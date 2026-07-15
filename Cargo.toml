@@ -1,0 +1,38 @@
+[package]
+name = "llmc"
+version = "0.1.0"
+edition = "2021"
+description = "LLMC — a clean, powerful digital-logic builder and simulator"
+license = "MIT"
+repository = "https://github.com/ferasbusiness666/llmc"
+rust-version = "1.80"
+
+[[bin]]
+name = "llmc"
+path = "src/main.rs"
+
+[lib]
+name = "llmc"
+path = "src/lib.rs"
+
+# The pure-logic library (model, backend, io) has NO GUI dependency, so it can be
+# unit-tested headlessly with `cargo test --lib`. The GUI lives only in the binary.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# GUI-only dependencies are used exclusively by the binary (src/main.rs + src/ui/**).
+# Keep the glow backend but re-enable the winit windowing backends (x11 + wayland);
+# these are no-ops when cross/native-compiling for Windows.
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "x11",
+    "wayland",
+] }
+rfd = "0.17"
+directories = "6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

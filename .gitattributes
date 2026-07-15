@@ -1,0 +1,7 @@
+# Keep source line endings consistent so `cargo fmt --check` and clippy behave
+# identically on the Windows and Linux CI runners.
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.llmc text eol=lf
