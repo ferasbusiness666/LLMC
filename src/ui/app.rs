@@ -104,6 +104,12 @@ pub struct LlmcApp {
     rename_chip: Option<(ChipId, String)>,
     /// Active chip-internals editing session.
     chip_edit: Option<ChipEdit>,
+    /// Block whose Properties window is open, plus its editable buffers.
+    props_for: Option<BlockId>,
+    props_name: String,
+    props_color: [u8; 3],
+    props_has_color: bool,
+    props_hz: f32,
 }
 
 impl LlmcApp {
@@ -140,6 +146,11 @@ impl LlmcApp {
             menu_world: Vec2f::ZERO,
             rename_chip: None,
             chip_edit: None,
+            props_for: None,
+            props_name: String::new(),
+            props_color: [0x5b, 0x9d, 0xf9],
+            props_has_color: false,
+            props_hz: 1.0,
             config,
         };
         if let Some(path) = initial {
@@ -158,7 +169,6 @@ impl LlmcApp {
 
     fn rebuild_sim(&mut self) {
         self.sim = Simulation::build(&self.manager.circuit, &self.manager.chips);
-        self.sim.set_clock_period(self.config.clock_period);
         // Settle once so combinational state (lit LEDs/wires) shows even when paused.
         self.sim.step(0.0);
         self.sim_dirty = false;
@@ -349,6 +359,103 @@ impl LlmcApp {
         self.selected_conns.clear();
         self.sim_dirty = true;
         self.status = "Cancelled chip edit".to_string();
+    }
+
+    // ----- block properties -----
+
+    /// Open the Properties window for the single selected block, loading its buffers.
+    fn open_properties(&mut self) {
+        if self.selection.len() != 1 {
+            return;
+        }
+        let Some(&id) = self.selection.iter().next() else {
+            return;
+        };
+        if let Some(b) = self.manager.circuit.block(id) {
+            self.props_name = b.label.clone().unwrap_or_default();
+            self.props_has_color = b.color.is_some();
+            self.props_color = b.color.unwrap_or([0x5b, 0x9d, 0xf9]);
+            self.props_hz = b.freq_hz.unwrap_or(1.0);
+            self.props_for = Some(id);
+        }
+    }
+
+    fn properties_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.props_for else {
+            return;
+        };
+        let Some(block) = self.manager.circuit.block(id) else {
+            self.props_for = None;
+            return;
+        };
+        let ty = block.ty;
+        let is_clock = matches!(ty, BlockType::Clock);
+        let type_label = match ty {
+            BlockType::Chip(cid) => self
+                .manager
+                .chips
+                .get(cid)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "Chip".to_string()),
+            other => palette_name(other).to_string(),
+        };
+
+        let mut open = true;
+        egui::Window::new("Properties")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("Type:  {type_label}")).color(self.theme().label_dim),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut self.props_name);
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.props_has_color, "Custom color");
+                    ui.add_enabled_ui(self.props_has_color, |ui| {
+                        ui.color_edit_button_srgb(&mut self.props_color);
+                    });
+                });
+                if is_clock {
+                    ui.horizontal(|ui| {
+                        ui.label("Frequency:");
+                        ui.add(
+                            egui::Slider::new(&mut self.props_hz, 0.25..=20.0)
+                                .suffix(" Hz")
+                                .logarithmic(true),
+                        );
+                    });
+                }
+            });
+
+        // Apply the edited buffers back to the block every frame.
+        if let Some(b) = self.manager.circuit.block_mut(id) {
+            let name = self.props_name.trim();
+            b.label = if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            };
+            b.color = if self.props_has_color {
+                Some(self.props_color)
+            } else {
+                None
+            };
+            if is_clock {
+                let new = Some(self.props_hz);
+                if b.freq_hz != new {
+                    b.freq_hz = new;
+                    self.sim_dirty = true;
+                }
+            }
+        }
+        if !open {
+            self.props_for = None;
+        }
     }
 
     fn select_all(&mut self) {
@@ -886,6 +993,9 @@ impl eframe::App for LlmcApp {
         if self.rename_chip.is_some() {
             self.rename_chip_dialog(&ctx);
         }
+        if self.props_for.is_some() {
+            self.properties_window(&ctx);
+        }
     }
 }
 
@@ -1097,6 +1207,16 @@ impl LlmcApp {
             let has_sel = !self.selection.is_empty() || !self.selected_conns.is_empty();
             let has_blocks = !self.selection.is_empty();
             let has_clip = self.clipboard.is_some();
+            let one_block = self.selection.len() == 1 && self.selected_conns.is_empty();
+
+            if ui
+                .add_enabled(one_block, Button::new("Properties\u{2026}"))
+                .clicked()
+            {
+                self.open_properties();
+                ui.close();
+            }
+            ui.separator();
 
             ui.add_enabled_ui(has_blocks, |ui| {
                 if ui.button("Copy").clicked() {
@@ -1503,6 +1623,10 @@ impl LlmcApp {
                 theme: &t,
                 zoom: self.camera.zoom,
                 chip_name,
+                color: block
+                    .color
+                    .map(|[r, g, b]| egui::Color32::from_rgb(r, g, b)),
+                label: block.label.as_deref(),
             };
             draw_block(painter, &style);
 

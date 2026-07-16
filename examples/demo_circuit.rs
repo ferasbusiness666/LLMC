@@ -78,6 +78,19 @@ fn main() {
     wire(&mut m, clk, 0, inv, 0);
     wire(&mut m, inv, 0, led, 0);
 
+    // Showcase per-block properties: names, a custom color, and a clock frequency.
+    if let Some(b) = m.circuit.block_mut(clk) {
+        b.label = Some("tick".to_string());
+        b.freq_hz = Some(4.0);
+    }
+    if let Some(b) = m.circuit.block_mut(chip) {
+        b.label = Some("ADD".to_string());
+        b.color = Some([0x8b, 0x5c, 0xf6]);
+    }
+    if let Some(b) = m.circuit.block_mut(sa) {
+        b.label = Some("A".to_string());
+    }
+
     let project = Project::new(
         m.circuit.clone(),
         m.chips.clone(),

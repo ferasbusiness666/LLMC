@@ -174,8 +174,15 @@ pub struct Block {
     /// by live UI state during simulation.
     #[serde(default)]
     pub state: bool,
+    /// An optional user-given name, shown above the type on the block.
     #[serde(default)]
     pub label: Option<String>,
+    /// Optional custom body color (sRGB). `None` uses the theme default.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+    /// Per-`Clock` frequency in Hz. `None` uses the default (1 Hz).
+    #[serde(default)]
+    pub freq_hz: Option<f32>,
 }
 
 impl Block {
@@ -187,6 +194,8 @@ impl Block {
             orientation: Orientation::default(),
             state: false,
             label: None,
+            color: None,
+            freq_hz: None,
         }
     }
 

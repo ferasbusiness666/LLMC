@@ -31,7 +31,8 @@ enum PrimKind {
     /// A switch/button; the bool is the authored default level.
     Switch(bool),
     Const(bool),
-    Clock,
+    /// A clock; the f64 is the half-period in seconds.
+    Clock(f64),
     /// An output sink (LED / chip output marker); produces no net.
     Sink,
 }
@@ -106,7 +107,11 @@ fn prim_kind(block: &Block) -> PrimKind {
         BlockType::Switch | BlockType::Button => PrimKind::Switch(block.state),
         BlockType::ConstantHigh => PrimKind::Const(true),
         BlockType::ConstantLow => PrimKind::Const(false),
-        BlockType::Clock => PrimKind::Clock,
+        BlockType::Clock => {
+            // freq_hz -> half-period in seconds (default 1 Hz).
+            let hz = block.freq_hz.unwrap_or(1.0).max(0.01) as f64;
+            PrimKind::Clock(1.0 / (2.0 * hz))
+        }
         BlockType::Led => PrimKind::Sink,
         BlockType::Chip(_) => unreachable!("chips are expanded, not turned into gates"),
     }
@@ -245,7 +250,6 @@ pub struct Simulation {
     /// Live top-level switch/button overrides (persist across rebuilds via the app).
     pub switch_states: BTreeMap<BlockId, bool>,
     time: f64,
-    clock_period: f64,
     /// Canonical net for each top-level output port (for wire coloring).
     top_out_net: BTreeMap<Port, NetId>,
     /// Gate index for each top-level block (for reading LEDs).
@@ -320,16 +324,10 @@ impl Simulation {
             values: vec![false; next as usize],
             switch_states,
             time: 0.0,
-            clock_period: 1.0,
             top_out_net,
             top_gate,
             conflicts,
         }
-    }
-
-    /// Seconds per half-period for `Clock` blocks (default 1.0s).
-    pub fn set_clock_period(&mut self, period: f64) {
-        self.clock_period = period.max(0.01);
     }
 
     pub fn set_switch(&mut self, id: BlockId, state: bool) {
@@ -347,13 +345,7 @@ impl Simulation {
         for _ in 0..MAX_ITERATIONS {
             let mut changed = false;
             for gate in &self.gates {
-                let val = eval_gate(
-                    gate,
-                    &self.values,
-                    self.time,
-                    self.clock_period,
-                    &self.switch_states,
-                );
+                let val = eval_gate(gate, &self.values, self.time, &self.switch_states);
                 if let Some(net) = gate.output {
                     let net = net as usize;
                     if self.values[net] != val {
@@ -406,7 +398,6 @@ fn eval_gate(
     gate: &FlatGate,
     values: &[bool],
     time: f64,
-    clock_period: f64,
     switches: &BTreeMap<BlockId, bool>,
 ) -> bool {
     let n = gate.inputs.len();
@@ -425,7 +416,7 @@ fn eval_gate(
             None => default,
         },
         PrimKind::Const(b) => b,
-        PrimKind::Clock => (time / clock_period).floor() as i64 % 2 != 0,
+        PrimKind::Clock(half_period) => (time / half_period).floor() as i64 % 2 != 0,
         PrimKind::Sink => false,
     }
 }
