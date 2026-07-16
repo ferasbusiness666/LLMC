@@ -47,9 +47,13 @@ A prebuilt Windows binary (`llmc.exe`) is produced by CI on every push — see t
 | Action | Input |
 | --- | --- |
 | Place a component | pick it in the left palette, then click the canvas |
+| Cancel the held component | right-click, or `Esc` |
 | Select | click a block/wire · Shift-click to add · drag on empty space to box-select |
 | Move | drag a selected block (grid-snapped; one undo step) |
-| Wire | drag from a port to another port |
+| Wire | drag from a port to another port — **or** click a port, then click the target port |
+| Cancel a wire in progress | right-click, or `Esc` |
+| Context menu | right-click the canvas → copy, paste-here, duplicate, delete, rotate, flip |
+| Manage a chip | right-click it in the palette → place, edit, rename, delete |
 | Toggle a switch | click it |
 | Pan | drag with middle or right mouse button, or hold `Space` and drag |
 | Zoom | scroll wheel (zooms around the cursor) |
@@ -59,6 +63,10 @@ A prebuilt Windows binary (`llmc.exe`) is produced by CI on every push — see t
 | Copy / paste / duplicate | `Ctrl+C` / `Ctrl+V` / `Ctrl+D` |
 | Select all | `Ctrl+A` |
 | Run / stop simulation | toolbar **Run** / **Stop** |
+
+**Editing a chip:** right-click a chip in the palette and choose **Edit** to open its
+internal circuit; the toolbar shows **Update chip** / **Cancel**. Updating re-derives the
+chip from its switches (inputs) and LEDs (outputs) and returns you to your circuit.
 
 ## Architecture
 

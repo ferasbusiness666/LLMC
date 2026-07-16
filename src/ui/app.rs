@@ -13,7 +13,8 @@ use eframe::egui::{
 use llmc::backend::{CircuitManager, Simulation};
 use llmc::io::{AppConfig, CameraState, Project};
 use llmc::model::{
-    Block, BlockId, BlockType, Circuit, ConnId, Connection, Orientation, Port, PortKind, Pos, Vec2f,
+    Block, BlockId, BlockType, ChipDef, ChipId, Circuit, ConnId, Connection, Orientation, Port,
+    PortKind, Pos, Vec2f,
 };
 
 use super::glyphs::{draw_block, BlockStyle};
@@ -69,6 +70,14 @@ struct Clipboard {
     connections: Vec<Connection>,
 }
 
+/// Active "edit this chip's internals" session. The working circuit is swapped for the
+/// chip's, and the previous circuit/path are stashed to restore on save or cancel.
+struct ChipEdit {
+    id: ChipId,
+    prev_circuit: Circuit,
+    prev_path: Option<PathBuf>,
+}
+
 pub struct LlmcApp {
     manager: CircuitManager,
     sim: Simulation,
@@ -87,6 +96,14 @@ pub struct LlmcApp {
     show_chip_dialog: bool,
     chip_name: String,
     space_down: bool,
+    /// A click-to-wire in progress: click a port, then click the target port.
+    pending_wire: Option<(Port, bool)>,
+    /// World position where the last context menu was opened (for paste-at-cursor).
+    menu_world: Vec2f,
+    /// Chip being renamed, with its editable name buffer.
+    rename_chip: Option<(ChipId, String)>,
+    /// Active chip-internals editing session.
+    chip_edit: Option<ChipEdit>,
 }
 
 impl LlmcApp {
@@ -119,6 +136,10 @@ impl LlmcApp {
             show_chip_dialog: false,
             chip_name: String::new(),
             space_down: false,
+            pending_wire: None,
+            menu_world: Vec2f::ZERO,
+            rename_chip: None,
+            chip_edit: None,
             config,
         };
         if let Some(path) = initial {
@@ -221,6 +242,113 @@ impl LlmcApp {
         self.selection = new_ids.into_iter().collect();
         self.selected_conns.clear();
         self.sim_dirty = true;
+    }
+
+    /// Paste the clipboard so its top-left lands near `world` (used by the context menu).
+    fn paste_at(&mut self, world: Vec2f) {
+        let Some(clip) = &self.clipboard else {
+            return;
+        };
+        let blocks = clip.blocks.clone();
+        let connections = clip.connections.clone();
+        let min_x = blocks.iter().map(|b| b.pos.x).min().unwrap_or(0);
+        let min_y = blocks.iter().map(|b| b.pos.y).min().unwrap_or(0);
+        let offset = Pos::new(
+            world.x.round() as i32 - min_x,
+            world.y.round() as i32 - min_y,
+        );
+        let new_ids = self.manager.insert_group(&blocks, &connections, offset);
+        self.selection = new_ids.into_iter().collect();
+        self.selected_conns.clear();
+        self.sim_dirty = true;
+    }
+
+    // ----- chip management -----
+
+    fn delete_chip(&mut self, id: ChipId) {
+        // Remove any instances of this chip in the working circuit first.
+        let instances: Vec<BlockId> = self
+            .manager
+            .circuit
+            .iter_blocks()
+            .filter(|b| matches!(b.ty, BlockType::Chip(cid) if cid == id))
+            .map(|b| b.id)
+            .collect();
+        if !instances.is_empty() {
+            self.manager.delete(&instances, &[]);
+        }
+        let name = self
+            .manager
+            .chips
+            .get(id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        self.manager.chips.remove(id);
+        if matches!(self.tool, Tool::Place(BlockType::Chip(cid)) if cid == id) {
+            self.tool = Tool::Select;
+        }
+        self.after_structural_edit();
+        self.status = format!("Deleted chip '{name}'");
+    }
+
+    /// Open a chip's internal circuit for editing (stashing the current circuit).
+    fn begin_chip_edit(&mut self, id: ChipId) {
+        if self.chip_edit.is_some() {
+            return;
+        }
+        let Some(def) = self.manager.chips.get(id) else {
+            return;
+        };
+        let name = def.name.clone();
+        let circuit = def.circuit.clone();
+        let prev_circuit = std::mem::replace(&mut self.manager.circuit, circuit);
+        self.manager.undo.clear();
+        self.chip_edit = Some(ChipEdit {
+            id,
+            prev_circuit,
+            prev_path: self.path.take(),
+        });
+        self.tool = Tool::Select;
+        self.selection.clear();
+        self.selected_conns.clear();
+        self.interaction = Interaction::Idle;
+        self.pending_wire = None;
+        self.sim_dirty = true;
+        self.status = format!("Editing chip '{name}' — Update or Cancel in the toolbar");
+    }
+
+    fn save_chip_edit(&mut self) {
+        let Some(edit) = self.chip_edit.take() else {
+            return;
+        };
+        let name = self
+            .manager
+            .chips
+            .get(edit.id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "chip".to_string());
+        let def = ChipDef::from_circuit(edit.id, name.clone(), self.manager.circuit.clone());
+        self.manager.chips.insert(def);
+        self.manager.circuit = edit.prev_circuit;
+        self.path = edit.prev_path;
+        self.manager.undo.clear();
+        self.selection.clear();
+        self.selected_conns.clear();
+        self.sim_dirty = true;
+        self.status = format!("Updated chip '{name}'");
+    }
+
+    fn cancel_chip_edit(&mut self) {
+        let Some(edit) = self.chip_edit.take() else {
+            return;
+        };
+        self.manager.circuit = edit.prev_circuit;
+        self.path = edit.prev_path;
+        self.manager.undo.clear();
+        self.selection.clear();
+        self.selected_conns.clear();
+        self.sim_dirty = true;
+        self.status = "Cancelled chip edit".to_string();
     }
 
     fn select_all(&mut self) {
@@ -415,6 +543,7 @@ impl LlmcApp {
         if s.esc {
             self.tool = Tool::Select;
             self.interaction = Interaction::Idle;
+            self.pending_wire = None;
             self.selection.clear();
             self.selected_conns.clear();
         }
@@ -428,18 +557,21 @@ impl LlmcApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("LLMC").strong().size(16.0));
                 ui.separator();
-                if ui.button("New").clicked() {
-                    self.new_circuit();
-                }
-                if ui.button("Open").clicked() {
-                    self.open();
-                }
-                if ui.button("Save").clicked() {
-                    self.save();
-                }
-                if ui.button("Save As").clicked() {
-                    self.save_as();
-                }
+                let editing_chip = self.chip_edit.is_some();
+                ui.add_enabled_ui(!editing_chip, |ui| {
+                    if ui.button("New").clicked() {
+                        self.new_circuit();
+                    }
+                    if ui.button("Open").clicked() {
+                        self.open();
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save();
+                    }
+                    if ui.button("Save As").clicked() {
+                        self.save_as();
+                    }
+                });
                 ui.separator();
                 let run = if self.running {
                     "\u{23f8}  Stop"
@@ -472,7 +604,15 @@ impl LlmcApp {
                     self.redo();
                 }
                 ui.separator();
-                if ui.button("Create Chip").clicked() {
+                if self.chip_edit.is_some() {
+                    ui.colored_label(self.theme().accent, "\u{270e} Editing chip");
+                    if ui.button("Update chip").clicked() {
+                        self.save_chip_edit();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.cancel_chip_edit();
+                    }
+                } else if ui.button("Create Chip").clicked() {
                     self.show_chip_dialog = true;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -538,13 +678,40 @@ impl LlmcApp {
                     .collect();
                 if !chips.is_empty() {
                     ui.add_space(10.0);
-                    ui.label(RichText::new("CHIPS").small().color(self.theme().label_dim));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("CHIPS").small().color(self.theme().label_dim));
+                        ui.label(
+                            RichText::new("(right-click)")
+                                .small()
+                                .color(self.theme().label_dim),
+                        );
+                    });
                     for (id, name) in chips {
                         let selected =
                             matches!(self.tool, Tool::Place(BlockType::Chip(cid)) if cid == id);
-                        if ui.selectable_label(selected, format!("  {name}")).clicked() {
+                        let resp = ui.selectable_label(selected, format!("  {name}"));
+                        if resp.clicked() {
                             self.tool = Tool::Place(BlockType::Chip(id));
                         }
+                        resp.context_menu(|ui| {
+                            if ui.button("Place").clicked() {
+                                self.tool = Tool::Place(BlockType::Chip(id));
+                                ui.close();
+                            }
+                            if ui.button("Edit\u{2026}").clicked() {
+                                self.begin_chip_edit(id);
+                                ui.close();
+                            }
+                            if ui.button("Rename\u{2026}").clicked() {
+                                self.rename_chip = Some((id, name.clone()));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("Delete").clicked() {
+                                self.delete_chip(id);
+                                ui.close();
+                            }
+                        });
                     }
                 }
             });
@@ -572,9 +739,17 @@ impl LlmcApp {
                 let nc = self.manager.circuit.connections.len();
                 ui.label(format!("{nb} blocks \u{00b7} {nc} wires"));
                 ui.separator();
-                let toolname = match self.tool {
-                    Tool::Select => "Select".to_string(),
-                    Tool::Place(ty) => format!("Place {}", palette_name(ty)),
+                let toolname = if self.chip_edit.is_some() {
+                    "Editing chip".to_string()
+                } else if let Tool::Place(ty) = self.tool {
+                    format!(
+                        "Placing {} \u{2014} click to add, right-click/Esc to cancel",
+                        palette_name(ty)
+                    )
+                } else if self.pending_wire.is_some() {
+                    "Wiring \u{2014} click a target port, right-click/Esc to cancel".to_string()
+                } else {
+                    "Select".to_string()
                 };
                 ui.label(toolname);
                 ui.separator();
@@ -624,6 +799,43 @@ impl LlmcApp {
             self.show_chip_dialog = false;
         }
     }
+
+    fn rename_chip_dialog(&mut self, ctx: &egui::Context) {
+        let Some((id, mut name)) = self.rename_chip.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut finish = false;
+        egui::Window::new("Rename chip")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut name);
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can = !name.trim().is_empty();
+                    if ui.add_enabled(can, Button::new("Save")).clicked() {
+                        if let Some(chip) = self.manager.chips.chips.get_mut(&id) {
+                            chip.name = name.trim().to_string();
+                        }
+                        self.status = format!("Renamed chip to '{}'", name.trim());
+                        finish = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        finish = true;
+                    }
+                });
+            });
+        if finish || !open {
+            self.rename_chip = None;
+        } else {
+            self.rename_chip = Some((id, name));
+        }
+    }
 }
 
 /// Snapshot of relevant key state read in one `input` call.
@@ -670,6 +882,9 @@ impl eframe::App for LlmcApp {
 
         if self.show_chip_dialog {
             self.chip_dialog(&ctx);
+        }
+        if self.rename_chip.is_some() {
+            self.rename_chip_dialog(&ctx);
         }
     }
 }
@@ -746,7 +961,8 @@ impl LlmcApp {
     }
 
     fn hit_port(&self, cursor: Pos2, origin: Pos2) -> Option<(Port, bool)> {
-        let radius = (self.camera.zoom * 0.30).max(8.0);
+        // Generous pick radius so grabbing a port to start a wire is easy.
+        let radius = (self.camera.zoom * 0.5).max(13.0);
         let mut best_d = radius * radius;
         let mut best = None;
         for block in self.manager.circuit.iter_blocks() {
@@ -843,10 +1059,15 @@ impl LlmcApp {
             }
         }
 
+        // Eligibility for the right-click menu, captured before input may change the tool.
+        let allow_menu = matches!(self.tool, Tool::Select) && self.pending_wire.is_none();
         self.handle_canvas_input(&response, origin, &ctx);
 
         if let Some(c) = cursor {
-            if self.hit_port(c, origin).is_some() || matches!(self.tool, Tool::Place(_)) {
+            if self.pending_wire.is_some()
+                || self.hit_port(c, origin).is_some()
+                || matches!(self.tool, Tool::Place(_))
+            {
                 ctx.set_cursor_icon(CursorIcon::Crosshair);
             } else if self.hit_block(c, origin).is_some() {
                 ctx.set_cursor_icon(CursorIcon::Grab);
@@ -864,6 +1085,62 @@ impl LlmcApp {
         self.draw_wires(&painter, origin);
         self.draw_blocks(&painter, origin, hover_block, hover_port);
         self.draw_overlay(&painter, origin, cursor);
+
+        if allow_menu {
+            self.canvas_context_menu(&response);
+        }
+    }
+
+    fn canvas_context_menu(&mut self, response: &Response) {
+        let world = self.menu_world;
+        response.context_menu(|ui| {
+            let has_sel = !self.selection.is_empty() || !self.selected_conns.is_empty();
+            let has_blocks = !self.selection.is_empty();
+            let has_clip = self.clipboard.is_some();
+
+            ui.add_enabled_ui(has_blocks, |ui| {
+                if ui.button("Copy").clicked() {
+                    self.copy_selection();
+                    ui.close();
+                }
+                if ui.button("Duplicate").clicked() {
+                    self.duplicate_selection();
+                    ui.close();
+                }
+            });
+            if ui
+                .add_enabled(has_clip, Button::new("Paste here"))
+                .clicked()
+            {
+                self.paste_at(world);
+                ui.close();
+            }
+            ui.separator();
+            ui.add_enabled_ui(has_blocks, |ui| {
+                if ui.button("Rotate").clicked() {
+                    self.rotate_selection(true);
+                    ui.close();
+                }
+                if ui.button("Flip").clicked() {
+                    self.flip_selection();
+                    ui.close();
+                }
+            });
+            if ui.add_enabled(has_sel, Button::new("Delete")).clicked() {
+                self.delete_selection();
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Select all").clicked() {
+                self.select_all();
+                ui.close();
+            }
+            if ui.add_enabled(has_sel, Button::new("Deselect")).clicked() {
+                self.selection.clear();
+                self.selected_conns.clear();
+                ui.close();
+            }
+        });
     }
 
     fn apply_zoom(&mut self, cursor: Pos2, factor: f32, origin: Pos2) {
@@ -885,6 +1162,29 @@ impl LlmcApp {
             || response.dragged_by(PointerButton::Secondary)
         {
             self.camera.pan += response.drag_delta();
+        }
+
+        // Right-click (no drag): cancel a held component or click-wire, else prep menu.
+        if response.secondary_clicked() {
+            let pos = pointer.or_else(|| response.hover_pos());
+            if matches!(self.tool, Tool::Place(_)) {
+                self.tool = Tool::Select;
+            } else if self.pending_wire.is_some() {
+                self.pending_wire = None;
+            } else if let Some(c) = pos {
+                self.menu_world = self.camera.to_world(c, origin);
+                if let Some(bid) = self.hit_block(c, origin) {
+                    if !self.selection.contains(&bid) {
+                        self.selection.clear();
+                        self.selected_conns.clear();
+                        self.selection.insert(bid);
+                    }
+                } else if let Some(cid) = self.hit_connection(c, origin) {
+                    self.selection.clear();
+                    self.selected_conns.clear();
+                    self.selected_conns.insert(cid);
+                }
+            }
         }
 
         if response.drag_started_by(PointerButton::Primary) {
@@ -914,6 +1214,7 @@ impl LlmcApp {
     }
 
     fn begin_primary(&mut self, press: Pos2, origin: Pos2, shift: bool) {
+        self.pending_wire = None; // starting a drag cancels any click-to-wire in progress
         if matches!(self.tool, Tool::Place(_)) {
             return; // placement happens on click
         }
@@ -1047,7 +1348,32 @@ impl LlmcApp {
             self.selection.insert(id);
             return;
         }
-        if self.hit_port(p, origin).is_some() {
+        // Click-to-wire: click a port, then click a compatible target port. This is an
+        // easier alternative to dragging when the drag is fiddly.
+        if let Some((port, is_out)) = self.hit_port(p, origin) {
+            match self.pending_wire {
+                None => self.pending_wire = Some((port, is_out)),
+                Some((from, from_out)) => {
+                    if from == port {
+                        self.pending_wire = None; // clicked the same port again -> cancel
+                    } else if from_out && !is_out {
+                        self.manager.connect(from, port);
+                        self.sim_dirty = true;
+                        self.pending_wire = None;
+                    } else if !from_out && is_out {
+                        self.manager.connect(port, from);
+                        self.sim_dirty = true;
+                        self.pending_wire = None;
+                    } else {
+                        // same kind -> restart the wire from the newly clicked port
+                        self.pending_wire = Some((port, is_out));
+                    }
+                }
+            }
+            return;
+        }
+        // Clicking away from any port cancels a pending click-wire.
+        if self.pending_wire.take().is_some() {
             return;
         }
         if let Some(bid) = self.hit_block(p, origin) {
@@ -1232,35 +1558,16 @@ impl LlmcApp {
                 }
             }
             Interaction::DrawWire { from, from_output } => {
-                if let (Some(c), Some(fb)) = (cursor, self.manager.circuit.block(from.block)) {
-                    if let Some(p0) = self.port_screen(fb, *from, origin) {
-                        let target = self.hit_port(c, origin);
-                        let (endp, valid) = match target {
-                            Some((tp, to_out)) if to_out != *from_output => (
-                                self.port_screen(
-                                    self.manager.circuit.block(tp.block).unwrap(),
-                                    tp,
-                                    origin,
-                                )
-                                .unwrap_or(c),
-                                true,
-                            ),
-                            _ => (c, false),
-                        };
-                        let d0 = self.port_dir(fb, *from);
-                        let pts = bezier(p0, endp, d0, Vec2::new(-d0.x, -d0.y), self.camera.zoom);
-                        let color = if valid { t.accent } else { t.port };
-                        for seg in pts.windows(2) {
-                            painter.line_segment([seg[0], seg[1]], Stroke::new(2.0, color));
-                        }
-                        painter.circle_filled(p0, 4.0, t.accent);
-                        if valid {
-                            painter.circle_stroke(endp, 6.0, Stroke::new(2.0, t.accent));
-                        }
-                    }
+                if let Some(c) = cursor {
+                    self.draw_wire_preview(painter, *from, *from_output, c, origin, false);
                 }
             }
             _ => {}
+        }
+
+        // Click-to-wire in progress (armed from a port).
+        if let (Some((from, from_output)), Some(c)) = (self.pending_wire, cursor) {
+            self.draw_wire_preview(painter, from, from_output, c, origin, true);
         }
 
         if let (Tool::Place(ty), Some(c)) = (self.tool, cursor) {
@@ -1276,6 +1583,50 @@ impl LlmcApp {
             );
             painter.rect_filled(r, 6.0, t.block_fill.linear_multiply(0.5));
             painter.rect_stroke(r, 6.0, Stroke::new(1.5, t.accent), StrokeKind::Inside);
+        }
+    }
+
+    fn port_screen_of(&self, port: Port, origin: Pos2) -> Option<Pos2> {
+        let block = self.manager.circuit.block(port.block)?;
+        self.port_screen(block, port, origin)
+    }
+
+    /// Draw a rubber-band wire preview from a source port to the cursor, snapping to a
+    /// valid opposite port when hovered. Shared by drag-wiring and click-wiring.
+    fn draw_wire_preview(
+        &self,
+        painter: &egui::Painter,
+        from: Port,
+        from_output: bool,
+        cursor: Pos2,
+        origin: Pos2,
+        armed: bool,
+    ) {
+        let t = self.theme();
+        let Some(fb) = self.manager.circuit.block(from.block) else {
+            return;
+        };
+        let Some(p0) = self.port_screen(fb, from, origin) else {
+            return;
+        };
+        let (endp, valid) = match self.hit_port(cursor, origin) {
+            Some((tp, to_out)) if to_out != from_output => {
+                (self.port_screen_of(tp, origin).unwrap_or(cursor), true)
+            }
+            _ => (cursor, false),
+        };
+        let d0 = self.port_dir(fb, from);
+        let pts = bezier(p0, endp, d0, Vec2::new(-d0.x, -d0.y), self.camera.zoom);
+        let color = if valid { t.accent } else { t.port };
+        for seg in pts.windows(2) {
+            painter.line_segment([seg[0], seg[1]], Stroke::new(2.0, color));
+        }
+        painter.circle_filled(p0, 4.5, t.accent);
+        if armed {
+            painter.circle_stroke(p0, 8.0, Stroke::new(1.5, t.accent));
+        }
+        if valid {
+            painter.circle_stroke(endp, 6.0, Stroke::new(2.0, t.accent));
         }
     }
 }
