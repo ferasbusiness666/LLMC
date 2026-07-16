@@ -7,6 +7,9 @@ use super::connection::{Port, PortKind};
 use super::geometry::{Orientation, Pos, Vec2f};
 use super::ids::{BlockId, ChipId};
 
+/// Maximum number of inputs a variable-input gate may have.
+pub const MAX_GATE_INPUTS: usize = 16;
+
 /// Every kind of block that can be placed on a circuit.
 ///
 /// `Junction` is intentionally absent: fan-out is done by drawing several wires from
@@ -93,20 +96,44 @@ impl BlockType {
         ]
     }
 
-    /// The unrotated footprint and port positions for this block type.
+    /// Gates whose input count can be increased (2..=[`MAX_GATE_INPUTS`]).
+    pub fn variable_inputs(&self) -> bool {
+        matches!(
+            self,
+            BlockType::And
+                | BlockType::Or
+                | BlockType::Nand
+                | BlockType::Nor
+                | BlockType::Xor
+                | BlockType::Xnor
+        )
+    }
+
+    /// The unrotated footprint and port positions for this block type, using the default
+    /// input count (2 for variable-input gates).
     pub fn layout(&self, chips: &ChipLibrary) -> PortLayout {
+        self.layout_with(chips, 2)
+    }
+
+    /// Like [`Self::layout`], but variable-input gates use `num_inputs` inputs. The gate
+    /// grows taller as inputs are added; `num_inputs` is ignored for other block types.
+    pub fn layout_with(&self, chips: &ChipLibrary, num_inputs: usize) -> PortLayout {
         match self {
-            // Two-input gates.
+            // Variable-input gates (2..=N inputs; taller with more).
             BlockType::And
             | BlockType::Or
             | BlockType::Nand
             | BlockType::Nor
             | BlockType::Xor
-            | BlockType::Xnor => PortLayout {
-                size: Vec2f::new(2.0, 2.0),
-                inputs: vec![Vec2f::new(0.0, 0.5), Vec2f::new(0.0, 1.5)],
-                outputs: vec![Vec2f::new(2.0, 1.0)],
-            },
+            | BlockType::Xnor => {
+                let n = num_inputs.clamp(2, MAX_GATE_INPUTS);
+                let h = n as f32;
+                PortLayout {
+                    size: Vec2f::new(2.0, h),
+                    inputs: (0..n).map(|i| Vec2f::new(0.0, i as f32 + 0.5)).collect(),
+                    outputs: vec![Vec2f::new(2.0, h / 2.0)],
+                }
+            }
             // Single-input gates.
             BlockType::Not | BlockType::Buffer => PortLayout {
                 size: Vec2f::new(2.0, 2.0),
@@ -183,6 +210,9 @@ pub struct Block {
     /// Per-`Clock` frequency in Hz. `None` uses the default (1 Hz).
     #[serde(default)]
     pub freq_hz: Option<f32>,
+    /// Input-pin count for variable-input gates. `None` uses the default (2).
+    #[serde(default)]
+    pub inputs: Option<u16>,
 }
 
 impl Block {
@@ -196,26 +226,38 @@ impl Block {
             label: None,
             color: None,
             freq_hz: None,
+            inputs: None,
         }
     }
 
+    /// The effective input-pin count for a variable-input gate (clamped, default 2).
+    pub fn gate_inputs(&self) -> usize {
+        self.inputs
+            .map(|n| (n as usize).clamp(2, MAX_GATE_INPUTS))
+            .unwrap_or(2)
+    }
+
+    /// The block's port layout, honoring its per-block input count.
+    pub fn layout(&self, chips: &ChipLibrary) -> PortLayout {
+        self.ty.layout_with(chips, self.gate_inputs())
+    }
+
     pub fn input_count(&self, chips: &ChipLibrary) -> usize {
-        self.ty.layout(chips).inputs.len()
+        self.layout(chips).inputs.len()
     }
 
     pub fn output_count(&self, chips: &ChipLibrary) -> usize {
-        self.ty.layout(chips).outputs.len()
+        self.layout(chips).outputs.len()
     }
 
     /// The block's bounding footprint in world cells, after orientation.
     pub fn footprint(&self, chips: &ChipLibrary) -> Vec2f {
-        self.orientation
-            .transformed_size(self.ty.layout(chips).size)
+        self.orientation.transformed_size(self.layout(chips).size)
     }
 
     /// World-space (cell) position of a port, or `None` if the index is out of range.
     pub fn port_position(&self, port: Port, chips: &ChipLibrary) -> Option<Vec2f> {
-        let layout = self.ty.layout(chips);
+        let layout = self.layout(chips);
         let locals = match port.kind {
             PortKind::Input => &layout.inputs,
             PortKind::Output => &layout.outputs,

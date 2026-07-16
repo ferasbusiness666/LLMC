@@ -277,6 +277,37 @@ fn mux_2to1() {
 }
 
 #[test]
+fn three_input_gates() {
+    // A 3-input AND and a 3-input XOR (parity) built by bumping the gate's input count.
+    type Check = fn(bool, bool, bool) -> bool;
+    let cases: [(BlockType, Check); 2] = [
+        (BlockType::And, |a, b, c| a && b && c),
+        (BlockType::Xor, |a, b, c| {
+            (a as u8 + b as u8 + c as u8) % 2 == 1
+        }),
+    ];
+    for (ty, check) in cases {
+        let mut m = CircuitManager::new();
+        let a = m.add_block(BlockType::Switch, Pos::new(0, 0));
+        let b = m.add_block(BlockType::Switch, Pos::new(0, 2));
+        let c = m.add_block(BlockType::Switch, Pos::new(0, 4));
+        let g = m.add_block(ty, Pos::new(4, 0));
+        m.circuit.block_mut(g).unwrap().inputs = Some(3);
+        let led = m.add_block(BlockType::Led, Pos::new(8, 0));
+        wire(&mut m, a, 0, g, 0);
+        wire(&mut m, b, 0, g, 1);
+        wire(&mut m, c, 0, g, 2);
+        wire(&mut m, g, 0, led, 0);
+
+        for x in 0..8u8 {
+            let (av, bv, cv) = (x & 1 != 0, x & 2 != 0, x & 4 != 0);
+            let sim = settle(&m, &[(a, av), (b, bv), (c, cv)]);
+            assert_eq!(sim.led_value(led).unwrap(), check(av, bv, cv), "{ty:?} {x}");
+        }
+    }
+}
+
+#[test]
 fn sr_latch_holds_state() {
     // Cross-coupled NOR latch: q = NOR(r, qn), qn = NOR(s, q).
     let mut m = CircuitManager::new();

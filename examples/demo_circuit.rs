@@ -91,6 +91,15 @@ fn main() {
         b.label = Some("A".to_string());
     }
 
+    // A 3-input AND (taller gate) to show variable input pins.
+    let and3 = m.add_block(BlockType::And, Pos::new(23, 1));
+    m.circuit.block_mut(and3).unwrap().inputs = Some(3);
+    let led3 = m.add_block(BlockType::Led, Pos::new(28, 1));
+    wire(&mut m, sa, 0, and3, 0);
+    wire(&mut m, x, 0, and3, 1);
+    wire(&mut m, y, 0, and3, 2);
+    wire(&mut m, and3, 0, led3, 0);
+
     let project = Project::new(
         m.circuit.clone(),
         m.chips.clone(),

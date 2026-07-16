@@ -7,7 +7,7 @@ pub mod connection;
 pub mod geometry;
 pub mod ids;
 
-pub use block::{Block, BlockType, PortLayout};
+pub use block::{Block, BlockType, PortLayout, MAX_GATE_INPUTS};
 pub use chip::{ChipDef, ChipLibrary};
 pub use circuit::Circuit;
 pub use connection::{Connection, Port, PortKind};

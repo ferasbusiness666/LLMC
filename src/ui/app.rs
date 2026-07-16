@@ -14,7 +14,7 @@ use llmc::backend::{CircuitManager, Simulation};
 use llmc::io::{AppConfig, CameraState, Project};
 use llmc::model::{
     Block, BlockId, BlockType, ChipDef, ChipId, Circuit, ConnId, Connection, Orientation, Port,
-    PortKind, Pos, Vec2f,
+    PortKind, Pos, Vec2f, MAX_GATE_INPUTS,
 };
 
 use super::glyphs::{draw_block, BlockStyle};
@@ -110,6 +110,7 @@ pub struct LlmcApp {
     props_color: [u8; 3],
     props_has_color: bool,
     props_hz: f32,
+    props_inputs: u16,
 }
 
 impl LlmcApp {
@@ -151,6 +152,7 @@ impl LlmcApp {
             props_color: [0x5b, 0x9d, 0xf9],
             props_has_color: false,
             props_hz: 1.0,
+            props_inputs: 2,
             config,
         };
         if let Some(path) = initial {
@@ -376,6 +378,7 @@ impl LlmcApp {
             self.props_has_color = b.color.is_some();
             self.props_color = b.color.unwrap_or([0x5b, 0x9d, 0xf9]);
             self.props_hz = b.freq_hz.unwrap_or(1.0);
+            self.props_inputs = b.gate_inputs() as u16;
             self.props_for = Some(id);
         }
     }
@@ -390,6 +393,7 @@ impl LlmcApp {
         };
         let ty = block.ty;
         let is_clock = matches!(ty, BlockType::Clock);
+        let is_variable = ty.variable_inputs();
         let type_label = match ty {
             BlockType::Chip(cid) => self
                 .manager
@@ -430,6 +434,15 @@ impl LlmcApp {
                         );
                     });
                 }
+                if is_variable {
+                    ui.horizontal(|ui| {
+                        ui.label("Inputs:");
+                        ui.add(egui::Slider::new(
+                            &mut self.props_inputs,
+                            2..=(MAX_GATE_INPUTS as u16),
+                        ));
+                    });
+                }
             });
 
         // Apply the edited buffers back to the block every frame.
@@ -451,6 +464,34 @@ impl LlmcApp {
                     b.freq_hz = new;
                     self.sim_dirty = true;
                 }
+            }
+        }
+        // Applying a new input count may orphan wires to removed pins; prune them.
+        if is_variable {
+            let n = self.props_inputs.clamp(2, MAX_GATE_INPUTS as u16);
+            let changed = self
+                .manager
+                .circuit
+                .block(id)
+                .map(|b| b.inputs != Some(n))
+                .unwrap_or(false);
+            if changed {
+                if let Some(b) = self.manager.circuit.block_mut(id) {
+                    b.inputs = Some(n);
+                }
+                let orphans: Vec<ConnId> = self
+                    .manager
+                    .circuit
+                    .iter_connections()
+                    .filter(|c| {
+                        c.to.block == id && matches!(c.to.kind, PortKind::Input) && c.to.index >= n
+                    })
+                    .map(|c| c.id)
+                    .collect();
+                for cid in orphans {
+                    self.manager.circuit.remove_connection(cid);
+                }
+                self.sim_dirty = true;
             }
         }
         if !open {
@@ -1025,7 +1066,7 @@ impl LlmcApp {
 
     /// A port's world position (drag-aware).
     fn port_world(&self, block: &Block, port: Port) -> Option<Vec2f> {
-        let layout = block.ty.layout(&self.manager.chips);
+        let layout = block.layout(&self.manager.chips);
         let locals = match port.kind {
             PortKind::Input => &layout.inputs,
             PortKind::Output => &layout.outputs,
@@ -1076,7 +1117,7 @@ impl LlmcApp {
         let mut best_d = radius * radius;
         let mut best = None;
         for block in self.manager.circuit.iter_blocks() {
-            let layout = block.ty.layout(&self.manager.chips);
+            let layout = block.layout(&self.manager.chips);
             for i in 0..layout.outputs.len() {
                 let port = Port::output(block.id, i as u16);
                 if let Some(s) = self.port_screen(block, port, origin) {
@@ -1630,7 +1671,7 @@ impl LlmcApp {
             };
             draw_block(painter, &style);
 
-            let layout = block.ty.layout(&self.manager.chips);
+            let layout = block.layout(&self.manager.chips);
             for i in 0..layout.outputs.len() {
                 let port = Port::output(block.id, i as u16);
                 if let Some(s) = self.port_screen(block, port, origin) {

@@ -53,7 +53,7 @@ A prebuilt Windows binary (`llmc.exe`) is produced by CI on every push — see t
 | Wire | drag from a port to another port — **or** click a port, then click the target port |
 | Cancel a wire in progress | right-click, or `Esc` |
 | Context menu | right-click the canvas → properties, copy, paste-here, duplicate, delete, rotate, flip |
-| Block properties | right-click a block → **Properties…** (rename, custom color, and clock frequency) |
+| Block properties | right-click a block → **Properties…** (rename, custom color, clock frequency, and gate input-pin count) |
 | Manage a chip | right-click it in the palette → place, edit, rename, delete |
 | Toggle a switch | click it |
 | Pan | drag with middle or right mouse button, or hold `Space` and drag |
