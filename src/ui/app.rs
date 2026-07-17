@@ -1111,6 +1111,17 @@ impl LlmcApp {
         Some(bezier(p0, p1, d0, d1, self.camera.zoom))
     }
 
+    /// True if any part of the wire's drawn path passes through `rect`
+    /// (used so box-select grabs wires the same way it grabs blocks).
+    fn wire_hits_rect(&self, conn: &Connection, rect: Rect, origin: Pos2) -> bool {
+        match self.wire_points(conn, origin) {
+            Some(pts) => pts
+                .windows(2)
+                .any(|seg| seg_intersects_rect(seg[0], seg[1], rect)),
+            None => false,
+        }
+    }
+
     fn hit_port(&self, cursor: Pos2, origin: Pos2) -> Option<(Port, bool)> {
         // Generous pick radius so grabbing a port to start a wire is easy.
         let radius = (self.camera.zoom * 0.5).max(13.0);
@@ -1462,6 +1473,7 @@ impl LlmcApp {
                     let box_rect = Rect::from_two_pos(start_screen, end);
                     if !shift {
                         self.selection.clear();
+                        self.selected_conns.clear();
                     }
                     let ids: Vec<BlockId> = self
                         .manager
@@ -1472,6 +1484,17 @@ impl LlmcApp {
                         .collect();
                     for id in ids {
                         self.selection.insert(id);
+                    }
+                    // Also select wires whose path passes through the box.
+                    let conn_ids: Vec<ConnId> = self
+                        .manager
+                        .circuit
+                        .iter_connections()
+                        .filter(|c| self.wire_hits_rect(c, box_rect, origin))
+                        .map(|c| c.id)
+                        .collect();
+                    for cid in conn_ids {
+                        self.selected_conns.insert(cid);
                     }
                 }
             }
@@ -1848,4 +1871,78 @@ fn dist_sq_point_seg(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
     let proj = a + ab * t;
     (p - proj).length_sq()
+}
+
+/// Does segment `a`–`b` touch axis-aligned `rect`? True if either endpoint is
+/// inside, or the segment crosses any of the four edges — so a thin selection
+/// box still catches a long straight wire between sample points.
+fn seg_intersects_rect(a: Pos2, b: Pos2, rect: Rect) -> bool {
+    if rect.contains(a) || rect.contains(b) {
+        return true;
+    }
+    let tl = rect.left_top();
+    let tr = rect.right_top();
+    let br = rect.right_bottom();
+    let bl = rect.left_bottom();
+    segs_cross(a, b, tl, tr)
+        || segs_cross(a, b, tr, br)
+        || segs_cross(a, b, br, bl)
+        || segs_cross(a, b, bl, tl)
+}
+
+/// Standard orientation-sign test for whether open segments p1–p2 and p3–p4 cross.
+fn segs_cross(p1: Pos2, p2: Pos2, p3: Pos2, p4: Pos2) -> bool {
+    let cross = |o: Pos2, x: Pos2, y: Pos2| (x.x - o.x) * (y.y - o.y) - (x.y - o.y) * (y.x - o.x);
+    let d1 = cross(p3, p4, p1);
+    let d2 = cross(p3, p4, p2);
+    let d3 = cross(p1, p2, p3);
+    let d4 = cross(p1, p2, p4);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn box_catches_wire_crossing_it() {
+        let rect = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(20.0, 20.0));
+        // Horizontal segment passing straight through the box.
+        assert!(seg_intersects_rect(
+            Pos2::new(0.0, 15.0),
+            Pos2::new(30.0, 15.0),
+            rect
+        ));
+        // Endpoint inside the box.
+        assert!(seg_intersects_rect(
+            Pos2::new(15.0, 15.0),
+            Pos2::new(40.0, 40.0),
+            rect
+        ));
+        // A thin box straddling a long segment still catches it.
+        let thin = Rect::from_min_max(Pos2::new(14.0, 0.0), Pos2::new(16.0, 100.0));
+        assert!(seg_intersects_rect(
+            Pos2::new(0.0, 50.0),
+            Pos2::new(500.0, 50.0),
+            thin
+        ));
+    }
+
+    #[test]
+    fn box_ignores_wire_that_misses_it() {
+        let rect = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(20.0, 20.0));
+        // Well clear of the box.
+        assert!(!seg_intersects_rect(
+            Pos2::new(0.0, 100.0),
+            Pos2::new(30.0, 100.0),
+            rect
+        ));
+        // Parallel and just outside one edge.
+        assert!(!seg_intersects_rect(
+            Pos2::new(0.0, 25.0),
+            Pos2::new(30.0, 25.0),
+            rect
+        ));
+    }
 }

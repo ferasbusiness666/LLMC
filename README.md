@@ -48,7 +48,7 @@ A prebuilt Windows binary (`llmc.exe`) is produced by CI on every push — see t
 | --- | --- |
 | Place a component | pick it in the left palette, then click the canvas |
 | Cancel the held component | right-click, or `Esc` |
-| Select | click a block/wire · Shift-click to add · drag on empty space to box-select |
+| Select | click a block/wire · Shift-click to add · drag on empty space to box-select (grabs blocks **and** wires) |
 | Move | drag a selected block (grid-snapped; one undo step) |
 | Wire | drag from a port to another port — **or** click a port, then click the target port |
 | Cancel a wire in progress | right-click, or `Esc` |
