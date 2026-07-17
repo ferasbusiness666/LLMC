@@ -6,5 +6,6 @@
 //! [`backend::Simulation`]. Every mutation flows through [`backend::EditCommand`].
 
 pub mod backend;
+pub mod icon;
 pub mod io;
 pub mod model;
