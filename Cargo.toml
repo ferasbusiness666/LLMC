@@ -33,6 +33,11 @@ eframe = { version = "0.35", default-features = false, features = [
 rfd = "0.17"
 directories = "6"
 
+# Windows-only: embed the app icon into llmc.exe at build time (see build.rs). Gated to the
+# Windows target so Linux/macOS builds don't pull it in.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

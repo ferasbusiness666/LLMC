@@ -112,19 +112,28 @@ fn sample(pt: P) -> (Rgb, f32) {
     (BG, 1.0)
 }
 
-/// Render the icon and return `(rgba, width, height)`.
+/// Render the icon at the default [`SIZE`] and return `(rgba, width, height)`.
 pub fn rgba() -> (Vec<u8>, u32, u32) {
-    let n = SIZE as usize;
+    rgba_at(SIZE)
+}
+
+/// Render the icon at an arbitrary square `size`. The glyph is defined in a fixed 256-unit
+/// design space and sampled into `size`×`size`, so the same logo scales to any icon size
+/// (16/32/48… for the Windows `.ico`, 256 for the window icon).
+pub fn rgba_at(size: u32) -> (Vec<u8>, u32, u32) {
+    let n = size.max(1) as usize;
     let mut out = vec![0u8; n * n * 4];
     let inv = 1.0 / (SS * SS) as f32;
+    // Map an output pixel (plus sub-sample offset) into the 256-unit design space.
+    let scale = SIZE as f32 / size as f32;
     for py in 0..n {
         for px in 0..n {
             // Accumulate premultiplied color over the sub-samples for clean edges.
             let (mut ar, mut ag, mut ab, mut aa) = (0.0f32, 0.0, 0.0, 0.0);
             for sy in 0..SS {
                 for sx in 0..SS {
-                    let fx = px as f32 + (sx as f32 + 0.5) / SS as f32;
-                    let fy = py as f32 + (sy as f32 + 0.5) / SS as f32;
+                    let fx = (px as f32 + (sx as f32 + 0.5) / SS as f32) * scale;
+                    let fy = (py as f32 + (sy as f32 + 0.5) / SS as f32) * scale;
                     let ((r, g, b), a) = sample(p(fx, fy));
                     ar += r * a;
                     ag += g * a;
@@ -149,7 +158,125 @@ pub fn rgba() -> (Vec<u8>, u32, u32) {
             out[i + 3] = (aa * 255.0).round().clamp(0.0, 255.0) as u8;
         }
     }
-    (out, SIZE, SIZE)
+    (out, size, size)
+}
+
+/// The icon sizes packed into the Windows `.ico` (small ones for the taskbar, large for
+/// Explorer / high-DPI). Windows picks the closest match per context.
+pub const ICO_SIZES: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
+
+/// Encode the app icon as a multi-resolution Windows `.ico` (PNG-compressed entries, which
+/// Windows Vista+ supports at every size). This is what `build.rs` embeds into `llmc.exe`.
+pub fn ico_bytes() -> Vec<u8> {
+    let images: Vec<(u32, Vec<u8>)> = ICO_SIZES
+        .iter()
+        .map(|&s| {
+            let (rgba, w, h) = rgba_at(s);
+            (s, encode_png(&rgba, w, h))
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    // ICONDIR: reserved, type=1 (icon), image count.
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&(images.len() as u16).to_le_bytes());
+
+    // ICONDIRENTRY per image, then the concatenated PNG blobs.
+    let mut offset = 6 + 16 * images.len();
+    for (size, png) in &images {
+        let dim = if *size >= 256 { 0u8 } else { *size as u8 };
+        out.push(dim); // width  (0 means 256)
+        out.push(dim); // height (0 means 256)
+        out.push(0); // palette color count
+        out.push(0); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // color planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes()); // bytes in resource
+        out.extend_from_slice(&(offset as u32).to_le_bytes()); // offset from file start
+        offset += png.len();
+    }
+    for (_, png) in &images {
+        out.extend_from_slice(png);
+    }
+    out
+}
+
+/// Encode 8-bit RGBA pixels as a PNG using uncompressed (stored) DEFLATE blocks — no
+/// dependencies, deterministic output. Used for the `.ico` entries and previews.
+pub fn encode_png(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+    // IHDR: 8-bit, color type 6 (RGBA), no interlace.
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    png_chunk(&mut out, b"IHDR", &ihdr);
+
+    // Raw image data: each row prefixed with filter byte 0.
+    let mut raw = Vec::with_capacity((h * (w * 4 + 1)) as usize);
+    for y in 0..h as usize {
+        raw.push(0);
+        let start = y * w as usize * 4;
+        raw.extend_from_slice(&rgba[start..start + w as usize * 4]);
+    }
+    png_chunk(&mut out, b"IDAT", &zlib_store(&raw));
+
+    png_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc_data = Vec::with_capacity(4 + data.len());
+    crc_data.extend_from_slice(kind);
+    crc_data.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&crc_data).to_be_bytes());
+}
+
+/// Wrap `data` in a zlib stream using only stored (uncompressed) DEFLATE blocks.
+fn zlib_store(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01]; // zlib header: 32K window, default level
+    let mut i = 0;
+    while i < data.len() {
+        let block = (data.len() - i).min(0xffff);
+        let final_block = i + block >= data.len();
+        out.push(u8::from(final_block));
+        let len = block as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(&data[i..i + block]);
+        i += block;
+    }
+    if data.is_empty() {
+        out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
 }
 
 #[cfg(test)]
@@ -173,5 +300,37 @@ mod tests {
         assert_eq!(at(SIZE - 1, SIZE - 1), 0);
         // The middle of the icon is solid.
         assert_eq!(at(SIZE / 2, SIZE / 2), 255);
+    }
+
+    #[test]
+    fn rgba_at_respects_requested_size() {
+        let (rgba, w, h) = rgba_at(32);
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(rgba.len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn png_has_signature_and_ihdr() {
+        let (rgba, w, h) = rgba_at(16);
+        let png = encode_png(&rgba, w, h);
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        // First chunk after the signature is IHDR.
+        assert_eq!(&png[12..16], b"IHDR");
+    }
+
+    #[test]
+    fn ico_header_matches_entry_count() {
+        let ico = ico_bytes();
+        assert_eq!(&ico[0..2], &0u16.to_le_bytes()); // reserved
+        assert_eq!(&ico[2..4], &1u16.to_le_bytes()); // type = icon
+        let count = u16::from_le_bytes([ico[4], ico[5]]);
+        assert_eq!(count as usize, ICO_SIZES.len());
+        // Every entry's declared offset+length must stay within the file.
+        for k in 0..count as usize {
+            let e = 6 + k * 16;
+            let len = u32::from_le_bytes([ico[e + 8], ico[e + 9], ico[e + 10], ico[e + 11]]);
+            let off = u32::from_le_bytes([ico[e + 12], ico[e + 13], ico[e + 14], ico[e + 15]]);
+            assert!(off as usize + len as usize <= ico.len());
+        }
     }
 }

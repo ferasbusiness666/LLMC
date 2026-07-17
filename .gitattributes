@@ -5,3 +5,7 @@
 *.md   text eol=lf
 *.yml  text eol=lf
 *.llmc text eol=lf
+
+# Binary assets must never be line-ending normalized.
+*.ico  binary
+*.png  binary
