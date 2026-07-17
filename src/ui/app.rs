@@ -1,6 +1,13 @@
-//! The application shell (the "Environment"): owns the backend, camera, interaction
-//! state, and the whole interactive canvas. All drawing is hand-rolled so pointer feel
-//! — hover, snapping, dragging, wiring — is precise and smooth.
+//! The application shell (the "Environment"). `LlmcApp` owns the open projects and the
+//! global concerns (theme, clipboard, tab bar, close prompts); each open project is a
+//! [`Document`] that owns its own backend, camera, interaction state, and the whole
+//! interactive canvas. All canvas drawing is hand-rolled so pointer feel — hover,
+//! snapping, dragging, wiring — is precise and smooth.
+//!
+//! Projects are fully independent: switching tabs never touches another document's state,
+//! so long-running work (and, in a later phase, a per-tab AI session) keeps going in the
+//! background. The clipboard is shared across tabs so you can copy from one and paste into
+//! another.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -65,6 +72,7 @@ enum Interaction {
     },
 }
 
+/// Shared across all tabs so a selection copied in one project can be pasted into another.
 struct Clipboard {
     blocks: Vec<Block>,
     connections: Vec<Connection>,
@@ -78,20 +86,34 @@ struct ChipEdit {
     prev_path: Option<PathBuf>,
 }
 
-pub struct LlmcApp {
+/// Human-friendly tab label derived from a file path (its stem), e.g. `adder.llmc` → `adder`.
+fn title_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("untitled")
+        .to_string()
+}
+
+// ===================== a single open project =====================
+
+/// One open project: its own circuit/backend, simulation, camera, selection, and all the
+/// transient editing state. Everything a tab needs lives here, so tabs are independent.
+struct Document {
     manager: CircuitManager,
     sim: Simulation,
     sim_dirty: bool,
     running: bool,
-    config: AppConfig,
-    dark: bool,
     camera: Camera,
     tool: Tool,
     interaction: Interaction,
     selection: BTreeSet<BlockId>,
     selected_conns: BTreeSet<ConnId>,
     path: Option<PathBuf>,
-    clipboard: Option<Clipboard>,
+    /// Content revision recorded at the last save; unsaved iff it differs from the manager's.
+    saved_rev: u64,
+    /// Tab label (file stem when saved, otherwise "Untitled N").
+    title: String,
     status: String,
     show_chip_dialog: bool,
     chip_name: String,
@@ -111,34 +133,33 @@ pub struct LlmcApp {
     props_has_color: bool,
     props_hz: f32,
     props_inputs: u16,
+    /// Mirrored from the app each frame so canvas colors follow the theme.
+    dark: bool,
 }
 
-impl LlmcApp {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        config: AppConfig,
-        initial: Option<PathBuf>,
+impl Document {
+    fn assemble(
+        manager: CircuitManager,
+        dark: bool,
+        path: Option<PathBuf>,
+        title: String,
+        camera: Camera,
     ) -> Self {
-        let dark = config.dark_mode;
-        apply_style(&cc.egui_ctx, dark);
-        let manager = CircuitManager::new();
         let sim = Simulation::build(&manager.circuit, &manager.chips);
-        let mut app = Self {
+        let saved_rev = manager.revision();
+        let mut doc = Self {
             manager,
             sim,
             sim_dirty: false,
             running: false,
-            dark,
-            camera: Camera {
-                pan: Vec2::new(140.0, 90.0),
-                zoom: DEFAULT_ZOOM,
-            },
+            camera,
             tool: Tool::Select,
             interaction: Interaction::Idle,
             selection: BTreeSet::new(),
             selected_conns: BTreeSet::new(),
-            path: None,
-            clipboard: None,
+            path,
+            saved_rev,
+            title,
             status: "Ready".to_string(),
             show_chip_dialog: false,
             chip_name: String::new(),
@@ -153,12 +174,38 @@ impl LlmcApp {
             props_has_color: false,
             props_hz: 1.0,
             props_inputs: 2,
-            config,
+            dark,
         };
-        if let Some(path) = initial {
-            app.load_path(&path);
-        }
-        app
+        // Settle once so combinational state (lit LEDs/wires) shows even when paused.
+        doc.sim.step(0.0);
+        doc
+    }
+
+    fn new_empty(dark: bool, title: String) -> Self {
+        let camera = Camera {
+            pan: Vec2::new(140.0, 90.0),
+            zoom: DEFAULT_ZOOM,
+        };
+        Self::assemble(CircuitManager::new(), dark, None, title, camera)
+    }
+
+    fn from_project(project: Project, dark: bool, path: PathBuf) -> Self {
+        let manager = CircuitManager::from_parts(project.circuit, project.chips);
+        let camera = Camera {
+            pan: Vec2::new(project.camera.pan_x, project.camera.pan_y),
+            zoom: project.camera.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
+        };
+        let title = title_from_path(&path);
+        Self::assemble(manager, dark, Some(path), title, camera)
+    }
+
+    /// Unsaved changes since the last save/load?
+    fn is_dirty(&self) -> bool {
+        self.manager.revision() != self.saved_rev
+    }
+
+    fn mark_saved(&mut self) {
+        self.saved_rev = self.manager.revision();
     }
 
     fn theme(&self) -> Theme {
@@ -174,6 +221,39 @@ impl LlmcApp {
         // Settle once so combinational state (lit LEDs/wires) shows even when paused.
         self.sim.step(0.0);
         self.sim_dirty = false;
+    }
+
+    /// Per-frame work for the active document: step simulation, keys, panels, canvas, dialogs.
+    fn frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, clipboard: &mut Option<Clipboard>) {
+        if self.sim_dirty {
+            self.rebuild_sim();
+        }
+        if self.running {
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1) as f64;
+            self.sim.step(dt);
+            ctx.request_repaint();
+        }
+
+        self.handle_shortcuts(ctx, clipboard);
+        self.left_palette(ui);
+        self.status_bar(ui);
+
+        let bg = self.theme().bg;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(bg))
+            .show(ui, |ui| {
+                self.canvas(ui, clipboard);
+            });
+
+        if self.show_chip_dialog {
+            self.chip_dialog(ctx);
+        }
+        if self.rename_chip.is_some() {
+            self.rename_chip_dialog(ctx);
+        }
+        if self.props_for.is_some() {
+            self.properties_window(ctx);
+        }
     }
 
     // ----- editing operations -----
@@ -220,7 +300,7 @@ impl LlmcApp {
         self.sim_dirty = true;
     }
 
-    fn copy_selection(&mut self) {
+    fn copy_selection(&mut self, clipboard: &mut Option<Clipboard>) {
         let ids: BTreeSet<_> = self.selection.iter().copied().collect();
         let blocks: Vec<Block> = ids
             .iter()
@@ -236,14 +316,14 @@ impl LlmcApp {
             .filter(|c| ids.contains(&c.from.block) && ids.contains(&c.to.block))
             .cloned()
             .collect();
-        self.clipboard = Some(Clipboard {
+        *clipboard = Some(Clipboard {
             blocks,
             connections,
         });
     }
 
-    fn paste(&mut self) {
-        let Some(clip) = &self.clipboard else {
+    fn paste(&mut self, clipboard: &Option<Clipboard>) {
+        let Some(clip) = clipboard else {
             return;
         };
         let blocks = clip.blocks.clone();
@@ -257,8 +337,8 @@ impl LlmcApp {
     }
 
     /// Paste the clipboard so its top-left lands near `world` (used by the context menu).
-    fn paste_at(&mut self, world: Vec2f) {
-        let Some(clip) = &self.clipboard else {
+    fn paste_at(&mut self, clipboard: &Option<Clipboard>, world: Vec2f) {
+        let Some(clip) = clipboard else {
             return;
         };
         let blocks = clip.blocks.clone();
@@ -296,6 +376,7 @@ impl LlmcApp {
             .map(|c| c.name.clone())
             .unwrap_or_default();
         self.manager.chips.remove(id);
+        self.manager.touch();
         if matches!(self.tool, Tool::Place(BlockType::Chip(cid)) if cid == id) {
             self.tool = Tool::Select;
         }
@@ -344,6 +425,7 @@ impl LlmcApp {
         self.manager.circuit = edit.prev_circuit;
         self.path = edit.prev_path;
         self.manager.undo.clear();
+        self.manager.touch();
         self.selection.clear();
         self.selected_conns.clear();
         self.sim_dirty = true;
@@ -445,23 +527,34 @@ impl LlmcApp {
                 }
             });
 
-        // Apply the edited buffers back to the block every frame.
+        // Apply the edited buffers back to the block, tracking whether anything changed so
+        // unsaved-state stays accurate (this runs every frame the window is open).
+        let mut changed = false;
         if let Some(b) = self.manager.circuit.block_mut(id) {
             let name = self.props_name.trim();
-            b.label = if name.is_empty() {
+            let new_label = if name.is_empty() {
                 None
             } else {
                 Some(name.to_string())
             };
-            b.color = if self.props_has_color {
+            if b.label != new_label {
+                b.label = new_label;
+                changed = true;
+            }
+            let new_color = if self.props_has_color {
                 Some(self.props_color)
             } else {
                 None
             };
+            if b.color != new_color {
+                b.color = new_color;
+                changed = true;
+            }
             if is_clock {
                 let new = Some(self.props_hz);
                 if b.freq_hz != new {
                     b.freq_hz = new;
+                    changed = true;
                     self.sim_dirty = true;
                 }
             }
@@ -469,13 +562,13 @@ impl LlmcApp {
         // Applying a new input count may orphan wires to removed pins; prune them.
         if is_variable {
             let n = self.props_inputs.clamp(2, MAX_GATE_INPUTS as u16);
-            let changed = self
+            let count_changed = self
                 .manager
                 .circuit
                 .block(id)
                 .map(|b| b.inputs != Some(n))
                 .unwrap_or(false);
-            if changed {
+            if count_changed {
                 if let Some(b) = self.manager.circuit.block_mut(id) {
                     b.inputs = Some(n);
                 }
@@ -491,8 +584,12 @@ impl LlmcApp {
                 for cid in orphans {
                     self.manager.circuit.remove_connection(cid);
                 }
+                changed = true;
                 self.sim_dirty = true;
             }
+        }
+        if changed {
+            self.manager.touch();
         }
         if !open {
             self.props_for = None;
@@ -539,106 +636,9 @@ impl LlmcApp {
         }
     }
 
-    // ----- file operations -----
-
-    fn new_circuit(&mut self) {
-        self.manager.circuit = Circuit::new("untitled");
-        self.manager.undo.clear();
-        self.selection.clear();
-        self.selected_conns.clear();
-        self.path = None;
-        self.interaction = Interaction::Idle;
-        self.sim_dirty = true;
-        self.status = "New circuit".to_string();
-    }
-
-    fn save(&mut self) {
-        if let Some(p) = self.path.clone() {
-            self.write_project(&p);
-        } else {
-            self.save_as();
-        }
-    }
-
-    fn save_as(&mut self) {
-        let mut dlg = rfd::FileDialog::new()
-            .add_filter("LLMC circuit", &["llmc"])
-            .set_file_name("circuit.llmc");
-        if let Some(dir) = &self.config.last_dir {
-            dlg = dlg.set_directory(dir);
-        }
-        if let Some(path) = dlg.save_file() {
-            self.remember_dir(&path);
-            self.path = Some(path.clone());
-            self.write_project(&path);
-        }
-    }
-
-    fn write_project(&mut self, path: &Path) {
-        let camera = CameraState {
-            pan_x: self.camera.pan.x,
-            pan_y: self.camera.pan.y,
-            zoom: self.camera.zoom,
-        };
-        let project = Project::new(
-            self.manager.circuit.clone(),
-            self.manager.chips.clone(),
-            camera,
-        );
-        match project.save(path) {
-            Ok(()) => self.status = format!("Saved {}", path.display()),
-            Err(e) => self.status = format!("Save failed: {e}"),
-        }
-    }
-
-    fn open(&mut self) {
-        let mut dlg = rfd::FileDialog::new().add_filter("LLMC circuit", &["llmc"]);
-        if let Some(dir) = &self.config.last_dir {
-            dlg = dlg.set_directory(dir);
-        }
-        if let Some(path) = dlg.pick_file() {
-            self.load_path(&path);
-        }
-    }
-
-    /// Load a project from a known path (used by the Open dialog and the CLI argument).
-    fn load_path(&mut self, path: &Path) {
-        match Project::load(path) {
-            Ok(p) => {
-                self.remember_dir(path);
-                self.manager = CircuitManager::from_parts(p.circuit, p.chips);
-                self.camera = Camera {
-                    pan: Vec2::new(p.camera.pan_x, p.camera.pan_y),
-                    zoom: p.camera.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
-                };
-                self.path = Some(path.to_path_buf());
-                self.selection.clear();
-                self.selected_conns.clear();
-                self.interaction = Interaction::Idle;
-                self.sim_dirty = true;
-                self.status = format!("Opened {}", path.display());
-            }
-            Err(e) => self.status = format!("Open failed: {e}"),
-        }
-    }
-
-    fn remember_dir(&mut self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            self.config.last_dir = Some(parent.to_path_buf());
-            self.config.save();
-        }
-    }
-
-    fn toggle_theme(&mut self, ctx: &egui::Context) {
-        self.dark = !self.dark;
-        self.config.dark_mode = self.dark;
-        apply_style(ctx, self.dark);
-        self.config.save();
-    }
-
     // ----- keyboard -----
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+    fn handle_shortcuts(&mut self, ctx: &egui::Context, clipboard: &mut Option<Clipboard>) {
         // While the chip dialog is open its text field owns the keyboard.
         if self.show_chip_dialog {
             self.space_down = false;
@@ -674,10 +674,10 @@ impl LlmcApp {
             self.duplicate_selection();
         }
         if s.cmd && s.c {
-            self.copy_selection();
+            self.copy_selection(clipboard);
         }
         if s.cmd && s.v {
-            self.paste();
+            self.paste(clipboard);
         }
         if s.cmd && s.a {
             self.select_all();
@@ -697,86 +697,7 @@ impl LlmcApp {
         }
     }
 
-    // ----- panels -----
-
-    fn top_toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("LLMC").strong().size(16.0));
-                ui.separator();
-                let editing_chip = self.chip_edit.is_some();
-                ui.add_enabled_ui(!editing_chip, |ui| {
-                    if ui.button("New").clicked() {
-                        self.new_circuit();
-                    }
-                    if ui.button("Open").clicked() {
-                        self.open();
-                    }
-                    if ui.button("Save").clicked() {
-                        self.save();
-                    }
-                    if ui.button("Save As").clicked() {
-                        self.save_as();
-                    }
-                });
-                ui.separator();
-                let run = if self.running {
-                    "\u{23f8}  Stop"
-                } else {
-                    "\u{25b6}  Run"
-                };
-                if ui.button(run).clicked() {
-                    self.running = !self.running;
-                    if self.running {
-                        self.sim_dirty = true;
-                    }
-                }
-                if ui.button("Step").clicked() {
-                    if self.sim_dirty {
-                        self.rebuild_sim();
-                    }
-                    self.sim.step(0.05);
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(self.manager.undo.can_undo(), Button::new("Undo"))
-                    .clicked()
-                {
-                    self.undo();
-                }
-                if ui
-                    .add_enabled(self.manager.undo.can_redo(), Button::new("Redo"))
-                    .clicked()
-                {
-                    self.redo();
-                }
-                ui.separator();
-                if self.chip_edit.is_some() {
-                    ui.colored_label(self.theme().accent, "\u{270e} Editing chip");
-                    if ui.button("Update chip").clicked() {
-                        self.save_chip_edit();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.cancel_chip_edit();
-                    }
-                } else if ui.button("Create Chip").clicked() {
-                    self.show_chip_dialog = true;
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let label = if self.dark { "Light" } else { "Dark" };
-                    if ui.button(label).clicked() {
-                        let ctx = ui.ctx().clone();
-                        self.toggle_theme(&ctx);
-                    }
-                    if self.sim.has_conflicts() {
-                        ui.colored_label(self.theme().conflict, "\u{26a0} multi-driver");
-                    }
-                });
-            });
-            ui.add_space(3.0);
-        });
-    }
+    // ----- panels owned by the document -----
 
     fn left_palette(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("palette")
@@ -818,7 +739,7 @@ impl LlmcApp {
                     ],
                 );
 
-                let chips: Vec<(llmc::model::ChipId, String)> = self
+                let chips: Vec<(ChipId, String)> = self
                     .manager
                     .chips
                     .iter()
@@ -969,6 +890,7 @@ impl LlmcApp {
                     if ui.add_enabled(can, Button::new("Save")).clicked() {
                         if let Some(chip) = self.manager.chips.chips.get_mut(&id) {
                             chip.name = name.trim().to_string();
+                            self.manager.touch();
                         }
                         self.status = format!("Renamed chip to '{}'", name.trim());
                         finish = true;
@@ -984,65 +906,9 @@ impl LlmcApp {
             self.rename_chip = Some((id, name));
         }
     }
-}
 
-/// Snapshot of relevant key state read in one `input` call.
-struct Keys {
-    del: bool,
-    cmd: bool,
-    shift: bool,
-    z: bool,
-    y: bool,
-    d: bool,
-    c: bool,
-    v: bool,
-    a: bool,
-    r: bool,
-    f: bool,
-    esc: bool,
-    space: bool,
-}
+    // ===================== canvas: geometry, input, drawing =====================
 
-impl eframe::App for LlmcApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        if self.sim_dirty {
-            self.rebuild_sim();
-        }
-        if self.running {
-            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1) as f64;
-            self.sim.step(dt);
-            ctx.request_repaint();
-        }
-
-        self.handle_shortcuts(&ctx);
-        self.top_toolbar(ui);
-        self.left_palette(ui);
-        self.status_bar(ui);
-
-        let bg = self.theme().bg;
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(bg))
-            .show(ui, |ui| {
-                self.canvas(ui);
-            });
-
-        if self.show_chip_dialog {
-            self.chip_dialog(&ctx);
-        }
-        if self.rename_chip.is_some() {
-            self.rename_chip_dialog(&ctx);
-        }
-        if self.props_for.is_some() {
-            self.properties_window(&ctx);
-        }
-    }
-}
-
-// ===================== canvas: geometry, input, drawing =====================
-
-impl LlmcApp {
     fn drag_offset_cells(&self, id: BlockId) -> Pos {
         if let Interaction::DragBlocks {
             offset, original, ..
@@ -1201,7 +1067,7 @@ impl LlmcApp {
         }
     }
 
-    fn canvas(&mut self, ui: &mut egui::Ui) {
+    fn canvas(&mut self, ui: &mut egui::Ui, clipboard: &mut Option<Clipboard>) {
         let size = ui.available_size();
         let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
         let origin = response.rect.min;
@@ -1249,16 +1115,16 @@ impl LlmcApp {
         self.draw_overlay(&painter, origin, cursor);
 
         if allow_menu {
-            self.canvas_context_menu(&response);
+            self.canvas_context_menu(&response, clipboard);
         }
     }
 
-    fn canvas_context_menu(&mut self, response: &Response) {
+    fn canvas_context_menu(&mut self, response: &Response, clipboard: &mut Option<Clipboard>) {
         let world = self.menu_world;
         response.context_menu(|ui| {
             let has_sel = !self.selection.is_empty() || !self.selected_conns.is_empty();
             let has_blocks = !self.selection.is_empty();
-            let has_clip = self.clipboard.is_some();
+            let has_clip = clipboard.is_some();
             let one_block = self.selection.len() == 1 && self.selected_conns.is_empty();
 
             if ui
@@ -1272,7 +1138,7 @@ impl LlmcApp {
 
             ui.add_enabled_ui(has_blocks, |ui| {
                 if ui.button("Copy").clicked() {
-                    self.copy_selection();
+                    self.copy_selection(clipboard);
                     ui.close();
                 }
                 if ui.button("Duplicate").clicked() {
@@ -1284,7 +1150,7 @@ impl LlmcApp {
                 .add_enabled(has_clip, Button::new("Paste here"))
                 .clicked()
             {
-                self.paste_at(world);
+                self.paste_at(clipboard, world);
                 ui.close();
             }
             ui.separator();
@@ -1816,6 +1682,527 @@ impl LlmcApp {
         if valid {
             painter.circle_stroke(endp, 6.0, Stroke::new(2.0, t.accent));
         }
+    }
+}
+
+// ===================== the application shell =====================
+
+/// What a pending close prompt is about.
+#[derive(Clone, Copy)]
+enum CloseKind {
+    /// A single tab is being closed.
+    Tab(usize),
+    /// The whole window is being closed.
+    Quit,
+}
+
+pub struct LlmcApp {
+    docs: Vec<Document>,
+    active: usize,
+    config: AppConfig,
+    dark: bool,
+    /// Shared across tabs so a selection copied in one project pastes into another.
+    clipboard: Option<Clipboard>,
+    /// Counter for naming fresh, never-saved projects ("Untitled 1", "Untitled 2", …).
+    untitled_count: usize,
+    /// A save/discard/cancel prompt in flight, if any.
+    close_confirm: Option<CloseKind>,
+    /// Set once the user has resolved the quit prompt so the next close request goes through.
+    allow_quit: bool,
+}
+
+impl LlmcApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        config: AppConfig,
+        initial: Option<PathBuf>,
+    ) -> Self {
+        let dark = config.dark_mode;
+        apply_style(&cc.egui_ctx, dark);
+        let mut app = Self {
+            docs: Vec::new(),
+            active: 0,
+            config,
+            dark,
+            clipboard: None,
+            untitled_count: 0,
+            close_confirm: None,
+            allow_quit: false,
+        };
+        // Open the file passed on the command line into the first tab, if any.
+        if let Some(path) = initial {
+            match Project::load(&path) {
+                Ok(project) => {
+                    app.remember_dir(&path);
+                    app.docs.push(Document::from_project(project, dark, path));
+                }
+                Err(e) => {
+                    let mut doc = app.fresh_document();
+                    doc.status = format!("Open failed: {e}");
+                    app.docs.push(doc);
+                }
+            }
+        }
+        if app.docs.is_empty() {
+            let doc = app.fresh_document();
+            app.docs.push(doc);
+        }
+        app.active = 0;
+        app
+    }
+
+    fn theme(&self) -> Theme {
+        if self.dark {
+            Theme::dark()
+        } else {
+            Theme::light()
+        }
+    }
+
+    /// A new empty document with the next "Untitled N" title.
+    fn fresh_document(&mut self) -> Document {
+        self.untitled_count += 1;
+        Document::new_empty(self.dark, format!("Untitled {}", self.untitled_count))
+    }
+
+    fn new_tab(&mut self) {
+        let doc = self.fresh_document();
+        self.docs.push(doc);
+        self.active = self.docs.len() - 1;
+    }
+
+    fn open(&mut self) {
+        let mut dlg = rfd::FileDialog::new().add_filter("LLMC circuit", &["llmc"]);
+        if let Some(dir) = &self.config.last_dir {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(path) = dlg.pick_file() {
+            self.open_path(&path);
+        }
+    }
+
+    /// Load a project from a known path into a new tab.
+    fn open_path(&mut self, path: &Path) {
+        // If this file is already open, just focus its tab.
+        if let Some(i) = self
+            .docs
+            .iter()
+            .position(|d| d.path.as_deref() == Some(path))
+        {
+            self.active = i;
+            return;
+        }
+        match Project::load(path) {
+            Ok(project) => {
+                self.remember_dir(path);
+                let mut doc = Document::from_project(project, self.dark, path.to_path_buf());
+                doc.status = format!("Opened {}", path.display());
+                self.docs.push(doc);
+                self.active = self.docs.len() - 1;
+            }
+            Err(e) => {
+                self.docs[self.active].status = format!("Open failed: {e}");
+            }
+        }
+    }
+
+    /// Save the given tab, prompting for a location when it has never been saved.
+    /// Returns whether the project ended up written (false if the user cancelled Save As).
+    fn save_doc(&mut self, i: usize) -> bool {
+        if i >= self.docs.len() {
+            return false;
+        }
+        let path = self.docs[i].path.clone();
+        match path {
+            Some(p) => {
+                self.write_doc(i, &p);
+                true
+            }
+            None => {
+                let mut dlg = rfd::FileDialog::new()
+                    .add_filter("LLMC circuit", &["llmc"])
+                    .set_file_name(format!("{}.llmc", self.docs[i].title));
+                if let Some(dir) = &self.config.last_dir {
+                    dlg = dlg.set_directory(dir);
+                }
+                if let Some(path) = dlg.save_file() {
+                    self.remember_dir(&path);
+                    self.docs[i].path = Some(path.clone());
+                    self.docs[i].title = title_from_path(&path);
+                    self.write_doc(i, &path);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Force a Save As for the given tab regardless of its current path.
+    fn save_doc_as(&mut self, i: usize) {
+        if i >= self.docs.len() {
+            return;
+        }
+        let mut dlg = rfd::FileDialog::new()
+            .add_filter("LLMC circuit", &["llmc"])
+            .set_file_name(format!("{}.llmc", self.docs[i].title));
+        if let Some(dir) = &self.config.last_dir {
+            dlg = dlg.set_directory(dir);
+        }
+        if let Some(path) = dlg.save_file() {
+            self.remember_dir(&path);
+            self.docs[i].path = Some(path.clone());
+            self.docs[i].title = title_from_path(&path);
+            self.write_doc(i, &path);
+        }
+    }
+
+    fn write_doc(&mut self, i: usize, path: &Path) {
+        let doc = &mut self.docs[i];
+        let camera = CameraState {
+            pan_x: doc.camera.pan.x,
+            pan_y: doc.camera.pan.y,
+            zoom: doc.camera.zoom,
+        };
+        let project = Project::new(
+            doc.manager.circuit.clone(),
+            doc.manager.chips.clone(),
+            camera,
+        );
+        match project.save(path) {
+            Ok(()) => {
+                doc.mark_saved();
+                doc.status = format!("Saved {}", path.display());
+            }
+            Err(e) => doc.status = format!("Save failed: {e}"),
+        }
+    }
+
+    fn remember_dir(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.config.last_dir = Some(parent.to_path_buf());
+            self.config.save();
+        }
+    }
+
+    fn toggle_theme(&mut self, ctx: &egui::Context) {
+        self.dark = !self.dark;
+        self.config.dark_mode = self.dark;
+        apply_style(ctx, self.dark);
+        self.config.save();
+    }
+
+    /// Close a tab unconditionally (the dirty check happens in [`LlmcApp::request_close_tab`]).
+    /// The window always keeps at least one tab: closing the last one resets it to empty.
+    fn close_tab(&mut self, i: usize) {
+        if i >= self.docs.len() {
+            return;
+        }
+        if self.docs.len() == 1 {
+            let doc = self.fresh_document();
+            self.docs[0] = doc;
+            self.active = 0;
+            return;
+        }
+        self.docs.remove(i);
+        if self.active > i {
+            self.active -= 1;
+        }
+        if self.active >= self.docs.len() {
+            self.active = self.docs.len() - 1;
+        }
+    }
+
+    /// Begin closing a tab: prompt to save if it has unsaved changes, else close it now.
+    fn request_close_tab(&mut self, i: usize) {
+        let dirty = self.docs.get(i).map(|d| d.is_dirty()).unwrap_or(false);
+        if dirty {
+            self.active = i;
+            self.close_confirm = Some(CloseKind::Tab(i));
+        } else {
+            self.close_tab(i);
+        }
+    }
+
+    // ----- top panels (app-level, delegating per-doc actions to the active document) -----
+
+    fn top_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let active = self.active;
+        egui::Panel::top("toolbar").show(ui, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("LLMC").strong().size(16.0));
+                ui.separator();
+                let editing_chip = self.docs[active].chip_edit.is_some();
+                ui.add_enabled_ui(!editing_chip, |ui| {
+                    if ui.button("New").clicked() {
+                        self.new_tab();
+                    }
+                    if ui.button("Open").clicked() {
+                        self.open();
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save_doc(self.active);
+                    }
+                    if ui.button("Save As").clicked() {
+                        self.save_doc_as(self.active);
+                    }
+                });
+                ui.separator();
+                let running = self.docs[active].running;
+                let run = if running {
+                    "\u{23f8}  Stop"
+                } else {
+                    "\u{25b6}  Run"
+                };
+                if ui.button(run).clicked() {
+                    let doc = &mut self.docs[active];
+                    doc.running = !doc.running;
+                    if doc.running {
+                        doc.sim_dirty = true;
+                    }
+                }
+                if ui.button("Step").clicked() {
+                    let doc = &mut self.docs[active];
+                    if doc.sim_dirty {
+                        doc.rebuild_sim();
+                    }
+                    doc.sim.step(0.05);
+                }
+                ui.separator();
+                let (can_undo, can_redo) = {
+                    let u = &self.docs[active].manager.undo;
+                    (u.can_undo(), u.can_redo())
+                };
+                if ui.add_enabled(can_undo, Button::new("Undo")).clicked() {
+                    self.docs[active].undo();
+                }
+                if ui.add_enabled(can_redo, Button::new("Redo")).clicked() {
+                    self.docs[active].redo();
+                }
+                ui.separator();
+                if self.docs[active].chip_edit.is_some() {
+                    ui.colored_label(self.theme().accent, "\u{270e} Editing chip");
+                    if ui.button("Update chip").clicked() {
+                        self.docs[active].save_chip_edit();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.docs[active].cancel_chip_edit();
+                    }
+                } else if ui.button("Create Chip").clicked() {
+                    self.docs[active].show_chip_dialog = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let label = if self.dark { "Light" } else { "Dark" };
+                    if ui.button(label).clicked() {
+                        self.toggle_theme(ctx);
+                    }
+                    if self.docs[active].sim.has_conflicts() {
+                        ui.colored_label(self.theme().conflict, "\u{26a0} multi-driver");
+                    }
+                });
+            });
+            ui.add_space(3.0);
+        });
+    }
+
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let t = self.theme();
+        egui::Panel::top("tabs").show(ui, |ui| {
+            ui.add_space(2.0);
+            let mut select: Option<usize> = None;
+            let mut close: Option<usize> = None;
+            let mut add = false;
+            egui::ScrollArea::horizontal()
+                .max_width(f32::INFINITY)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, doc) in self.docs.iter().enumerate() {
+                            let selected = i == self.active;
+                            let dirty = doc.is_dirty();
+                            let name = if dirty {
+                                format!("{} \u{2022}", doc.title)
+                            } else {
+                                doc.title.clone()
+                            };
+                            let text = if selected {
+                                RichText::new(name).strong()
+                            } else {
+                                RichText::new(name).color(t.label_dim)
+                            };
+                            if ui.selectable_label(selected, text).clicked() {
+                                select = Some(i);
+                            }
+                            if ui
+                                .add(Button::new(RichText::new("\u{00d7}").small()).frame(false))
+                                .on_hover_text("Close tab")
+                                .clicked()
+                            {
+                                close = Some(i);
+                            }
+                            ui.separator();
+                        }
+                        if ui
+                            .add(Button::new("+").frame(false))
+                            .on_hover_text("New project")
+                            .clicked()
+                        {
+                            add = true;
+                        }
+                    });
+                });
+            ui.add_space(2.0);
+            if let Some(i) = select {
+                self.active = i;
+            }
+            if add {
+                self.new_tab();
+            }
+            if let Some(i) = close {
+                self.request_close_tab(i);
+            }
+        });
+    }
+
+    /// The save/discard/cancel prompt shown before a dirty tab or the window is closed.
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.close_confirm else {
+            return;
+        };
+        let mut decision: Option<Decision> = None;
+        let title = match kind {
+            CloseKind::Tab(i) => format!(
+                "Save changes to \u{201c}{}\u{201d} before closing?",
+                self.docs.get(i).map(|d| d.title.as_str()).unwrap_or("")
+            ),
+            CloseKind::Quit => {
+                let n = self.docs.iter().filter(|d| d.is_dirty()).count();
+                format!("You have unsaved changes in {n} project(s).")
+            }
+        };
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(title);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Your changes will be lost if you don't save them.")
+                        .small()
+                        .color(self.theme().label_dim),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let save_label = match kind {
+                        CloseKind::Quit => "Save all",
+                        CloseKind::Tab(_) => "Save",
+                    };
+                    if ui.button(save_label).clicked() {
+                        decision = Some(Decision::Save);
+                    }
+                    if ui.button("Don't save").clicked() {
+                        decision = Some(Decision::Discard);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(Decision::Cancel);
+                    }
+                });
+            });
+
+        let Some(decision) = decision else {
+            return;
+        };
+        self.close_confirm = None;
+        match (kind, decision) {
+            (_, Decision::Cancel) => {}
+            (CloseKind::Tab(i), Decision::Save) => {
+                if self.save_doc(i) {
+                    self.close_tab(i);
+                }
+                // If the Save As was cancelled, leave the tab open.
+            }
+            (CloseKind::Tab(i), Decision::Discard) => self.close_tab(i),
+            (CloseKind::Quit, Decision::Save) => {
+                let mut all_saved = true;
+                for i in 0..self.docs.len() {
+                    if self.docs[i].is_dirty() && !self.save_doc(i) {
+                        all_saved = false;
+                        break;
+                    }
+                }
+                if all_saved {
+                    self.allow_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            (CloseKind::Quit, Decision::Discard) => {
+                self.allow_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Intercept the window's close button so unsaved work can prompt first.
+    fn handle_quit_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.allow_quit {
+            return; // already confirmed — let the close proceed
+        }
+        if self.docs.iter().any(|d| d.is_dirty()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_confirm = Some(CloseKind::Quit);
+        }
+        // No unsaved work: allow the close.
+    }
+}
+
+/// The user's answer to the unsaved-changes prompt.
+enum Decision {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// Snapshot of relevant key state read in one `input` call.
+struct Keys {
+    del: bool,
+    cmd: bool,
+    shift: bool,
+    z: bool,
+    y: bool,
+    d: bool,
+    c: bool,
+    v: bool,
+    a: bool,
+    r: bool,
+    f: bool,
+    esc: bool,
+    space: bool,
+}
+
+impl eframe::App for LlmcApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
+        // Keep the active document's theme flag in sync (only it renders).
+        let dark = self.dark;
+        self.docs[self.active].dark = dark;
+
+        self.top_toolbar(ui, &ctx);
+        self.tab_bar(ui);
+
+        // Delegate the palette, status bar, canvas, and dialogs to the active document.
+        // `docs[active]` and `clipboard` are disjoint fields, so both can be borrowed.
+        let active = self.active;
+        let clipboard = &mut self.clipboard;
+        self.docs[active].frame(ui, &ctx, clipboard);
+
+        // App-level modals and window-close handling.
+        self.close_dialog(&ctx);
+        self.handle_quit_request(&ctx);
     }
 }
 

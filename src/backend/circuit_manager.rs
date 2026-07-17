@@ -16,6 +16,9 @@ pub struct CircuitManager {
     pub circuit: Circuit,
     pub chips: ChipLibrary,
     pub undo: UndoSystem,
+    /// Monotonic counter bumped on every content change. The UI compares it against the
+    /// value at the last save to know whether a project has unsaved edits.
+    revision: u64,
 }
 
 impl CircuitManager {
@@ -24,6 +27,7 @@ impl CircuitManager {
             circuit: Circuit::new("untitled"),
             chips: ChipLibrary::default(),
             undo: UndoSystem::default(),
+            revision: 0,
         }
     }
 
@@ -32,21 +36,42 @@ impl CircuitManager {
             circuit,
             chips,
             undo: UndoSystem::default(),
+            revision: 0,
         }
+    }
+
+    /// The current content revision (see [`CircuitManager::revision`]).
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Note a content change made outside the command path (e.g. a block's color/name or
+    /// a chip rename edited in place), so unsaved-change tracking stays accurate.
+    pub fn touch(&mut self) {
+        self.revision += 1;
     }
 
     /// Apply an edit batch as one undoable step.
     pub fn apply(&mut self, batch: Vec<EditCommand>) {
         let inverse = apply_batch(&mut self.circuit, batch);
         self.undo.record(inverse);
+        self.revision += 1;
     }
 
     pub fn undo(&mut self) -> bool {
-        self.undo.undo(&mut self.circuit)
+        let changed = self.undo.undo(&mut self.circuit);
+        if changed {
+            self.revision += 1;
+        }
+        changed
     }
 
     pub fn redo(&mut self) -> bool {
-        self.undo.redo(&mut self.circuit)
+        let changed = self.undo.redo(&mut self.circuit);
+        if changed {
+            self.revision += 1;
+        }
+        changed
     }
 
     // --- convenience operations (each is a single undo step) ---
@@ -172,6 +197,7 @@ impl CircuitManager {
         let id = self.chips.allocate_id();
         let def = ChipDef::from_circuit(id, name, self.circuit.clone());
         self.chips.insert(def);
+        self.revision += 1;
         id
     }
 }

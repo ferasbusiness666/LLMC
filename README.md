@@ -24,7 +24,10 @@ and drop it back onto the canvas.
   (e.g. build a full adder once, drop four to make a 4-bit adder).
 - **Full editing** — select (click / shift-click / box select), move, rotate, flip,
   duplicate, copy/paste, delete, and unlimited undo/redo.
-- **Save/Load** — versioned `.llmc` JSON project files; persistent app settings.
+- **Project tabs** — open several fully independent projects at once (each with its own
+  circuit, chips, undo history, and view); copy from one tab and paste into another.
+- **Save/Load** — versioned `.llmc` JSON project files with an **unsaved-changes prompt**
+  before you close a tab or the app; persistent app settings.
 
 ### Components
 
@@ -46,6 +49,8 @@ A prebuilt Windows binary (`llmc.exe`) is produced by CI on every push — see t
 
 | Action | Input |
 | --- | --- |
+| New project / switch / close | tab bar: **+** to open a tab · click a tab to switch · **×** to close |
+| Save prompt | closing a tab or the app with unsaved changes asks to Save / Don't Save / Cancel |
 | Place a component | pick it in the left palette, then click the canvas |
 | Cancel the held component | right-click, or `Esc` |
 | Select | click a block/wire · Shift-click to add · drag on empty space to box-select (grabs blocks **and** wires) |
