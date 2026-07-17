@@ -9,7 +9,9 @@
 //! background. The clipboard is shared across tabs so you can copy from one and paste into
 //! another.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
@@ -100,6 +102,9 @@ fn title_from_path(path: &Path) -> String {
 /// One open project: its own circuit/backend, simulation, camera, selection, and all the
 /// transient editing state. Everything a tab needs lives here, so tabs are independent.
 struct Document {
+    /// Stable identity for this open project, so tab actions survive reordering/closing
+    /// of other tabs (never reuse an index to refer to a document across frames).
+    id: u64,
     manager: CircuitManager,
     sim: Simulation,
     sim_dirty: bool,
@@ -110,8 +115,15 @@ struct Document {
     selection: BTreeSet<BlockId>,
     selected_conns: BTreeSet<ConnId>,
     path: Option<PathBuf>,
-    /// Content revision recorded at the last save; unsaved iff it differs from the manager's.
-    saved_rev: u64,
+    /// Fingerprint of the serialized circuit+chips at the last save/load. The project is
+    /// unsaved exactly when the current content fingerprint differs from this (see
+    /// `content_fingerprint`) — i.e. dirtiness reflects real content, so undoing back to
+    /// the saved state, or reverting an edit, correctly clears it.
+    saved_fingerprint: u64,
+    /// Cached result of the last dirtiness check. Only the active document's content can
+    /// change in a frame, so this is recomputed once per frame for it and left frozen (and
+    /// correct) for inactive tabs — the tab bar reads it every frame without re-hashing.
+    dirty: bool,
     /// Tab label (file stem when saved, otherwise "Untitled N").
     title: String,
     status: String,
@@ -146,8 +158,8 @@ impl Document {
         camera: Camera,
     ) -> Self {
         let sim = Simulation::build(&manager.circuit, &manager.chips);
-        let saved_rev = manager.revision();
         let mut doc = Self {
+            id: 0,
             manager,
             sim,
             sim_dirty: false,
@@ -158,7 +170,8 @@ impl Document {
             selection: BTreeSet::new(),
             selected_conns: BTreeSet::new(),
             path,
-            saved_rev,
+            saved_fingerprint: 0,
+            dirty: false,
             title,
             status: "Ready".to_string(),
             show_chip_dialog: false,
@@ -176,6 +189,8 @@ impl Document {
             props_inputs: 2,
             dark,
         };
+        // The freshly-loaded/empty content is the "saved" baseline.
+        doc.saved_fingerprint = doc.content_fingerprint();
         // Settle once so combinational state (lit LEDs/wires) shows even when paused.
         doc.sim.step(0.0);
         doc
@@ -199,13 +214,56 @@ impl Document {
         Self::assemble(manager, dark, Some(path), title, camera)
     }
 
-    /// Unsaved changes since the last save/load?
-    fn is_dirty(&self) -> bool {
-        self.manager.revision() != self.saved_rev
+    /// A fingerprint of the saveable *logical* content: block/connection/chip data, but
+    /// deliberately NOT the camera (so panning never counts as an edit) nor the id-allocator
+    /// counters (`next_block`/`next_conn`/`next_id`), which only ever grow and are not rolled
+    /// back by undo — hashing them would make "undo to the saved state" look dirty. The
+    /// model's deterministic BTreeMap ordering makes equal content yield an equal value.
+    fn content_fingerprint(&self) -> u64 {
+        let c = &self.manager.circuit;
+        let chips: Vec<_> = self
+            .manager
+            .chips
+            .iter()
+            .map(|d| {
+                (
+                    d.id,
+                    &d.name,
+                    &d.circuit.name,
+                    &d.circuit.blocks,
+                    &d.circuit.connections,
+                    &d.input_blocks,
+                    &d.output_blocks,
+                )
+            })
+            .collect();
+        let view = (&c.name, &c.blocks, &c.connections, &chips);
+        let mut h = DefaultHasher::new();
+        match serde_json::to_vec(&view) {
+            Ok(bytes) => h.write(&bytes),
+            // Serialization of the model cannot realistically fail; if it ever did, fold in
+            // a marker so current and saved fingerprints stay comparable (never falsely clean).
+            Err(_) => h.write(b"llmc-fingerprint-error"),
+        }
+        h.finish()
     }
 
+    /// Whether the project has unsaved changes (cheap: returns the cached result).
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Recompute the cached dirty flag from actual content. An in-progress chip edit always
+    /// counts as unsaved work (the sub-edit isn't committed to the project yet).
+    fn recompute_dirty(&mut self) {
+        self.dirty =
+            self.chip_edit.is_some() || self.content_fingerprint() != self.saved_fingerprint;
+    }
+
+    /// Record the current content as the saved baseline and refresh the dirty flag.
     fn mark_saved(&mut self) {
-        self.saved_rev = self.manager.revision();
+        self.saved_fingerprint = self.content_fingerprint();
+        self.recompute_dirty();
     }
 
     fn theme(&self) -> Theme {
@@ -376,7 +434,6 @@ impl Document {
             .map(|c| c.name.clone())
             .unwrap_or_default();
         self.manager.chips.remove(id);
-        self.manager.touch();
         if matches!(self.tool, Tool::Place(BlockType::Chip(cid)) if cid == id) {
             self.tool = Tool::Select;
         }
@@ -425,7 +482,6 @@ impl Document {
         self.manager.circuit = edit.prev_circuit;
         self.path = edit.prev_path;
         self.manager.undo.clear();
-        self.manager.touch();
         self.selection.clear();
         self.selected_conns.clear();
         self.sim_dirty = true;
@@ -527,34 +583,24 @@ impl Document {
                 }
             });
 
-        // Apply the edited buffers back to the block, tracking whether anything changed so
-        // unsaved-state stays accurate (this runs every frame the window is open).
-        let mut changed = false;
+        // Apply the edited buffers back to the block (this runs every frame the window is
+        // open; the fingerprint picks up any real change for unsaved-state tracking).
         if let Some(b) = self.manager.circuit.block_mut(id) {
             let name = self.props_name.trim();
-            let new_label = if name.is_empty() {
+            b.label = if name.is_empty() {
                 None
             } else {
                 Some(name.to_string())
             };
-            if b.label != new_label {
-                b.label = new_label;
-                changed = true;
-            }
-            let new_color = if self.props_has_color {
+            b.color = if self.props_has_color {
                 Some(self.props_color)
             } else {
                 None
             };
-            if b.color != new_color {
-                b.color = new_color;
-                changed = true;
-            }
             if is_clock {
                 let new = Some(self.props_hz);
                 if b.freq_hz != new {
                     b.freq_hz = new;
-                    changed = true;
                     self.sim_dirty = true;
                 }
             }
@@ -584,12 +630,8 @@ impl Document {
                 for cid in orphans {
                     self.manager.circuit.remove_connection(cid);
                 }
-                changed = true;
                 self.sim_dirty = true;
             }
-        }
-        if changed {
-            self.manager.touch();
         }
         if !open {
             self.props_for = None;
@@ -890,7 +932,6 @@ impl Document {
                     if ui.add_enabled(can, Button::new("Save")).clicked() {
                         if let Some(chip) = self.manager.chips.chips.get_mut(&id) {
                             chip.name = name.trim().to_string();
-                            self.manager.touch();
                         }
                         self.status = format!("Renamed chip to '{}'", name.trim());
                         finish = true;
@@ -1690,8 +1731,9 @@ impl Document {
 /// What a pending close prompt is about.
 #[derive(Clone, Copy)]
 enum CloseKind {
-    /// A single tab is being closed.
-    Tab(usize),
+    /// A single tab is being closed, identified by its stable document id (not an index,
+    /// which could point at a different tab if the vector changes while the prompt is open).
+    Tab(u64),
     /// The whole window is being closed.
     Quit,
 }
@@ -1705,6 +1747,8 @@ pub struct LlmcApp {
     clipboard: Option<Clipboard>,
     /// Counter for naming fresh, never-saved projects ("Untitled 1", "Untitled 2", …).
     untitled_count: usize,
+    /// Source of stable per-document ids (see [`Document::id`]).
+    next_doc_id: u64,
     /// A save/discard/cancel prompt in flight, if any.
     close_confirm: Option<CloseKind>,
     /// Set once the user has resolved the quit prompt so the next close request goes through.
@@ -1726,6 +1770,7 @@ impl LlmcApp {
             dark,
             clipboard: None,
             untitled_count: 0,
+            next_doc_id: 0,
             close_confirm: None,
             allow_quit: false,
         };
@@ -1734,18 +1779,19 @@ impl LlmcApp {
             match Project::load(&path) {
                 Ok(project) => {
                     app.remember_dir(&path);
-                    app.docs.push(Document::from_project(project, dark, path));
+                    let doc = Document::from_project(project, dark, path);
+                    app.push_doc(doc);
                 }
                 Err(e) => {
                     let mut doc = app.fresh_document();
                     doc.status = format!("Open failed: {e}");
-                    app.docs.push(doc);
+                    app.push_doc(doc);
                 }
             }
         }
         if app.docs.is_empty() {
             let doc = app.fresh_document();
-            app.docs.push(doc);
+            app.push_doc(doc);
         }
         app.active = 0;
         app
@@ -1759,16 +1805,28 @@ impl LlmcApp {
         }
     }
 
-    /// A new empty document with the next "Untitled N" title.
+    fn alloc_doc_id(&mut self) -> u64 {
+        let id = self.next_doc_id;
+        self.next_doc_id += 1;
+        id
+    }
+
+    /// A new empty document with the next "Untitled N" title (id assigned on insertion).
     fn fresh_document(&mut self) -> Document {
         self.untitled_count += 1;
         Document::new_empty(self.dark, format!("Untitled {}", self.untitled_count))
     }
 
+    /// Assign a stable id and append the document. Returns its index; does not change focus.
+    fn push_doc(&mut self, mut doc: Document) -> usize {
+        doc.id = self.alloc_doc_id();
+        self.docs.push(doc);
+        self.docs.len() - 1
+    }
+
     fn new_tab(&mut self) {
         let doc = self.fresh_document();
-        self.docs.push(doc);
-        self.active = self.docs.len() - 1;
+        self.active = self.push_doc(doc);
     }
 
     fn open(&mut self) {
@@ -1797,8 +1855,7 @@ impl LlmcApp {
                 self.remember_dir(path);
                 let mut doc = Document::from_project(project, self.dark, path.to_path_buf());
                 doc.status = format!("Opened {}", path.display());
-                self.docs.push(doc);
-                self.active = self.docs.len() - 1;
+                self.active = self.push_doc(doc);
             }
             Err(e) => {
                 self.docs[self.active].status = format!("Open failed: {e}");
@@ -1807,17 +1864,22 @@ impl LlmcApp {
     }
 
     /// Save the given tab, prompting for a location when it has never been saved.
-    /// Returns whether the project ended up written (false if the user cancelled Save As).
+    /// Returns whether the project was actually written — false if the user cancelled the
+    /// Save As dialog *or* the write itself failed, so callers must not close a tab whose
+    /// save did not succeed.
     fn save_doc(&mut self, i: usize) -> bool {
         if i >= self.docs.len() {
             return false;
         }
+        // An in-progress chip edit swaps the live circuit for the chip's internals and
+        // stashes the project. Commit it first so we persist the real project (with the
+        // chip changes folded in) instead of the chip's sub-circuit, and never lose either.
+        if self.docs[i].chip_edit.is_some() {
+            self.docs[i].save_chip_edit();
+        }
         let path = self.docs[i].path.clone();
         match path {
-            Some(p) => {
-                self.write_doc(i, &p);
-                true
-            }
+            Some(p) => self.write_doc(i, &p),
             None => {
                 let mut dlg = rfd::FileDialog::new()
                     .add_filter("LLMC circuit", &["llmc"])
@@ -1829,8 +1891,7 @@ impl LlmcApp {
                     self.remember_dir(&path);
                     self.docs[i].path = Some(path.clone());
                     self.docs[i].title = title_from_path(&path);
-                    self.write_doc(i, &path);
-                    true
+                    self.write_doc(i, &path)
                 } else {
                     false
                 }
@@ -1842,6 +1903,9 @@ impl LlmcApp {
     fn save_doc_as(&mut self, i: usize) {
         if i >= self.docs.len() {
             return;
+        }
+        if self.docs[i].chip_edit.is_some() {
+            self.docs[i].save_chip_edit();
         }
         let mut dlg = rfd::FileDialog::new()
             .add_filter("LLMC circuit", &["llmc"])
@@ -1857,7 +1921,8 @@ impl LlmcApp {
         }
     }
 
-    fn write_doc(&mut self, i: usize, path: &Path) {
+    /// Serialize the tab to `path`. Returns whether the write succeeded.
+    fn write_doc(&mut self, i: usize, path: &Path) -> bool {
         let doc = &mut self.docs[i];
         let camera = CameraState {
             pan_x: doc.camera.pan.x,
@@ -1873,8 +1938,12 @@ impl LlmcApp {
             Ok(()) => {
                 doc.mark_saved();
                 doc.status = format!("Saved {}", path.display());
+                true
             }
-            Err(e) => doc.status = format!("Save failed: {e}"),
+            Err(e) => {
+                doc.status = format!("Save failed: {e}");
+                false
+            }
         }
     }
 
@@ -1899,7 +1968,8 @@ impl LlmcApp {
             return;
         }
         if self.docs.len() == 1 {
-            let doc = self.fresh_document();
+            let mut doc = self.fresh_document();
+            doc.id = self.alloc_doc_id();
             self.docs[0] = doc;
             self.active = 0;
             return;
@@ -1915,13 +1985,21 @@ impl LlmcApp {
 
     /// Begin closing a tab: prompt to save if it has unsaved changes, else close it now.
     fn request_close_tab(&mut self, i: usize) {
-        let dirty = self.docs.get(i).map(|d| d.is_dirty()).unwrap_or(false);
-        if dirty {
+        let Some(doc) = self.docs.get(i) else {
+            return;
+        };
+        if doc.is_dirty() {
+            let id = doc.id;
             self.active = i;
-            self.close_confirm = Some(CloseKind::Tab(i));
+            self.close_confirm = Some(CloseKind::Tab(id));
         } else {
             self.close_tab(i);
         }
+    }
+
+    /// Current index of the document with the given stable id, if it's still open.
+    fn doc_index(&self, id: u64) -> Option<usize> {
+        self.docs.iter().position(|d| d.id == id)
     }
 
     // ----- top panels (app-level, delegating per-doc actions to the active document) -----
@@ -2069,11 +2147,21 @@ impl LlmcApp {
         let Some(kind) = self.close_confirm else {
             return;
         };
+        // The prompted tab may have been closed/reordered already (the prompt isn't modal);
+        // resolve it by stable id and drop the prompt if it's gone.
+        if let CloseKind::Tab(id) = kind {
+            if self.doc_index(id).is_none() {
+                self.close_confirm = None;
+                return;
+            }
+        }
         let mut decision: Option<Decision> = None;
         let title = match kind {
-            CloseKind::Tab(i) => format!(
+            CloseKind::Tab(id) => format!(
                 "Save changes to \u{201c}{}\u{201d} before closing?",
-                self.docs.get(i).map(|d| d.title.as_str()).unwrap_or("")
+                self.doc_index(id)
+                    .map(|i| self.docs[i].title.as_str())
+                    .unwrap_or("")
             ),
             CloseKind::Quit => {
                 let n = self.docs.iter().filter(|d| d.is_dirty()).count();
@@ -2116,13 +2204,23 @@ impl LlmcApp {
         self.close_confirm = None;
         match (kind, decision) {
             (_, Decision::Cancel) => {}
-            (CloseKind::Tab(i), Decision::Save) => {
-                if self.save_doc(i) {
+            (CloseKind::Tab(id), Decision::Save) => {
+                if let Some(i) = self.doc_index(id) {
+                    if self.save_doc(i) {
+                        // Re-resolve: saving an untitled tab shows a native dialog, during
+                        // which nothing here can change the vector, but stay defensive.
+                        if let Some(i) = self.doc_index(id) {
+                            self.close_tab(i);
+                        }
+                    }
+                    // If the save was cancelled or failed, leave the tab open.
+                }
+            }
+            (CloseKind::Tab(id), Decision::Discard) => {
+                if let Some(i) = self.doc_index(id) {
                     self.close_tab(i);
                 }
-                // If the Save As was cancelled, leave the tab open.
             }
-            (CloseKind::Tab(i), Decision::Discard) => self.close_tab(i),
             (CloseKind::Quit, Decision::Save) => {
                 let mut all_saved = true;
                 for i in 0..self.docs.len() {
@@ -2187,18 +2285,24 @@ impl eframe::App for LlmcApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        // Keep the active document's theme flag in sync (only it renders).
-        let dark = self.dark;
-        self.docs[self.active].dark = dark;
-
+        // The toolbar may toggle the theme this frame, so render it (and the tab bar) first…
         self.top_toolbar(ui, &ctx);
         self.tab_bar(ui);
 
+        // …then sync the (possibly just-flipped) theme into the active document, so the
+        // canvas paints in the same theme as the chrome on the very same frame.
+        let active = self.active;
+        self.docs[active].dark = self.dark;
+
         // Delegate the palette, status bar, canvas, and dialogs to the active document.
         // `docs[active]` and `clipboard` are disjoint fields, so both can be borrowed.
-        let active = self.active;
         let clipboard = &mut self.clipboard;
         self.docs[active].frame(ui, &ctx, clipboard);
+
+        // Only the active document can have changed this frame; refresh its dirty flag from
+        // the actual content so the tab bar and close prompts stay accurate (inactive tabs
+        // can't change, so their cached flag stays correct without re-hashing).
+        self.docs[active].recompute_dirty();
 
         // App-level modals and window-close handling.
         self.close_dialog(&ctx);
@@ -2331,5 +2435,70 @@ mod tests {
             Pos2::new(30.0, 25.0),
             rect
         ));
+    }
+
+    fn doc() -> Document {
+        Document::new_empty(true, "test".to_string())
+    }
+
+    #[test]
+    fn dirty_reflects_real_content_changes() {
+        let mut d = doc();
+        d.recompute_dirty();
+        assert!(!d.is_dirty(), "a fresh empty project is clean");
+
+        let id = d.manager.add_block(BlockType::Switch, Pos::new(0, 0));
+        d.recompute_dirty();
+        assert!(d.is_dirty(), "adding a block is an unsaved change");
+
+        d.mark_saved();
+        assert!(!d.is_dirty(), "saving clears the dirty flag");
+
+        // A switch's on/off state is part of the serialized project, so toggling it must
+        // count as an unsaved change (finding: switch toggle was silently lost on close).
+        d.manager.circuit.block_mut(id).unwrap().state = true;
+        d.recompute_dirty();
+        assert!(d.is_dirty(), "toggling a switch dirties the project");
+    }
+
+    #[test]
+    fn undo_back_to_saved_state_is_clean() {
+        let mut d = doc();
+        d.mark_saved();
+        d.manager.add_block(BlockType::And, Pos::new(1, 1));
+        d.recompute_dirty();
+        assert!(d.is_dirty());
+
+        // Undoing all the way back to the saved content must clear dirtiness, not leave it
+        // stuck on (the monotonic-counter approach could not detect this).
+        assert!(d.manager.undo());
+        d.recompute_dirty();
+        assert!(!d.is_dirty(), "undo back to the saved state is clean again");
+    }
+
+    #[test]
+    fn in_progress_chip_edit_counts_as_unsaved() {
+        let mut d = doc();
+        d.mark_saved();
+        assert!(!d.is_dirty());
+
+        // While a chip is being edited the live circuit is the chip's internals; the project
+        // has uncommitted sub-work, so the document must read as dirty regardless of content.
+        d.chip_edit = Some(ChipEdit {
+            id: ChipId(0),
+            prev_circuit: Circuit::new("proj"),
+            prev_path: None,
+        });
+        d.recompute_dirty();
+        assert!(d.is_dirty(), "an open chip edit is unsaved work");
+
+        // Cancelling restores the exact pre-edit content, which must read clean again
+        // (finding: cancel left the project spuriously dirty).
+        d.chip_edit = None;
+        d.recompute_dirty();
+        assert!(
+            !d.is_dirty(),
+            "reverting the chip edit restores a clean project"
+        );
     }
 }
