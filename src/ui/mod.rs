@@ -2,6 +2,7 @@
 //! lives in the `llmc` library crate.
 
 mod app;
+mod assistant;
 mod glyphs;
 mod theme;
 

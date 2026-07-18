@@ -26,6 +26,7 @@ use llmc::model::{
     PortKind, Pos, Vec2f, MAX_GATE_INPUTS,
 };
 
+use super::assistant::{self, AiSession, AiSettings};
 use super::glyphs::{draw_block, BlockStyle};
 use super::theme::{apply_style, Theme};
 
@@ -145,6 +146,8 @@ struct Document {
     props_has_color: bool,
     props_hz: f32,
     props_inputs: u16,
+    /// This project's own assistant conversation (independent per tab).
+    ai: assistant::AiSession,
     /// Mirrored from the app each frame so canvas colors follow the theme.
     dark: bool,
 }
@@ -187,6 +190,7 @@ impl Document {
             props_has_color: false,
             props_hz: 1.0,
             props_inputs: 2,
+            ai: AiSession::default(),
             dark,
         };
         // The freshly-loaded/empty content is the "saved" baseline.
@@ -282,7 +286,18 @@ impl Document {
     }
 
     /// Per-frame work for the active document: step simulation, keys, panels, canvas, dialogs.
-    fn frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, clipboard: &mut Option<Clipboard>) {
+    /// The assistant panel is drawn here (between the other side panels and the canvas) so it
+    /// reserves its width before the central canvas fills the remaining space.
+    #[allow(clippy::too_many_arguments)]
+    fn frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        clipboard: &mut Option<Clipboard>,
+        ai_settings: &mut AiSettings,
+        ai_open: bool,
+        ai_settings_open: &mut bool,
+    ) {
         if self.sim_dirty {
             self.rebuild_sim();
         }
@@ -293,6 +308,10 @@ impl Document {
         }
 
         self.handle_shortcuts(ctx, clipboard);
+        if ai_open {
+            let theme = self.theme();
+            assistant::panel(ui, &theme, ai_settings, &mut self.ai, ai_settings_open);
+        }
         self.left_palette(ui);
         self.status_bar(ui);
 
@@ -1753,6 +1772,12 @@ pub struct LlmcApp {
     close_confirm: Option<CloseKind>,
     /// Set once the user has resolved the quit prompt so the next close request goes through.
     allow_quit: bool,
+    /// Global assistant settings (providers/keys), shared across all tabs.
+    ai: AiSettings,
+    /// Whether the assistant side panel is open.
+    ai_open: bool,
+    /// Whether the provider settings modal is open.
+    ai_settings_open: bool,
 }
 
 impl LlmcApp {
@@ -1773,6 +1798,11 @@ impl LlmcApp {
             next_doc_id: 0,
             close_confirm: None,
             allow_quit: false,
+            // Providers start empty/disconnected; the panel is closed so the base UI stays
+            // calm (open it from the toolbar "Assistant" toggle).
+            ai: AiSettings::default(),
+            ai_open: false,
+            ai_settings_open: false,
         };
         // Open the file passed on the command line into the first tab, if any.
         if let Some(path) = initial {
@@ -2071,6 +2101,17 @@ impl LlmcApp {
                     self.docs[active].show_chip_dialog = true;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // The assistant toggle sits on the right, as its own thing — the base UI
+                    // stays calm (just this button and, when open, the side panel).
+                    let ai_label = RichText::new("Assistant").color(if self.ai_open {
+                        egui::Color32::WHITE
+                    } else {
+                        self.theme().accent
+                    });
+                    if ui.selectable_label(self.ai_open, ai_label).clicked() {
+                        self.ai_open = !self.ai_open;
+                    }
+                    ui.separator();
                     let label = if self.dark { "Light" } else { "Dark" };
                     if ui.button(label).clicked() {
                         self.toggle_theme(ctx);
@@ -2294,10 +2335,15 @@ impl eframe::App for LlmcApp {
         let active = self.active;
         self.docs[active].dark = self.dark;
 
-        // Delegate the palette, status bar, canvas, and dialogs to the active document.
-        // `docs[active]` and `clipboard` are disjoint fields, so both can be borrowed.
+        // Delegate the palette, status bar, assistant panel, canvas, and dialogs to the active
+        // document. The assistant panel is drawn inside `frame` (after the other side panels,
+        // before the canvas) so all side panels reserve their space before the canvas fills the
+        // rest. `docs[active]`, `ai`, `ai_settings_open`, and `clipboard` are disjoint fields.
         let clipboard = &mut self.clipboard;
-        self.docs[active].frame(ui, &ctx, clipboard);
+        let ai_settings = &mut self.ai;
+        let ai_open = self.ai_open;
+        let ai_settings_open = &mut self.ai_settings_open;
+        self.docs[active].frame(ui, &ctx, clipboard, ai_settings, ai_open, ai_settings_open);
 
         // Only the active document can have changed this frame; refresh its dirty flag from
         // the actual content so the tab bar and close prompts stay accurate (inactive tabs
@@ -2305,6 +2351,10 @@ impl eframe::App for LlmcApp {
         self.docs[active].recompute_dirty();
 
         // App-level modals and window-close handling.
+        if self.ai_settings_open {
+            let theme = self.theme();
+            assistant::settings_window(&ctx, &theme, &mut self.ai, &mut self.ai_settings_open);
+        }
         self.close_dialog(&ctx);
         self.handle_quit_request(&ctx);
     }
