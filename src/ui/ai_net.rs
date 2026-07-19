@@ -33,6 +33,126 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+// ===================== chat =====================
+
+/// One turn in a conversation, in the OpenAI `messages` shape (`role` is `system`/`user`/
+/// `assistant`).
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// Everything a worker needs to run one chat completion.
+pub struct ChatRequest {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub turns: Vec<ChatTurn>,
+}
+
+/// A chat reply handed back to the UI thread, tagged with the request `token` so it lands in
+/// the tab that started it — a request keeps running in the background when you switch tabs.
+pub enum ChatEvent {
+    Reply {
+        token: u64,
+        result: Result<String, String>,
+    },
+}
+
+/// Run one chat completion on a background thread and send the reply to `tx`.
+pub fn spawn_chat(tx: Sender<ChatEvent>, token: u64, req: ChatRequest) {
+    std::thread::spawn(move || {
+        let result = chat(&req);
+        let _ = tx.send(ChatEvent::Reply { token, result });
+    });
+}
+
+/// Chat completions can take a while to generate, so allow a longer read timeout than the
+/// quick model-list fetch.
+fn chat_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+}
+
+/// Blocking call: POST an OpenAI-compatible chat completion and return the assistant's text.
+fn chat(req: &ChatRequest) -> Result<String, String> {
+    let base = req.base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("No base URL for the selected provider.".to_string());
+    }
+    if req.api_key.trim().is_empty() {
+        return Err("No API key for the selected provider.".to_string());
+    }
+    let messages: Vec<serde_json::Value> = req
+        .turns
+        .iter()
+        .map(|t| serde_json::json!({ "role": t.role, "content": t.content }))
+        .collect();
+    let body = serde_json::json!({
+        "model": req.model,
+        "messages": messages,
+        "stream": false,
+    });
+    let url = format!("{base}/chat/completions");
+    let resp = chat_agent()
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", req.api_key.trim()))
+        .send_json(body)
+        .map_err(describe_error)?;
+    let value: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("Unexpected response: {e}"))?;
+    parse_chat_reply(&value)
+}
+
+/// Pull the assistant text out of an OpenAI-style chat-completion response
+/// (`choices[0].message.content`), tolerating a plain string or an array of text parts.
+fn parse_chat_reply(v: &serde_json::Value) -> Result<String, String> {
+    if let Some(choice) = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+    {
+        if let Some(text) = choice
+            .get("message")
+            .and_then(|m| content_text(m.get("content")))
+        {
+            if !text.trim().is_empty() {
+                return Ok(text);
+            }
+        }
+    }
+    // A few providers return an error object with an HTTP 200.
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(truncate(msg));
+    }
+    Err("The provider returned an empty reply.".to_string())
+}
+
+/// Chat content is usually a string, but some providers return an array of
+/// `{ "type": "text", "text": "…" }` parts — concatenate their text.
+fn content_text(content: Option<&serde_json::Value>) -> Option<String> {
+    match content {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(t);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Blocking call: list the models available to `api_key` at `base_url`.
 pub fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
     let base = base_url.trim().trim_end_matches('/');
@@ -165,5 +285,36 @@ mod tests {
     fn error_message_extracted_from_json() {
         let m = extract_message(r#"{"error":{"message":"Invalid API Key"}}"#);
         assert_eq!(m, "Invalid API Key");
+    }
+
+    #[test]
+    fn chat_reply_from_string_content() {
+        let v = serde_json::json!({
+            "choices": [ { "message": { "role": "assistant", "content": "Hello there" } } ]
+        });
+        assert_eq!(parse_chat_reply(&v).unwrap(), "Hello there");
+    }
+
+    #[test]
+    fn chat_reply_from_array_content() {
+        let v = serde_json::json!({
+            "choices": [ { "message": { "content": [
+                { "type": "text", "text": "Part 1. " },
+                { "type": "text", "text": "Part 2." }
+            ] } } ]
+        });
+        assert_eq!(parse_chat_reply(&v).unwrap(), "Part 1. Part 2.");
+    }
+
+    #[test]
+    fn chat_reply_surfaces_200_error_body() {
+        let v = serde_json::json!({ "error": { "message": "model not found" } });
+        assert_eq!(parse_chat_reply(&v).unwrap_err(), "model not found");
+    }
+
+    #[test]
+    fn chat_reply_empty_is_error() {
+        let v = serde_json::json!({ "choices": [] });
+        assert!(parse_chat_reply(&v).is_err());
     }
 }

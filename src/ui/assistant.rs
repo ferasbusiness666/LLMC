@@ -16,7 +16,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Ri
 
 use llmc::io::AiProviderConfig;
 
-use super::ai_net::{self, AiEvent};
+use super::ai_net::{self, AiEvent, ChatEvent, ChatRequest, ChatTurn};
 use super::keystore;
 use super::theme::Theme;
 
@@ -307,15 +307,41 @@ impl AiSettings {
 #[derive(Clone, Copy, PartialEq)]
 pub enum Role {
     User,
-    /// Constructed when the assistant's reply arrives (networking layer, added next); already
-    /// rendered by `bubble`.
-    #[allow(dead_code)]
     Assistant,
 }
 
 pub struct ChatMessage {
     pub role: Role,
     pub text: String,
+    /// A failed reply (network/provider error) — rendered in a distinct, muted-red style and
+    /// never sent back to the model as conversation history.
+    pub error: bool,
+}
+
+impl ChatMessage {
+    fn user(text: String) -> Self {
+        Self {
+            role: Role::User,
+            text,
+            error: false,
+        }
+    }
+
+    fn assistant(text: String) -> Self {
+        Self {
+            role: Role::Assistant,
+            text,
+            error: false,
+        }
+    }
+
+    fn failure(text: String) -> Self {
+        Self {
+            role: Role::Assistant,
+            text,
+            error: true,
+        }
+    }
 }
 
 /// The selected model: an index into `AiSettings::providers` plus the model id.
@@ -325,26 +351,145 @@ pub struct ModelRef {
     pub model: String,
 }
 
-/// Per-project assistant state (each tab keeps its own conversation, so switching tabs — and,
-/// later, a request running in the background — never disturbs another project).
-#[derive(Default)]
+/// Per-project assistant state. Each tab keeps its own conversation *and* its own reply
+/// channel, so a request started in one tab keeps running — and lands in that tab — even while
+/// you work in another.
 pub struct AiSession {
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub selected: Option<ModelRef>,
+    /// Replies from chat workers come back here; drained by [`AiSession::poll_chat`].
+    chat_tx: Sender<ChatEvent>,
+    chat_rx: Receiver<ChatEvent>,
+    /// Token of the in-flight request, if any. A reply is accepted only when its token matches
+    /// (so a reply for a since-cleared conversation is quietly dropped).
+    pending: Option<u64>,
+    next_token: u64,
+}
+
+impl Default for AiSession {
+    fn default() -> Self {
+        let (chat_tx, chat_rx) = std::sync::mpsc::channel();
+        Self {
+            messages: Vec::new(),
+            input: String::new(),
+            selected: None,
+            chat_tx,
+            chat_rx,
+            pending: None,
+            next_token: 0,
+        }
+    }
+}
+
+impl AiSession {
+    /// Is a reply currently being awaited?
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Drain any chat replies that arrived from worker threads and append them. Safe to call on
+    /// every tab each frame — a request keeps running when its tab is in the background.
+    pub fn poll_chat(&mut self) {
+        while let Ok(ChatEvent::Reply { token, result }) = self.chat_rx.try_recv() {
+            if self.pending != Some(token) {
+                continue; // stale reply (conversation cleared, or superseded) — drop it.
+            }
+            self.pending = None;
+            match result {
+                Ok(text) => self.messages.push(ChatMessage::assistant(text)),
+                Err(e) => self.messages.push(ChatMessage::failure(e)),
+            }
+        }
+    }
+
+    /// If nothing valid is selected, fall back to the first available model (and recover from a
+    /// selection whose provider has since disconnected).
+    fn ensure_selection(&mut self, live: &[(usize, &str)]) {
+        let valid = self.selected.as_ref().is_some_and(|s| {
+            live.iter()
+                .any(|(pi, m)| *pi == s.provider && *m == s.model)
+        });
+        if !valid {
+            self.selected = live.first().map(|(pi, m)| ModelRef {
+                provider: *pi,
+                model: m.to_string(),
+            });
+        }
+    }
+
+    /// Send the current composer input as a new user turn. `system_prompt` carries the circuit
+    /// context assembled by the caller (the circuit lives with the document). Runs off-thread;
+    /// the reply arrives via [`AiSession::poll_chat`].
+    pub fn send(&mut self, settings: &AiSettings, system_prompt: String) {
+        let text = self.input.trim().to_string();
+        if text.is_empty() || self.pending.is_some() {
+            return;
+        }
+        let Some(sel) = self.selected.clone() else {
+            return;
+        };
+        let Some(provider) = settings.providers.get(sel.provider) else {
+            return;
+        };
+        if !provider.is_live() {
+            return;
+        }
+        self.input.clear();
+        self.messages.push(ChatMessage::user(text));
+
+        // system prompt + the visible conversation (skipping error bubbles).
+        let mut turns = vec![ChatTurn {
+            role: "system".to_string(),
+            content: system_prompt,
+        }];
+        for m in &self.messages {
+            if m.error {
+                continue;
+            }
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            };
+            turns.push(ChatTurn {
+                role: role.to_string(),
+                content: m.text.clone(),
+            });
+        }
+
+        let token = self.next_token;
+        self.next_token += 1;
+        self.pending = Some(token);
+        let req = ChatRequest {
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model: sel.model.clone(),
+            turns,
+        };
+        ai_net::spawn_chat(self.chat_tx.clone(), token, req);
+    }
 }
 
 // ===================== rendering =====================
 
-/// Render the assistant panel on the right. Returns nothing; mutates session/settings and may
-/// flip `open_settings` when the gear is pressed.
+/// What the panel needs the app to do after rendering. Kept tiny so the app can build the
+/// circuit context (which lives with the document) and hand it to [`AiSession::send`].
+#[derive(Default)]
+pub struct PanelResponse {
+    /// The user pressed Send on a ready model; dispatch a chat request.
+    pub send: bool,
+}
+
+/// Render the assistant panel on the right. Mutates session/settings, may flip `open_settings`
+/// when the gear is pressed, and reports (via the return value) when a chat send was requested.
 pub fn panel(
     ui: &mut egui::Ui,
     theme: &Theme,
     settings: &mut AiSettings,
     session: &mut AiSession,
     open_settings: &mut bool,
-) {
+) -> PanelResponse {
+    let mut response = PanelResponse::default();
     egui::Panel::right("ai_panel")
         .resizable(true)
         .default_size(370.0)
@@ -363,7 +508,9 @@ pub fn panel(
                     if text_button(ui, theme, "Settings", "Providers & API keys") {
                         *open_settings = true;
                     }
+                    // Don't offer "Clear" mid-request; the reply would land in a cleared thread.
                     if !session.messages.is_empty()
+                        && !session.is_pending()
                         && text_button(ui, theme, "Clear", "Clear conversation")
                     {
                         session.messages.clear();
@@ -391,10 +538,11 @@ pub fn panel(
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.set_width(width - 24.0);
-                    composer(ui, theme, settings, session);
+                    response.send = composer(ui, theme, settings, session);
                 });
             });
         });
+    response
 }
 
 /// The calm "connect a provider" state shown before anything is connected.
@@ -423,7 +571,8 @@ fn empty_state(ui: &mut egui::Ui, theme: &Theme, open_settings: &mut bool) {
     });
 }
 
-/// The scrolling message list.
+/// The scrolling message list (plus a "thinking" row while a reply is in flight). Empty until
+/// the first message so the panel stays calm.
 fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) {
     // The row width must be captured from the bounded scroll viewport; passing it down keeps
     // the per-message right/left alignment from treating the width as unbounded (which would
@@ -438,13 +587,35 @@ fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) {
                 bubble(ui, theme, msg, row_width);
                 ui.add_space(8.0);
             }
+            if session.is_pending() {
+                thinking(ui, theme);
+            }
         });
 }
 
-/// A single chat bubble: user right-aligned/accent, assistant left-aligned/panel.
+/// A left-aligned "Thinking…" placeholder shown while awaiting a reply.
+fn thinking(ui: &mut egui::Ui, theme: &Theme) {
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        accent_dot(ui, theme, 3.5);
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Thinking\u{2026}")
+                .italics()
+                .color(theme.label_dim),
+        );
+    });
+    // Keep animating so the reply (and this indicator) refresh promptly.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(120));
+}
+
+/// A single chat bubble: user right-aligned/accent, assistant left-aligned/panel, errors muted-red.
 fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32) {
     let is_user = msg.role == Role::User;
-    let fill = if is_user {
+    let fill = if msg.error {
+        theme.conflict.linear_multiply(0.16)
+    } else if is_user {
         theme.accent.linear_multiply(0.22)
     } else {
         surface(theme)
@@ -465,7 +636,9 @@ fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32) {
             .show(ui, |ui| {
                 ui.set_max_width(max_w);
                 ui.vertical(|ui| {
-                    if !is_user {
+                    if msg.error {
+                        ui.label(RichText::new("Error").small().color(theme.conflict));
+                    } else if !is_user {
                         ui.label(RichText::new("Assistant").small().color(theme.label_dim));
                     }
                     ui.label(RichText::new(&msg.text).color(theme.label));
@@ -474,10 +647,19 @@ fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32) {
     });
 }
 
-/// The bottom composer: model switcher + input + send.
-fn composer(ui: &mut egui::Ui, theme: &Theme, settings: &mut AiSettings, session: &mut AiSession) {
+/// The bottom composer: model switcher + input + send. Returns true when the user asked to
+/// send (the app then supplies circuit context and dispatches via [`AiSession::send`]).
+fn composer(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    settings: &mut AiSettings,
+    session: &mut AiSession,
+) -> bool {
     let live = settings.live_models();
     let ready = !live.is_empty();
+    session.ensure_selection(&live);
+    let pending = session.is_pending();
+    let mut send = false;
 
     ui.add_enabled_ui(ready, |ui| {
         // Input box in a soft rounded surface.
@@ -487,40 +669,51 @@ fn composer(ui: &mut egui::Ui, theme: &Theme, settings: &mut AiSettings, session
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
-                let hint = if ready {
-                    "Ask the assistant to build or edit your circuit\u{2026}"
-                } else {
+                let hint = if !ready {
                     "Connect a provider to start\u{2026}"
+                } else if pending {
+                    "Waiting for a reply\u{2026}"
+                } else {
+                    "Ask the assistant to build or edit your circuit\u{2026}"
                 };
-                ui.add(
+                // Enter sends; Shift+Enter inserts a newline.
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                let editor = ui.add_enabled(
+                    !pending,
                     egui::TextEdit::multiline(&mut session.input)
                         .frame(Frame::NONE)
                         .desired_rows(2)
                         .hint_text(hint)
                         .desired_width(f32::INFINITY),
                 );
+                if enter && editor.has_focus() && !session.input.trim().is_empty() {
+                    send = true;
+                }
             });
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             model_switcher(ui, theme, settings, session);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let can_send = ready && !session.input.trim().is_empty();
+                let can_send = ready && !pending && !session.input.trim().is_empty();
+                let label = if pending { "Sending\u{2026}" } else { "Send" };
                 if ui
-                    .add_enabled(can_send, accent_widget(theme, "Send"))
+                    .add_enabled(can_send, accent_widget(theme, label))
                     .clicked()
                 {
-                    let text = std::mem::take(&mut session.input).trim().to_string();
-                    session.messages.push(ChatMessage {
-                        role: Role::User,
-                        text,
-                    });
-                    // The response + circuit edits are produced by the networking/command
-                    // layer added next; the UI plumbing is already in place.
+                    send = true;
                 }
             });
         });
     });
+    // A stray newline from the Enter keypress is trimmed by `send`, but drop it here too so the
+    // box doesn't briefly show one.
+    if send {
+        while session.input.ends_with('\n') {
+            session.input.pop();
+        }
+    }
+    send && ready && !pending && !session.input.trim().is_empty()
 }
 
 /// The in-composer model picker. Shows the current model with its provider in a fainter,

@@ -270,6 +270,35 @@ impl Document {
         self.recompute_dirty();
     }
 
+    /// The system prompt handed to the assistant: who it is, plus the user's current circuit as
+    /// context so replies are grounded in what's on the canvas. (Structured, applyable edits and
+    /// the diff preview arrive next; for now the assistant explains and advises.)
+    fn assistant_system_prompt(&self) -> String {
+        format!(
+            "You are the built-in assistant inside LLMC, a native digital-logic builder and \
+             simulator. Users place logic blocks (AND, OR, NOT, NAND, NOR, XOR, XNOR, Buffer, \
+             Switch, Button, LED, Constant 0/1, Clock) and wire output ports to input ports; \
+             reusable sub-circuits can be saved as chips. Help the user understand, design, and \
+             debug their circuit. Be concise and concrete.\n\n\
+             Current circuit:\n{}",
+            self.circuit_context()
+        )
+    }
+
+    /// A compact JSON view of the active circuit (blocks + connections) for the assistant. Kept
+    /// small; an empty circuit is reported in words so the model isn't handed `{}`.
+    fn circuit_context(&self) -> String {
+        let c = &self.manager.circuit;
+        if c.blocks.is_empty() {
+            return "The circuit is currently empty (no blocks placed yet).".to_string();
+        }
+        let view = serde_json::json!({
+            "blocks": c.blocks,
+            "connections": c.connections,
+        });
+        serde_json::to_string(&view).unwrap_or_else(|_| "(unavailable)".to_string())
+    }
+
     fn theme(&self) -> Theme {
         if self.dark {
             Theme::dark()
@@ -310,7 +339,11 @@ impl Document {
         self.handle_shortcuts(ctx, clipboard);
         if ai_open {
             let theme = self.theme();
-            assistant::panel(ui, &theme, ai_settings, &mut self.ai, ai_settings_open);
+            let resp = assistant::panel(ui, &theme, ai_settings, &mut self.ai, ai_settings_open);
+            if resp.send {
+                let prompt = self.assistant_system_prompt();
+                self.ai.send(ai_settings, prompt);
+            }
         }
         self.left_palette(ui);
         self.status_bar(ui);
@@ -2333,6 +2366,18 @@ impl eframe::App for LlmcApp {
         // test is in flight so the outcome appears promptly.
         self.ai.poll();
         if self.ai.any_testing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+
+        // Chat replies can arrive for ANY tab — a request started in one project keeps running
+        // in the background when you switch away — so poll every document's session, and keep
+        // repainting while any is still awaiting a reply.
+        let mut any_pending = false;
+        for doc in &mut self.docs {
+            doc.ai.poll_chat();
+            any_pending |= doc.ai.is_pending();
+        }
+        if any_pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
         // Persist provider config (never keys) when it changed.
