@@ -1824,6 +1824,9 @@ impl LlmcApp {
             app.push_doc(doc);
         }
         app.active = 0;
+        // Restore saved providers/keys and reconnect any that were enabled.
+        let saved = app.config.ai_providers.clone();
+        app.ai.apply_config(&saved);
         app
     }
 
@@ -2325,6 +2328,18 @@ struct Keys {
 impl eframe::App for LlmcApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Drain any provider-connection results from worker threads, and keep animating while a
+        // test is in flight so the outcome appears promptly.
+        self.ai.poll();
+        if self.ai.any_testing() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        }
+        // Persist provider config (never keys) when it changed.
+        if self.ai.take_dirty() {
+            self.config.ai_providers = self.ai.config_snapshot();
+            self.config.save();
+        }
 
         // The toolbar may toggle the theme this frame, so render it (and the tab bar) first…
         self.top_toolbar(ui, &ctx);

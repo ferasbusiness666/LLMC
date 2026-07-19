@@ -32,6 +32,15 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 rfd = "0.17"
 directories = "6"
+# Blocking HTTP for the AI providers, run on a worker thread so the UI never stalls. Default
+# features give rustls TLS with bundled roots (no system cert setup needed); `json` adds the
+# response parsing helpers.
+ureq = { version = "2", features = ["json"] }
+
+# Windows-only: store API keys in the Windows Credential Manager. On other platforms a local
+# file fallback is used (see src/ui/keystore.rs), so Linux/macOS builds and CI don't need it.
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
 
 # Windows-only: embed the app icon into llmc.exe at build time (see build.rs). Gated to the
 # Windows target so Linux/macOS builds don't pull it in.

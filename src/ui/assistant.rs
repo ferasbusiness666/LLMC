@@ -1,17 +1,23 @@
 //! The AI assistant: a calm right-side panel plus a provider settings modal.
 //!
-//! This module is the **UI layer** of the assistant. It renders the panel and settings and
-//! owns the in-memory state (providers, per-project chat session, selected model). The
-//! networking, secure key storage, structured circuit-edit command API, diff preview, and
-//! auto-fix loop are layered on top of this in later steps — the types here are shaped so
-//! that work slots in without reshaping the UI.
+//! This module owns the assistant's UI and state (providers, per-project chat session,
+//! selected model) and drives provider connections through `ai_net` (off-thread HTTP) and
+//! `keystore` (secure key storage). The structured circuit-edit command API, diff preview,
+//! and auto-fix loop are layered on next — the types here are shaped so that slots in without
+//! reshaping the UI.
 //!
 //! Design goals: the base app stays calm (just one toolbar toggle + this panel), and the
 //! panel itself reads like a real product — a clear header, roomy chat, and a composer with
 //! the model switcher right where you type.
 
+use std::sync::mpsc::{Receiver, Sender};
+
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
 
+use llmc::io::AiProviderConfig;
+
+use super::ai_net::{self, AiEvent};
+use super::keystore;
 use super::theme::Theme;
 
 /// A provider the settings can offer. Most are OpenAI-compatible, so they share one client;
@@ -29,6 +35,20 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    /// Stable id used to persist config and key it in the keystore.
+    fn id(self) -> &'static str {
+        match self {
+            ProviderKind::Groq => "groq",
+            ProviderKind::OpenRouter => "openrouter",
+            ProviderKind::GoogleAiStudio => "google-ai-studio",
+            ProviderKind::Zen => "zen",
+            ProviderKind::Cerebras => "cerebras",
+            ProviderKind::Mistral => "mistral",
+            ProviderKind::OllamaCloud => "ollama-cloud",
+            ProviderKind::Custom => "custom",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             ProviderKind::Groq => "Groq",
@@ -94,9 +114,7 @@ pub enum ConnStatus {
     Idle,
     Testing,
     Connected,
-    /// Constructed by the networking layer (added next) when a test connection fails; already
-    /// rendered by `status_chip`.
-    #[allow(dead_code)]
+    /// A test/reconnect failed; the string is a short human-readable reason.
     Failed(String),
 }
 
@@ -106,10 +124,10 @@ pub struct Provider {
     /// Display name (editable, mainly for Custom entries).
     pub name: String,
     pub base_url: String,
-    /// Held in memory while running; persisted to the OS keyring in the backend step.
+    /// Held in memory while running; a working key is persisted to the OS keyring (see keystore).
     pub api_key: String,
     pub enabled: bool,
-    /// Models fetched from the provider (populated by "Test connection" once networking lands).
+    /// Models fetched from the provider by "Test connection" / startup reconnect.
     pub models: Vec<String>,
     pub status: ConnStatus,
 }
@@ -132,9 +150,14 @@ impl Provider {
     }
 }
 
-/// Global assistant settings: the provider list.
+/// Global assistant settings: the provider list plus the worker-thread channel that carries
+/// connection results back to the UI.
 pub struct AiSettings {
     pub providers: Vec<Provider>,
+    tx: Sender<AiEvent>,
+    rx: Receiver<AiEvent>,
+    /// Set when the persisted config changed (enabled/base-url/name); the app writes it out.
+    dirty: bool,
 }
 
 impl Default for AiSettings {
@@ -152,7 +175,13 @@ impl Default for AiSettings {
         .into_iter()
         .map(Provider::preset)
         .collect();
-        Self { providers }
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            providers,
+            tx,
+            rx,
+            dirty: false,
+        }
     }
 }
 
@@ -172,6 +201,105 @@ impl AiSettings {
 
     fn any_live(&self) -> bool {
         self.providers.iter().any(Provider::is_live)
+    }
+
+    /// Is a connection test in flight (used to keep repainting so results land promptly)?
+    pub fn any_testing(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.status == ConnStatus::Testing)
+    }
+
+    /// Drain any results that arrived from worker threads and update provider state.
+    pub fn poll(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                AiEvent::Models { provider, result } => {
+                    if let Some(p) = self.providers.get_mut(provider) {
+                        match result {
+                            Ok(models) => {
+                                p.models = models;
+                                p.status = ConnStatus::Connected;
+                                // A working key is worth remembering.
+                                if !p.api_key.trim().is_empty() {
+                                    let _ = keystore::save(p.kind.id(), p.api_key.trim());
+                                }
+                            }
+                            Err(e) => {
+                                p.models.clear();
+                                p.status = ConnStatus::Failed(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start a "Test connection" for provider `i` on a worker thread.
+    fn start_test(&mut self, i: usize) {
+        let Some(p) = self.providers.get_mut(i) else {
+            return;
+        };
+        if p.api_key.trim().is_empty() || p.base_url.trim().is_empty() {
+            p.status = ConnStatus::Failed("Enter a base URL and API key first.".to_string());
+            return;
+        }
+        p.status = ConnStatus::Testing;
+        let (base, key) = (p.base_url.clone(), p.api_key.clone());
+        ai_net::spawn_fetch_models(self.tx.clone(), i, base, key);
+        self.dirty = true;
+    }
+
+    /// Restore saved provider config + keys, and reconnect any that were enabled.
+    pub fn apply_config(&mut self, saved: &[AiProviderConfig]) {
+        for i in 0..self.providers.len() {
+            let id = self.providers[i].kind.id();
+            if let Some(cfg) = saved.iter().find(|c| c.id == id) {
+                let p = &mut self.providers[i];
+                p.enabled = cfg.enabled;
+                if !cfg.name.trim().is_empty() {
+                    p.name = cfg.name.clone();
+                }
+                if !cfg.base_url.trim().is_empty() {
+                    p.base_url = cfg.base_url.clone();
+                }
+            }
+            if let Some(key) = keystore::load(id) {
+                self.providers[i].api_key = key;
+            }
+            // Reconnect providers that were on and have a key.
+            let ready = {
+                let p = &self.providers[i];
+                p.enabled && !p.api_key.trim().is_empty() && !p.base_url.trim().is_empty()
+            };
+            if ready {
+                self.providers[i].status = ConnStatus::Testing;
+                let (base, key) = (
+                    self.providers[i].base_url.clone(),
+                    self.providers[i].api_key.clone(),
+                );
+                ai_net::spawn_fetch_models(self.tx.clone(), i, base, key);
+            }
+        }
+    }
+
+    /// The persistable (non-secret) view of the providers.
+    pub fn config_snapshot(&self) -> Vec<AiProviderConfig> {
+        self.providers
+            .iter()
+            .map(|p| AiProviderConfig {
+                id: p.kind.id().to_string(),
+                name: p.name.clone(),
+                base_url: p.base_url.clone(),
+                enabled: p.enabled,
+            })
+            .collect()
+    }
+
+    /// Take (and clear) the "config changed, please persist" flag.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 }
 
@@ -512,23 +640,45 @@ pub fn settings_window(
                 .color(theme.label_dim),
             );
             ui.add_space(8.0);
+            let mut test_request: Option<usize> = None;
+            let mut changed = false;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .max_height(440.0)
                 .show(ui, |ui| {
                     for i in 0..settings.providers.len() {
-                        provider_card(ui, theme, &mut settings.providers[i]);
+                        let act = provider_card(ui, theme, &mut settings.providers[i]);
+                        if act.test {
+                            test_request = Some(i);
+                        }
+                        changed |= act.changed;
                         ui.add_space(8.0);
                     }
                 });
+            if let Some(i) = test_request {
+                settings.start_test(i);
+            }
+            if changed {
+                settings.dirty = true;
+            }
         });
     if !keep_open {
         *open = false;
+        // Persist the provider setup when the modal closes.
+        settings.dirty = true;
     }
 }
 
+/// What the user did to a provider card this frame.
+#[derive(Default)]
+struct CardAction {
+    test: bool,
+    changed: bool,
+}
+
 /// One provider row in settings: name, status, key field, test button.
-fn provider_card(ui: &mut egui::Ui, theme: &Theme, p: &mut Provider) {
+fn provider_card(ui: &mut egui::Ui, theme: &Theme, p: &mut Provider) -> CardAction {
+    let mut action = CardAction::default();
     Frame::NONE
         .fill(surface(theme))
         .stroke(Stroke::new(1.0, theme.block_stroke))
@@ -536,7 +686,9 @@ fn provider_card(ui: &mut egui::Ui, theme: &Theme, p: &mut Provider) {
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut p.enabled, "");
+                if ui.checkbox(&mut p.enabled, "").changed() {
+                    action.changed = true;
+                }
                 ui.vertical(|ui| {
                     ui.label(RichText::new(&p.name).strong());
                     ui.label(RichText::new(p.kind.blurb()).small().color(theme.label_dim));
@@ -550,16 +702,27 @@ fn provider_card(ui: &mut egui::Ui, theme: &Theme, p: &mut Provider) {
                 ui.add_space(8.0);
                 if p.kind == ProviderKind::Custom {
                     labeled(ui, theme, "Name", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut p.name).desired_width(f32::INFINITY),
-                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut p.name)
+                                    .desired_width(f32::INFINITY),
+                            )
+                            .changed()
+                        {
+                            action.changed = true;
+                        }
                     });
                     labeled(ui, theme, "Base URL", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut p.base_url)
-                                .hint_text("https://…/v1")
-                                .desired_width(f32::INFINITY),
-                        );
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut p.base_url)
+                                    .hint_text("https://…/v1")
+                                    .desired_width(f32::INFINITY),
+                            )
+                            .changed()
+                        {
+                            action.changed = true;
+                        }
                     });
                 }
                 labeled(ui, theme, "API key", |ui| {
@@ -572,22 +735,39 @@ fn provider_card(ui: &mut egui::Ui, theme: &Theme, p: &mut Provider) {
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
+                    let can_test = !p.api_key.trim().is_empty()
+                        && p.status != ConnStatus::Testing
+                        && !p.base_url.trim().is_empty();
                     if ui
-                        .add_enabled(
-                            !p.api_key.trim().is_empty(),
-                            accent_widget(theme, "Test connection"),
-                        )
+                        .add_enabled(can_test, accent_widget(theme, "Test connection"))
                         .clicked()
                     {
-                        // Networking lands next; for now reflect intent so the flow is visible.
-                        p.status = ConnStatus::Testing;
+                        action.test = true;
                     }
                     if let Some(url) = p.kind.key_url() {
                         ui.hyperlink_to(RichText::new("Get a key").color(theme.accent), url);
                     }
                 });
+
+                // Feedback line: model count when connected, or the failure reason.
+                match &p.status {
+                    ConnStatus::Connected => {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!("{} models available", p.models.len()))
+                                .small()
+                                .color(theme.label_dim),
+                        );
+                    }
+                    ConnStatus::Failed(msg) => {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(msg).small().color(theme.conflict));
+                    }
+                    _ => {}
+                }
             }
         });
+    action
 }
 
 fn status_chip(ui: &mut egui::Ui, theme: &Theme, status: &ConnStatus) {

@@ -1,9 +1,11 @@
 //! The eframe/egui GUI (binary-only). Everything here depends on egui; the pure logic
 //! lives in the `llmc` library crate.
 
+mod ai_net;
 mod app;
 mod assistant;
 mod glyphs;
+mod keystore;
 mod theme;
 
 /// Launch the native window and run the app. An optional `.llmc` path may be passed as

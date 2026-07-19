@@ -16,6 +16,20 @@ pub struct AppConfig {
     /// Clock half-period in seconds for simulation.
     #[serde(default = "default_clock_period")]
     pub clock_period: f64,
+    /// Saved AI provider setup (enabled/base-url/name). API keys are NOT stored here — they
+    /// live in the OS keyring / a separate local file (see the UI's keystore).
+    #[serde(default)]
+    pub ai_providers: Vec<AiProviderConfig>,
+}
+
+/// Persisted, non-secret configuration for one AI provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiProviderConfig {
+    /// Stable id matching the UI provider (e.g. "groq", "custom").
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -32,6 +46,7 @@ impl Default for AppConfig {
             dark_mode: true,
             last_dir: None,
             clock_period: 1.0,
+            ai_providers: Vec::new(),
         }
     }
 }
