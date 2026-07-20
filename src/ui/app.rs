@@ -10,7 +10,7 @@
 //! another.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
@@ -19,13 +19,14 @@ use eframe::egui::{
     Sense, Stroke, StrokeKind, Vec2,
 };
 
-use llmc::backend::{CircuitManager, Simulation};
+use llmc::backend::{CircuitManager, EditCommand, Simulation};
 use llmc::io::{AppConfig, CameraState, Project};
 use llmc::model::{
     Block, BlockId, BlockType, ChipDef, ChipId, Circuit, ConnId, Connection, Orientation, Port,
     PortKind, Pos, Vec2f, MAX_GATE_INPUTS,
 };
 
+use super::ai_edit::RawOp;
 use super::assistant::{self, AiSession, AiSettings};
 use super::glyphs::{draw_block, BlockStyle};
 use super::theme::{apply_style, Theme};
@@ -270,16 +271,45 @@ impl Document {
         self.recompute_dirty();
     }
 
-    /// The system prompt handed to the assistant: who it is, plus the user's current circuit as
-    /// context so replies are grounded in what's on the canvas. (Structured, applyable edits and
-    /// the diff preview arrive next; for now the assistant explains and advises.)
+    /// The system prompt handed to the assistant: who it is, the JSON command protocol it uses to
+    /// build/edit the circuit, and the user's current circuit as context so edits are grounded in
+    /// what's on the canvas.
     fn assistant_system_prompt(&self) -> String {
         format!(
-            "You are the built-in assistant inside LLMC, a native digital-logic builder and \
-             simulator. Users place logic blocks (AND, OR, NOT, NAND, NOR, XOR, XNOR, Buffer, \
-             Switch, Button, LED, Constant 0/1, Clock) and wire output ports to input ports; \
-             reusable sub-circuits can be saved as chips. Help the user understand, design, and \
-             debug their circuit. Be concise and concrete.\n\n\
+            "You are the built-in AI inside LLMC, a native digital-logic circuit builder and \
+             simulator. You can talk to the user AND directly build or edit their circuit.\n\
+             \n\
+             BLOCK KINDS (use the quoted value as \"kind\"):\n\
+             - Gates: \"and\", \"or\", \"not\", \"nand\", \"nor\", \"xor\", \"xnor\", \"buffer\"\n\
+             - Inputs: \"switch\" (user-toggle), \"button\" (momentary), \"constant1\", \
+             \"constant0\", \"clock\"\n\
+             - Output: \"led\"\n\
+             and/or/nand/nor/xor/xnor take an optional \"inputs\" count (2-16, default 2); \
+             not/buffer have exactly 1 input; sources (switch/button/constant/clock) have no \
+             inputs and one output; led has one input and no output.\n\
+             \n\
+             PORTS: input ports are indexed 0,1,2,… top-to-bottom; every block that has an output \
+             uses output port 0. A wire goes from an output port to an input port.\n\
+             \n\
+             COORDINATES: an integer grid; x increases right, y increases down. Blocks are ~2 \
+             cells wide and (number of inputs) tall. Put inputs on the left (small x), gates in \
+             the middle, the LED on the right; leave ~4 cells horizontally between stages and ~3 \
+             vertically between stacked blocks so wires stay readable.\n\
+             \n\
+             TO CHANGE THE CIRCUIT, end your reply with ONE fenced ```json block of the form \
+             {{\"commands\":[ … ]}}. Commands:\n\
+             - {{\"op\":\"add\",\"ref\":\"<name>\",\"kind\":\"<kind>\",\"x\":<int>,\"y\":<int>,\
+             \"inputs\":<opt int>,\"label\":\"<opt>\"}}\n\
+             - {{\"op\":\"connect\",\"from\":\"<ref-or-id>\",\"to\":\"<ref-or-id>\",\
+             \"from_port\":<opt,def 0>,\"to_port\":<opt,def 0>}}\n\
+             - {{\"op\":\"remove\",\"target\":\"<ref-or-id>\"}}\n\
+             - {{\"op\":\"move\",\"target\":\"<ref-or-id>\",\"x\":<int>,\"y\":<int>}}\n\
+             - {{\"op\":\"label\",\"target\":\"<ref-or-id>\",\"text\":\"<string>\"}}\n\
+             Give every NEW block a short unique \"ref\" and use it in connects. Reference \
+             EXISTING blocks by the numeric id shown in the circuit JSON. Include the json block \
+             ONLY when you actually want to change the circuit — for plain questions, just \
+             answer. Keep any prose before the json short.\n\
+             \n\
              Current circuit:\n{}",
             self.circuit_context()
         )
@@ -297,6 +327,142 @@ impl Document {
             "connections": c.connections,
         });
         serde_json::to_string(&view).unwrap_or_else(|_| "(unavailable)".to_string())
+    }
+
+    /// Apply a batch of AI-proposed edits as one undoable step. Handles are resolved (new refs
+    /// first, then existing numeric block ids), ports are validated, and any op that can't be
+    /// applied is skipped and reported rather than aborting the whole batch. Returns a summary
+    /// for the chat "activity" view.
+    fn apply_ai_ops(&mut self, ops: Vec<RawOp>) -> AiEditReport {
+        let mut refs: std::collections::HashMap<String, BlockId> = std::collections::HashMap::new();
+        let mut pending: BTreeMap<BlockId, Block> = BTreeMap::new();
+        let mut batch: Vec<EditCommand> = Vec::new();
+        let mut activity: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut new_ids: Vec<BlockId> = Vec::new();
+
+        for op in ops {
+            match op {
+                RawOp::Add {
+                    r#ref,
+                    kind,
+                    x,
+                    y,
+                    inputs,
+                    label,
+                    state,
+                } => {
+                    let id = self.manager.circuit.allocate_block_id();
+                    let mut b = Block::new(id, kind, Pos::new(x, y));
+                    if kind.variable_inputs() {
+                        if let Some(n) = inputs {
+                            b.inputs = Some(n.clamp(2, MAX_GATE_INPUTS as u16));
+                        }
+                    }
+                    if let Some(l) = label {
+                        if !l.trim().is_empty() {
+                            b.label = Some(l);
+                        }
+                    }
+                    b.state = state;
+                    pending.insert(id, b.clone());
+                    if let Some(r) = r#ref {
+                        refs.insert(r, id);
+                    }
+                    new_ids.push(id);
+                    activity.push(format!("Add {} at ({x}, {y})", palette_name(kind)));
+                    batch.push(EditCommand::AddBlock { block: b });
+                }
+                RawOp::Connect {
+                    from,
+                    from_port,
+                    to,
+                    to_port,
+                } => {
+                    let (Some(fb), Some(tb)) = (
+                        resolve_handle(&refs, &self.manager.circuit, &from),
+                        resolve_handle(&refs, &self.manager.circuit, &to),
+                    ) else {
+                        errors.push(format!("connect: unknown block ({from} \u{2192} {to})"));
+                        continue;
+                    };
+                    let out_ok = block_ref(&pending, &self.manager.circuit, fb).is_some_and(|b| {
+                        (from_port as usize) < b.output_count(&self.manager.chips)
+                    });
+                    let in_ok = block_ref(&pending, &self.manager.circuit, tb)
+                        .is_some_and(|b| (to_port as usize) < b.input_count(&self.manager.chips));
+                    if !out_ok || !in_ok {
+                        errors.push(format!(
+                            "connect: invalid port ({from}.{from_port} \u{2192} {to}.{to_port})"
+                        ));
+                        continue;
+                    }
+                    let to_p = Port::input(tb, to_port);
+                    if let Some(existing) = self.manager.circuit.connection_id_into(to_p) {
+                        batch.push(EditCommand::RemoveConnection { id: existing });
+                    }
+                    let cid = self.manager.circuit.allocate_conn_id();
+                    activity.push(format!("Wire {from}.{from_port} \u{2192} {to}.{to_port}"));
+                    batch.push(EditCommand::AddConnection {
+                        conn: Connection {
+                            id: cid,
+                            from: Port::output(fb, from_port),
+                            to: to_p,
+                        },
+                    });
+                }
+                RawOp::Remove { target } => {
+                    match resolve_handle(&refs, &self.manager.circuit, &target) {
+                        Some(id) if self.manager.circuit.block(id).is_some() => {
+                            activity.push(format!("Remove block {target}"));
+                            batch.push(EditCommand::RemoveBlock { id });
+                        }
+                        _ => errors.push(format!("remove: unknown block {target}")),
+                    }
+                }
+                RawOp::Move { target, x, y } => {
+                    match resolve_handle(&refs, &self.manager.circuit, &target) {
+                        Some(id) => {
+                            activity.push(format!("Move {target} to ({x}, {y})"));
+                            batch.push(EditCommand::MoveBlock {
+                                id,
+                                to: Pos::new(x, y),
+                            });
+                        }
+                        None => errors.push(format!("move: unknown block {target}")),
+                    }
+                }
+                RawOp::Label { target, text } => {
+                    match resolve_handle(&refs, &self.manager.circuit, &target) {
+                        Some(id) => {
+                            activity.push(match &text {
+                                Some(t) => format!("Label {target} \u{201c}{t}\u{201d}"),
+                                None => format!("Clear label on {target}"),
+                            });
+                            batch.push(EditCommand::SetLabel { id, label: text });
+                        }
+                        None => errors.push(format!("label: unknown block {target}")),
+                    }
+                }
+            }
+        }
+
+        let changed = !batch.is_empty();
+        if changed {
+            self.manager.apply(batch);
+            self.after_structural_edit();
+            // Select what the AI just created, so it's easy to see/move/delete.
+            self.selection = new_ids
+                .into_iter()
+                .filter(|id| self.manager.circuit.block(*id).is_some())
+                .collect();
+            self.selected_conns.clear();
+        }
+        AiEditReport {
+            activity,
+            errors,
+            changed,
+        }
     }
 
     fn theme(&self) -> Theme {
@@ -343,6 +509,9 @@ impl Document {
             if resp.send {
                 let prompt = self.assistant_system_prompt();
                 self.ai.send(ai_settings, prompt);
+            } else if resp.retry {
+                let prompt = self.assistant_system_prompt();
+                self.ai.resend(ai_settings, prompt);
             }
         }
         self.left_palette(ui);
@@ -2370,11 +2539,19 @@ impl eframe::App for LlmcApp {
         }
 
         // Chat replies can arrive for ANY tab — a request started in one project keeps running
-        // in the background when you switch away — so poll every document's session, and keep
+        // in the background when you switch away — so poll every document's session, apply any
+        // circuit edits the reply proposed (as one undoable step, into that tab), and keep
         // repainting while any is still awaiting a reply.
         let mut any_pending = false;
         for doc in &mut self.docs {
             doc.ai.poll_chat();
+            if let Some(ops) = doc.ai.take_pending_ops() {
+                let report = doc.apply_ai_ops(ops);
+                if report.changed {
+                    doc.recompute_dirty();
+                }
+                doc.ai.attach_edit_result(report.activity, report.errors);
+            }
             any_pending |= doc.ai.is_pending();
         }
         if any_pending {
@@ -2418,6 +2595,47 @@ impl eframe::App for LlmcApp {
         self.close_dialog(&ctx);
         self.handle_quit_request(&ctx);
     }
+}
+
+/// The outcome of applying a batch of AI-proposed edits, surfaced in the chat "activity" view.
+struct AiEditReport {
+    /// One human-readable line per edit that was applied.
+    activity: Vec<String>,
+    /// One line per edit that was skipped (bad handle / port), so the user can see what didn't
+    /// happen.
+    errors: Vec<String>,
+    /// Whether anything actually changed (empty batches touch nothing).
+    changed: bool,
+}
+
+/// Resolve an AI block handle to a real block id: a new-block ref first, else an existing numeric
+/// id that is actually present in the circuit. A leading `#` is tolerated.
+fn resolve_handle(
+    refs: &std::collections::HashMap<String, BlockId>,
+    circuit: &Circuit,
+    handle: &str,
+) -> Option<BlockId> {
+    if let Some(id) = refs.get(handle) {
+        return Some(*id);
+    }
+    let trimmed = handle.trim().trim_start_matches('#');
+    if let Ok(n) = trimmed.parse::<u32>() {
+        let id = BlockId(n);
+        if circuit.block(id).is_some() {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Look up a block among the not-yet-applied additions first, then the live circuit — so a wire
+/// can reference a block created earlier in the same batch.
+fn block_ref<'a>(
+    pending: &'a BTreeMap<BlockId, Block>,
+    circuit: &'a Circuit,
+    id: BlockId,
+) -> Option<&'a Block> {
+    pending.get(&id).or_else(|| circuit.block(id))
 }
 
 fn palette_name(ty: BlockType) -> &'static str {

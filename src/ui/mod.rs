@@ -1,6 +1,7 @@
 //! The eframe/egui GUI (binary-only). Everything here depends on egui; the pure logic
 //! lives in the `llmc` library crate.
 
+mod ai_edit;
 mod ai_net;
 mod app;
 mod assistant;

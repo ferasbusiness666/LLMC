@@ -2,9 +2,9 @@
 //!
 //! This module owns the assistant's UI and state (providers, per-project chat session,
 //! selected model) and drives provider connections through `ai_net` (off-thread HTTP) and
-//! `keystore` (secure key storage). The structured circuit-edit command API, diff preview,
-//! and auto-fix loop are layered on next — the types here are shaped so that slots in without
-//! reshaping the UI.
+//! `keystore` (secure key storage). Replies are parsed by `ai_edit` into reasoning + prose +
+//! circuit-edit ops; the ops are handed to the app (which owns the circuit) to apply as one
+//! undoable step, and the result is shown back here as an "activity" list under the reply.
 //!
 //! Design goals: the base app stays calm (just one toolbar toggle + this panel), and the
 //! panel itself reads like a real product — a clear header, roomy chat, and a composer with
@@ -16,6 +16,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, Ri
 
 use llmc::io::AiProviderConfig;
 
+use super::ai_edit::{self, RawOp};
 use super::ai_net::{self, AiEvent, ChatEvent, ChatRequest, ChatTurn};
 use super::keystore;
 use super::theme::Theme;
@@ -313,9 +314,13 @@ pub enum Role {
 pub struct ChatMessage {
     pub role: Role,
     pub text: String,
+    /// Reasoning pulled from `<think>` tags, shown dimmed above the answer.
+    pub thinking: Option<String>,
     /// A failed reply (network/provider error) — rendered in a distinct, muted-red style and
     /// never sent back to the model as conversation history.
     pub error: bool,
+    /// Human-readable summary of edits this reply applied to the circuit (the "activity" view).
+    pub activity: Vec<String>,
 }
 
 impl ChatMessage {
@@ -323,15 +328,9 @@ impl ChatMessage {
         Self {
             role: Role::User,
             text,
+            thinking: None,
             error: false,
-        }
-    }
-
-    fn assistant(text: String) -> Self {
-        Self {
-            role: Role::Assistant,
-            text,
-            error: false,
+            activity: Vec::new(),
         }
     }
 
@@ -339,7 +338,9 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             text,
+            thinking: None,
             error: true,
+            activity: Vec::new(),
         }
     }
 }
@@ -365,6 +366,9 @@ pub struct AiSession {
     /// (so a reply for a since-cleared conversation is quietly dropped).
     pending: Option<u64>,
     next_token: u64,
+    /// Edit ops parsed from the latest reply, waiting for the app (which owns the circuit) to
+    /// apply them. Picked up via [`AiSession::take_pending_ops`].
+    pending_ops: Option<Vec<RawOp>>,
 }
 
 impl Default for AiSession {
@@ -378,6 +382,7 @@ impl Default for AiSession {
             chat_rx,
             pending: None,
             next_token: 0,
+            pending_ops: None,
         }
     }
 }
@@ -388,8 +393,9 @@ impl AiSession {
         self.pending.is_some()
     }
 
-    /// Drain any chat replies that arrived from worker threads and append them. Safe to call on
-    /// every tab each frame — a request keeps running when its tab is in the background.
+    /// Drain any chat replies that arrived from worker threads. A successful reply is split into
+    /// reasoning / prose / edit-ops; the ops (if any) are queued for the app to apply. Safe to
+    /// call on every tab each frame — a request keeps running when its tab is in the background.
     pub fn poll_chat(&mut self) {
         while let Ok(ChatEvent::Reply { token, result }) = self.chat_rx.try_recv() {
             if self.pending != Some(token) {
@@ -397,8 +403,38 @@ impl AiSession {
             }
             self.pending = None;
             match result {
-                Ok(text) => self.messages.push(ChatMessage::assistant(text)),
+                Ok(raw) => {
+                    let parsed = ai_edit::parse_reply(&raw);
+                    self.messages.push(ChatMessage {
+                        role: Role::Assistant,
+                        text: parsed.text,
+                        thinking: parsed.thinking,
+                        error: false,
+                        activity: Vec::new(),
+                    });
+                    if !parsed.ops.is_empty() {
+                        self.pending_ops = Some(parsed.ops);
+                    }
+                }
                 Err(e) => self.messages.push(ChatMessage::failure(e)),
+            }
+        }
+    }
+
+    /// Take the edit ops parsed from the last reply (if any) so the app can apply them.
+    pub fn take_pending_ops(&mut self) -> Option<Vec<RawOp>> {
+        self.pending_ops.take()
+    }
+
+    /// Attach the outcome of applying edits to the most recent assistant message (the "activity"
+    /// view). Skipped ops are appended as muted notes.
+    pub fn attach_edit_result(&mut self, mut activity: Vec<String>, errors: Vec<String>) {
+        for e in errors {
+            activity.push(format!("Skipped — {e}"));
+        }
+        if let Some(msg) = self.messages.last_mut() {
+            if msg.role == Role::Assistant && !msg.error {
+                msg.activity = activity;
             }
         }
     }
@@ -426,25 +462,47 @@ impl AiSession {
         if text.is_empty() || self.pending.is_some() {
             return;
         }
-        let Some(sel) = self.selected.clone() else {
-            return;
-        };
-        let Some(provider) = settings.providers.get(sel.provider) else {
-            return;
-        };
-        if !provider.is_live() {
-            return;
-        }
         self.input.clear();
         self.messages.push(ChatMessage::user(text));
+        self.dispatch(settings, system_prompt);
+    }
 
-        // system prompt + the visible conversation (skipping error bubbles).
+    /// Re-run the conversation after a failed reply (the "Retry" affordance). Drops trailing
+    /// error bubbles and resends the existing turns; no new user message is added.
+    pub fn resend(&mut self, settings: &AiSettings, system_prompt: String) {
+        if self.pending.is_some() {
+            return;
+        }
+        while self.messages.last().is_some_and(|m| m.error) {
+            self.messages.pop();
+        }
+        if !self.messages.iter().any(|m| m.role == Role::User) {
+            return;
+        }
+        self.dispatch(settings, system_prompt);
+    }
+
+    /// Build the request from the current turns + `system_prompt` and fire it off-thread.
+    fn dispatch(&mut self, settings: &AiSettings, system_prompt: String) {
+        let Some(sel) = self.selected.clone() else {
+            self.messages
+                .push(ChatMessage::failure("No model selected.".to_string()));
+            return;
+        };
+        let Some(provider) = settings.providers.get(sel.provider).filter(|p| p.is_live()) else {
+            self.messages.push(ChatMessage::failure(
+                "The selected provider isn't connected.".to_string(),
+            ));
+            return;
+        };
+
+        // system prompt + the visible conversation (skipping error bubbles and empty turns).
         let mut turns = vec![ChatTurn {
             role: "system".to_string(),
             content: system_prompt,
         }];
         for m in &self.messages {
-            if m.error {
+            if m.error || m.text.trim().is_empty() {
                 continue;
             }
             let role = match m.role {
@@ -478,6 +536,8 @@ impl AiSession {
 pub struct PanelResponse {
     /// The user pressed Send on a ready model; dispatch a chat request.
     pub send: bool,
+    /// The user pressed Retry on a failed reply; re-run the last request.
+    pub retry: bool,
 }
 
 /// Render the assistant panel on the right. Mutates session/settings, may flip `open_settings`
@@ -528,7 +588,7 @@ pub fn panel(
                 if !settings.any_live() {
                     empty_state(ui, theme, open_settings);
                 } else {
-                    conversation(ui, theme, session);
+                    response.retry |= conversation(ui, theme, session);
                 }
             });
 
@@ -572,25 +632,27 @@ fn empty_state(ui: &mut egui::Ui, theme: &Theme, open_settings: &mut bool) {
 }
 
 /// The scrolling message list (plus a "thinking" row while a reply is in flight). Empty until
-/// the first message so the panel stays calm.
-fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) {
+/// the first message so the panel stays calm. Returns true if a "Retry" was clicked.
+fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) -> bool {
     // The row width must be captured from the bounded scroll viewport; passing it down keeps
     // the per-message right/left alignment from treating the width as unbounded (which would
     // blow the panel's size up).
     let row_width = (ui.available_width() - 24.0).max(120.0);
+    let mut retry = false;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.add_space(4.0);
-            for msg in &session.messages {
-                bubble(ui, theme, msg, row_width);
+            for (i, msg) in session.messages.iter().enumerate() {
+                retry |= bubble(ui, theme, msg, row_width, i);
                 ui.add_space(8.0);
             }
             if session.is_pending() {
                 thinking(ui, theme);
             }
         });
+    retry
 }
 
 /// A left-aligned "Thinking…" placeholder shown while awaiting a reply.
@@ -611,8 +673,11 @@ fn thinking(ui: &mut egui::Ui, theme: &Theme) {
 }
 
 /// A single chat bubble: user right-aligned/accent, assistant left-aligned/panel, errors muted-red.
-fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32) {
+/// Shows any `<think>` reasoning (dimmed, collapsible) above the answer and an "activity" list of
+/// applied edits below it. Returns true if the bubble's "Retry" button was clicked.
+fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32, idx: usize) -> bool {
     let is_user = msg.role == Role::User;
+    let mut retry = false;
     let fill = if msg.error {
         theme.conflict.linear_multiply(0.16)
     } else if is_user {
@@ -641,10 +706,83 @@ fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32) {
                     } else if !is_user {
                         ui.label(RichText::new("Assistant").small().color(theme.label_dim));
                     }
-                    ui.label(RichText::new(&msg.text).color(theme.label));
+                    // Reasoning first, dimmed and foldable (default open, so it's visible but calm).
+                    if let Some(reasoning) = &msg.thinking {
+                        egui::CollapsingHeader::new(
+                            RichText::new("Reasoning").small().color(theme.label_dim),
+                        )
+                        .id_salt(("ai-reasoning", idx))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(reasoning)
+                                    .italics()
+                                    .color(theme.label_dim)
+                                    .size(12.5),
+                            );
+                        });
+                    }
+                    if !msg.text.trim().is_empty() {
+                        ui.label(RichText::new(&msg.text).color(theme.label));
+                    }
+                    activity_view(ui, theme, &msg.activity);
+                    if msg.error && text_button(ui, theme, "Retry", "Send this prompt again") {
+                        retry = true;
+                    }
                 });
             });
     });
+    retry
+}
+
+/// The "activity" view under an assistant reply: the concrete edits it applied to the circuit,
+/// one line each, with skipped ops shown in muted-red. Nothing is drawn when the list is empty.
+fn activity_view(ui: &mut egui::Ui, theme: &Theme, activity: &[String]) {
+    if activity.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    let applied = activity
+        .iter()
+        .filter(|a| !a.starts_with("Skipped"))
+        .count();
+    ui.label(
+        RichText::new(format!(
+            "Applied {applied} change{}",
+            if applied == 1 { "" } else { "s" }
+        ))
+        .small()
+        .strong()
+        .color(theme.label_dim),
+    );
+    for line in activity {
+        let skipped = line.starts_with("Skipped");
+        let color = if skipped {
+            theme.conflict
+        } else {
+            theme.label_dim
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            colored_dot(
+                ui,
+                if skipped {
+                    theme.conflict
+                } else {
+                    theme.accent
+                },
+                2.5,
+            );
+            ui.add_space(5.0);
+            ui.label(RichText::new(line).small().color(color));
+        });
+    }
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("Undo (Ctrl+Z) to revert")
+            .small()
+            .color(theme.label_dim),
+    );
 }
 
 /// The bottom composer: model switcher + input + send. Returns true when the user asked to
