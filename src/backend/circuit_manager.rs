@@ -59,18 +59,13 @@ impl CircuitManager {
         id
     }
 
-    /// Wire `from` (an output) to `to` (an input), replacing any wire already feeding
-    /// that input so an input never ends up multi-driven through the UI.
+    /// Wire `from` (an output) to `to` (an input). An input may be fed by more than one wire;
+    /// the simulator OR-combines the drivers, so wires are added rather than replaced.
     pub fn connect(&mut self, from: Port, to: Port) -> ConnId {
-        let mut batch = Vec::new();
-        if let Some(existing) = self.circuit.connection_id_into(to) {
-            batch.push(EditCommand::RemoveConnection { id: existing });
-        }
         let id = self.circuit.allocate_conn_id();
-        batch.push(EditCommand::AddConnection {
+        self.apply(vec![EditCommand::AddConnection {
             conn: Connection { id, from, to },
-        });
-        self.apply(batch);
+        }]);
         id
     }
 

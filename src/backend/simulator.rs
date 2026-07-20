@@ -7,7 +7,7 @@
 //! Evaluation then iterates the gates to a fixpoint each step, which settles
 //! combinational logic immediately and propagates sequential logic one step at a time.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::model::{Block, BlockId, BlockType, ChipLibrary, Circuit, Port};
 
@@ -90,8 +90,6 @@ struct Builder<'a> {
     gates: Vec<FlatGate>,
     /// Output-port nets for top-level blocks, so wires can be colored by signal.
     top_out_net: BTreeMap<Port, NetId>,
-    /// Top-level input ports driven by more than one wire (multi-driver conflicts).
-    conflicts: BTreeSet<Port>,
 }
 
 fn prim_kind(block: &Block) -> PrimKind {
@@ -189,9 +187,6 @@ impl<'a> Builder<'a> {
                     for i in 0..chip_inputs.len() {
                         let d =
                             Self::drivers_of(circuit, &out_net, Port::input(block.id, i as u16));
-                        if d.len() > 1 && is_top {
-                            self.conflicts.insert(Port::input(block.id, i as u16));
-                        }
                         in_nets.push(d.first().copied().unwrap_or(GROUND));
                     }
 
@@ -209,9 +204,6 @@ impl<'a> Builder<'a> {
                     for i in 0..ninputs {
                         let d =
                             Self::drivers_of(circuit, &out_net, Port::input(block.id, i as u16));
-                        if d.len() > 1 && is_top {
-                            self.conflicts.insert(Port::input(block.id, i as u16));
-                        }
                         inputs.push(d);
                     }
 
@@ -254,7 +246,6 @@ pub struct Simulation {
     top_out_net: BTreeMap<Port, NetId>,
     /// Gate index for each top-level block (for reading LEDs).
     top_gate: BTreeMap<BlockId, usize>,
-    conflicts: BTreeSet<Port>,
 }
 
 impl Simulation {
@@ -265,7 +256,6 @@ impl Simulation {
             uf: UnionFind::default(),
             gates: Vec::new(),
             top_out_net: BTreeMap::new(),
-            conflicts: BTreeSet::new(),
         };
         // Reserve GROUND as net 0.
         let ground = builder.uf.make_set();
@@ -289,7 +279,6 @@ impl Simulation {
             mut uf,
             mut gates,
             top_out_net,
-            conflicts,
             ..
         } = builder;
 
@@ -326,7 +315,6 @@ impl Simulation {
             time: 0.0,
             top_out_net,
             top_gate,
-            conflicts,
         }
     }
 
@@ -376,15 +364,6 @@ impl Simulation {
 
     pub fn switch_value(&self, block: BlockId) -> bool {
         self.switch_states.get(&block).copied().unwrap_or(false)
-    }
-
-    /// Whether an input port is driven by more than one wire.
-    pub fn is_conflict(&self, port: Port) -> bool {
-        self.conflicts.contains(&port)
-    }
-
-    pub fn has_conflicts(&self) -> bool {
-        !self.conflicts.is_empty()
     }
 }
 

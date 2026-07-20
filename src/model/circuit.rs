@@ -94,8 +94,7 @@ impl Circuit {
         self.connections.values()
     }
 
-    /// All connections feeding an input port. Normally zero or one; more than one is a
-    /// (flagged) multi-driver conflict.
+    /// All connections feeding an input port (zero, one, or several — several are OR-combined).
     pub fn connections_into(&self, port: Port) -> impl Iterator<Item = &Connection> {
         self.connections.values().filter(move |c| c.to == port)
     }
@@ -104,7 +103,7 @@ impl Circuit {
         self.connections.values().any(|c| c.to == port)
     }
 
-    /// The id of an existing connection into `port`, if any (used to replace on rewire).
+    /// The id of the first connection into `port`, if any.
     pub fn connection_id_into(&self, port: Port) -> Option<ConnId> {
         self.connections
             .values()

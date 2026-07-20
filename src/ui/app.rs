@@ -305,12 +305,11 @@ impl Document {
              - Position is cosmetic and never changes behavior, but good spacing makes the result \
              readable and easy for you to verify.\n\
              \n\
-             WIRING RULES (correctness):\n\
-             - Each INPUT port takes exactly ONE wire. Driving one input from two outputs is a \
-             multi-driver conflict (a bug) — the auto-check flags it; fix it by removing the extra \
-             wire. One OUTPUT may fan out to many inputs (that's fine).\n\
-             - To feed the same signal to several gates, draw a separate wire from the source \
-             output to each destination input.\n\
+             WIRING: a wire goes from an output port to an input port. One OUTPUT may fan out to \
+             many inputs. An input may also be fed by more than one wire — those drivers are \
+             OR-combined (the input is high if any driver is high), which is allowed. To feed the \
+             same signal to several gates, draw a separate wire from the source output to each \
+             destination input.\n\
              \n\
              RECIPES (common building blocks):\n\
              - NOT of a signal: a \"not\" gate (1 input).\n\
@@ -382,12 +381,6 @@ impl Document {
 
         // A fresh sim so the user's live switch settings aren't disturbed.
         let mut sim = Simulation::build(&self.manager.circuit, &self.manager.chips);
-        if sim.has_conflicts() {
-            out.push_str(
-                "WARNING: an input is driven by more than one wire (multi-driver conflict) — \
-                 usually a mistake.\n",
-            );
-        }
 
         let name = |b: &Block| match &b.label {
             Some(l) if !l.trim().is_empty() => format!("#{}({})", b.id, l.trim()),
@@ -562,10 +555,9 @@ impl Document {
                         ));
                         continue;
                     }
+                    // An input may have several drivers (OR-combined), so wires are added, never
+                    // replaced — this lets the AI intentionally merge signals into one input.
                     let to_p = Port::input(tb, to_port);
-                    if let Some(existing) = self.manager.circuit.connection_id_into(to_p) {
-                        batch.push(EditCommand::RemoveConnection { id: existing });
-                    }
                     let cid = self.manager.circuit.allocate_conn_id();
                     activity.push(format!("Wire {from}.{from_port} \u{2192} {to}.{to_port}"));
                     batch.push(EditCommand::AddConnection {
@@ -1955,11 +1947,8 @@ impl Document {
                 continue;
             };
             let high = self.sim.output_value(conn.from).unwrap_or(false);
-            let conflict = self.sim.is_conflict(conn.to);
             let selected = self.selected_conns.contains(&conn.id);
-            let color = if conflict {
-                t.conflict
-            } else if selected {
+            let color = if selected {
                 t.accent
             } else if high {
                 t.wire_high
@@ -2510,9 +2499,6 @@ impl LlmcApp {
                     let label = if self.dark { "Light" } else { "Dark" };
                     if ui.button(label).clicked() {
                         self.toggle_theme(ctx);
-                    }
-                    if self.docs[active].sim.has_conflicts() {
-                        ui.colored_label(self.theme().conflict, "\u{26a0} multi-driver");
                     }
                 });
             });
@@ -3100,6 +3086,39 @@ mod tests {
         // The whole batch is one undo step.
         assert!(d.manager.undo());
         assert_eq!(d.manager.circuit.blocks.len(), 0, "one undo reverts it all");
+    }
+
+    #[test]
+    fn multi_driver_input_is_kept_and_or_combined() {
+        let mut d = doc();
+        let a = d.manager.add_block(BlockType::Switch, Pos::new(0, 0));
+        let b = d.manager.add_block(BlockType::Switch, Pos::new(0, 4));
+        let led = d.manager.add_block(BlockType::Led, Pos::new(6, 1));
+        // Two switches driving the SAME LED input — allowed now (no replace-on-connect).
+        d.manager.connect(Port::output(a, 0), Port::input(led, 0));
+        d.manager.connect(Port::output(b, 0), Port::input(led, 0));
+        assert_eq!(
+            d.manager.circuit.connections.len(),
+            2,
+            "both wires are kept, not replaced"
+        );
+
+        d.rebuild_sim();
+        d.sim.set_switch(a, true);
+        d.sim.set_switch(b, false);
+        d.sim.step(0.0);
+        assert_eq!(
+            d.sim.led_value(led),
+            Some(true),
+            "input is high if either driver is high"
+        );
+        d.sim.set_switch(a, false);
+        d.sim.step(0.0);
+        assert_eq!(
+            d.sim.led_value(led),
+            Some(false),
+            "input is low only when all drivers are low"
+        );
     }
 
     #[test]

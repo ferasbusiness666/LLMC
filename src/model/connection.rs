@@ -1,10 +1,9 @@
 //! Ports and connections.
 //!
-//! The model is *directed*: an output port may fan out to many input ports, and an
-//! input port is normally driven by exactly one output. There is no bidirectional
-//! wire node — branching is achieved by drawing multiple wires from one output. This
-//! makes the netlist trivial and structurally prevents multi-driver conflicts through
-//! the normal editing path.
+//! The model is *directed*: a wire runs from an output port to an input port. An output
+//! may fan out to many inputs, and an input may be fed by more than one wire (the
+//! simulator OR-combines those drivers). There is no bidirectional wire node — branching
+//! is achieved by drawing multiple wires.
 
 use serde::{Deserialize, Serialize};
 
