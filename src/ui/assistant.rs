@@ -321,6 +321,9 @@ pub struct ChatMessage {
     pub error: bool,
     /// Human-readable summary of edits this reply applied to the circuit (the "activity" view).
     pub activity: Vec<String>,
+    /// An automatic agent-loop message (the "auto-check" fed back after edits). Sent to the model
+    /// as a user turn, but rendered as a subtle step note rather than a chat bubble.
+    pub auto: bool,
 }
 
 impl ChatMessage {
@@ -331,6 +334,7 @@ impl ChatMessage {
             thinking: None,
             error: false,
             activity: Vec::new(),
+            auto: false,
         }
     }
 
@@ -341,6 +345,19 @@ impl ChatMessage {
             thinking: None,
             error: true,
             activity: Vec::new(),
+            auto: false,
+        }
+    }
+
+    /// An automatic agent-loop feedback turn (the post-edit "auto-check").
+    fn auto(text: String) -> Self {
+        Self {
+            role: Role::User,
+            text,
+            thinking: None,
+            error: false,
+            activity: Vec::new(),
+            auto: true,
         }
     }
 }
@@ -369,7 +386,20 @@ pub struct AiSession {
     /// Edit ops parsed from the latest reply, waiting for the app (which owns the circuit) to
     /// apply them. Picked up via [`AiSession::take_pending_ops`].
     pending_ops: Option<Vec<RawOp>>,
+    /// Agent mode: when on, the assistant iterates on its own (build → auto-check → fix → …)
+    /// until the circuit is right, instead of stopping after one reply. Persists per tab.
+    pub agent_enabled: bool,
+    /// Whether an autonomous run is currently in flight (drives the Stop button / status line).
+    agent_running: bool,
+    /// Auto-continue steps taken in the current run (bounded by [`MAX_AGENT_STEPS`]).
+    agent_steps: u32,
+    /// Set when the user presses Stop; the loop ends after the in-flight reply lands.
+    agent_stop: bool,
 }
+
+/// Safety cap on autonomous agent iterations (each is one provider call). The user can always
+/// Stop sooner, or re-prompt to go further.
+const MAX_AGENT_STEPS: u32 = 40;
 
 impl Default for AiSession {
     fn default() -> Self {
@@ -383,6 +413,10 @@ impl Default for AiSession {
             pending: None,
             next_token: 0,
             pending_ops: None,
+            agent_enabled: true,
+            agent_running: false,
+            agent_steps: 0,
+            agent_stop: false,
         }
     }
 }
@@ -396,12 +430,15 @@ impl AiSession {
     /// Drain any chat replies that arrived from worker threads. A successful reply is split into
     /// reasoning / prose / edit-ops; the ops (if any) are queued for the app to apply. Safe to
     /// call on every tab each frame — a request keeps running when its tab is in the background.
-    pub fn poll_chat(&mut self) {
+    /// Returns true if a reply (success or error) was received this call.
+    pub fn poll_chat(&mut self) -> bool {
+        let mut got = false;
         while let Ok(ChatEvent::Reply { token, result }) = self.chat_rx.try_recv() {
             if self.pending != Some(token) {
                 continue; // stale reply (conversation cleared, or superseded) — drop it.
             }
             self.pending = None;
+            got = true;
             match result {
                 Ok(raw) => {
                     let parsed = ai_edit::parse_reply(&raw);
@@ -411,6 +448,7 @@ impl AiSession {
                         thinking: parsed.thinking,
                         error: false,
                         activity: Vec::new(),
+                        auto: false,
                     });
                     if !parsed.ops.is_empty() {
                         self.pending_ops = Some(parsed.ops);
@@ -419,6 +457,7 @@ impl AiSession {
                 Err(e) => self.messages.push(ChatMessage::failure(e)),
             }
         }
+        got
     }
 
     /// Take the edit ops parsed from the last reply (if any) so the app can apply them.
@@ -437,6 +476,62 @@ impl AiSession {
                 msg.activity = activity;
             }
         }
+    }
+
+    /// Is an autonomous run in progress (for the Stop button / status line)?
+    pub fn is_running(&self) -> bool {
+        self.agent_running
+    }
+
+    /// The current step number in a run (1-based-ish, for the status line).
+    pub fn agent_step(&self) -> u32 {
+        self.agent_steps
+    }
+
+    /// Ask the running agent to stop after the in-flight reply lands.
+    pub fn request_stop(&mut self) {
+        self.agent_stop = true;
+        self.agent_running = false;
+    }
+
+    /// After a reply that made edits, decide whether the agent keeps iterating on its own. If it
+    /// stops purely because it hit the step cap (not user Stop / agent off), leave a short note so
+    /// the pause isn't silent.
+    pub fn should_continue_or_note(&mut self) -> bool {
+        if !self.agent_enabled || self.agent_stop {
+            return false;
+        }
+        if self.agent_steps < MAX_AGENT_STEPS {
+            return true;
+        }
+        self.messages.push(ChatMessage {
+            role: Role::Assistant,
+            text: format!(
+                "Paused after {MAX_AGENT_STEPS} steps. Tell me to continue if it isn't finished."
+            ),
+            thinking: None,
+            error: false,
+            activity: Vec::new(),
+            auto: false,
+        });
+        false
+    }
+
+    /// Feed the post-edit auto-check back to the model and dispatch the next step of the run.
+    pub fn continue_agent(
+        &mut self,
+        settings: &AiSettings,
+        system_prompt: String,
+        feedback: String,
+    ) {
+        self.agent_steps += 1;
+        self.messages.push(ChatMessage::auto(feedback));
+        self.dispatch(settings, system_prompt);
+    }
+
+    /// End the current run (the model replied with no further edits, or hit an error / the cap).
+    pub fn end_agent(&mut self) {
+        self.agent_running = false;
     }
 
     /// If nothing valid is selected, fall back to the first available model (and recover from a
@@ -464,6 +559,7 @@ impl AiSession {
         }
         self.input.clear();
         self.messages.push(ChatMessage::user(text));
+        self.begin_run();
         self.dispatch(settings, system_prompt);
     }
 
@@ -479,7 +575,15 @@ impl AiSession {
         if !self.messages.iter().any(|m| m.role == Role::User) {
             return;
         }
+        self.begin_run();
         self.dispatch(settings, system_prompt);
+    }
+
+    /// Reset the agent counters for a new run started by the user.
+    fn begin_run(&mut self) {
+        self.agent_running = true;
+        self.agent_steps = 0;
+        self.agent_stop = false;
     }
 
     /// Build the request from the current turns + `system_prompt` and fire it off-thread.
@@ -496,13 +600,19 @@ impl AiSession {
             return;
         };
 
-        // system prompt + the visible conversation (skipping error bubbles and empty turns).
+        // system prompt + the visible conversation. Skip error bubbles and empty turns; the
+        // system prompt already carries the *current* circuit, so include only the newest
+        // auto-check turn (older ones describe superseded states and would just waste tokens).
+        let last_auto = self.messages.iter().rposition(|m| m.auto);
         let mut turns = vec![ChatTurn {
             role: "system".to_string(),
             content: system_prompt,
         }];
-        for m in &self.messages {
+        for (i, m) in self.messages.iter().enumerate() {
             if m.error || m.text.trim().is_empty() {
+                continue;
+            }
+            if m.auto && Some(i) != last_auto {
                 continue;
             }
             let role = match m.role {
@@ -645,27 +755,52 @@ fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) -> bool {
         .show(ui, |ui| {
             ui.add_space(4.0);
             for (i, msg) in session.messages.iter().enumerate() {
-                retry |= bubble(ui, theme, msg, row_width, i);
+                if msg.auto {
+                    auto_note(ui, theme, msg, i);
+                } else {
+                    retry |= bubble(ui, theme, msg, row_width, i);
+                }
                 ui.add_space(8.0);
             }
             if session.is_pending() {
-                thinking(ui, theme);
+                thinking(ui, theme, session);
             }
         });
     retry
 }
 
-/// A left-aligned "Thinking…" placeholder shown while awaiting a reply.
-fn thinking(ui: &mut egui::Ui, theme: &Theme) {
+/// A subtle, foldable "auto-check" row for an agent-loop feedback turn — visible so the run reads
+/// like a live workflow, but quiet so it never competes with the real messages.
+fn auto_note(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, idx: usize) {
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new(
+            RichText::new("Checked the circuit")
+                .small()
+                .italics()
+                .color(theme.label_dim),
+        )
+        .id_salt(("ai-autocheck", idx))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(RichText::new(&msg.text).small().color(theme.label_dim));
+        });
+    });
+}
+
+/// A left-aligned status row shown while awaiting a reply: "Thinking…", or "Working — step N…"
+/// during an autonomous run.
+fn thinking(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) {
+    let label = if session.is_running() && session.agent_step() > 0 {
+        format!("Working \u{2014} step {}\u{2026}", session.agent_step())
+    } else {
+        "Thinking\u{2026}".to_string()
+    };
     ui.horizontal(|ui| {
         ui.add_space(12.0);
         accent_dot(ui, theme, 3.5);
         ui.add_space(6.0);
-        ui.label(
-            RichText::new("Thinking\u{2026}")
-                .italics()
-                .color(theme.label_dim),
-        );
+        ui.label(RichText::new(label).italics().color(theme.label_dim));
     });
     // Keep animating so the reply (and this indicator) refresh promptly.
     ui.ctx()
@@ -832,14 +967,33 @@ fn composer(
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             model_switcher(ui, theme, settings, session);
+            // Agent toggle: when on, the assistant iterates (build → self-check → fix) on its own.
+            ui.add_space(8.0);
+            ui.checkbox(&mut session.agent_enabled, RichText::new("Agent").small())
+                .on_hover_text(
+                    "Let the assistant work on its own: build, auto-check the circuit's \
+                     behavior, and fix it until it matches your request. Uses several provider \
+                     calls; press Stop any time.",
+                );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let can_send = ready && !pending && !session.input.trim().is_empty();
-                let label = if pending { "Sending\u{2026}" } else { "Send" };
-                if ui
-                    .add_enabled(can_send, accent_widget(theme, label))
-                    .clicked()
-                {
-                    send = true;
+                if session.is_running() {
+                    // Mid-run: offer Stop instead of Send.
+                    if ui
+                        .add(accent_widget(theme, "Stop"))
+                        .on_hover_text("Stop after the current step")
+                        .clicked()
+                    {
+                        session.request_stop();
+                    }
+                } else {
+                    let can_send = ready && !pending && !session.input.trim().is_empty();
+                    let label = if pending { "Sending\u{2026}" } else { "Send" };
+                    if ui
+                        .add_enabled(can_send, accent_widget(theme, label))
+                        .clicked()
+                    {
+                        send = true;
+                    }
                 }
             });
         });

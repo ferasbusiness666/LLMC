@@ -310,9 +310,132 @@ impl Document {
              ONLY when you actually want to change the circuit — for plain questions, just \
              answer. Keep any prose before the json short.\n\
              \n\
+             AUTONOMOUS LOOP: after your commands are applied you'll receive an automatic \
+             \"auto-check\" — the circuit's real behavior as a truth table (inputs \u{2192} \
+             outputs) plus any wiring problems. Compare it against the request. If the circuit is \
+             complete and correct, reply with a short summary and NO json block (that ends the \
+             task). Otherwise, send more commands to fix it — you can iterate as many times as \
+             needed. Always re-check the wiring after you add, remove, or replace a block, since \
+             replacing a block drops the wires that were attached to it.\n\
+             \n\
              Current circuit:\n{}",
             self.circuit_context()
         )
+    }
+
+    /// The automatic post-edit "auto-check" handed back to the agent: what the circuit actually
+    /// does (a truth table over its switches → LEDs), plus any multi-driver conflicts. This is
+    /// what lets the assistant verify and fix its own work without the user prodding it.
+    fn agent_observation(&self) -> String {
+        use std::fmt::Write as _;
+        let c = &self.manager.circuit;
+        let inputs: Vec<&Block> = c
+            .iter_blocks()
+            .filter(|b| matches!(b.ty, BlockType::Switch | BlockType::Button))
+            .collect();
+        let outputs: Vec<&Block> = c.iter_blocks().filter(|b| b.ty == BlockType::Led).collect();
+        let has_clock = c.iter_blocks().any(|b| b.ty == BlockType::Clock);
+
+        let mut out = String::from("Auto-check after your edits.\n");
+
+        // A fresh sim so the user's live switch settings aren't disturbed.
+        let mut sim = Simulation::build(&self.manager.circuit, &self.manager.chips);
+        if sim.has_conflicts() {
+            out.push_str(
+                "WARNING: an input is driven by more than one wire (multi-driver conflict) — \
+                 usually a mistake.\n",
+            );
+        }
+
+        let name = |b: &Block| match &b.label {
+            Some(l) if !l.trim().is_empty() => format!("#{}({})", b.id, l.trim()),
+            _ => format!("#{}", b.id),
+        };
+
+        if inputs.is_empty() || outputs.is_empty() {
+            let _ = write!(
+                out,
+                "Circuit has {} switch input(s) and {} LED output(s); a truth table needs at \
+                 least one of each.",
+                inputs.len(),
+                outputs.len()
+            );
+            return out;
+        }
+        if inputs.len() > 6 {
+            let _ = write!(
+                out,
+                "Circuit has {} inputs — too many for a full truth table here. Inputs: {}. \
+                 Outputs: {}.",
+                inputs.len(),
+                inputs
+                    .iter()
+                    .copied()
+                    .map(name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                outputs
+                    .iter()
+                    .copied()
+                    .map(name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            return out;
+        }
+
+        if has_clock {
+            out.push_str("(Circuit has a clock; table is a settled snapshot at time 0.)\n");
+        }
+        let _ = writeln!(
+            out,
+            "Truth table — inputs [{}] \u{2192} outputs [{}]:",
+            inputs
+                .iter()
+                .copied()
+                .map(name)
+                .collect::<Vec<_>>()
+                .join(", "),
+            outputs
+                .iter()
+                .copied()
+                .map(name)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let n = inputs.len();
+        for combo in 0..(1u32 << n) {
+            for (i, b) in inputs.iter().enumerate() {
+                let bit = (combo >> (n - 1 - i)) & 1 == 1;
+                sim.set_switch(b.id, bit);
+            }
+            sim.step(0.0);
+            let ins: Vec<&str> = (0..n)
+                .map(|i| {
+                    if (combo >> (n - 1 - i)) & 1 == 1 {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                })
+                .collect();
+            let outs: Vec<&str> = outputs
+                .iter()
+                .map(|b| {
+                    if sim.led_value(b.id).unwrap_or(false) {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                })
+                .collect();
+            let _ = writeln!(out, "  {} | {}", ins.join(" "), outs.join(" "));
+        }
+        out.push_str(
+            "If this matches the request, reply with a brief summary and NO commands. Otherwise \
+             fix it with more commands.",
+        );
+        out
     }
 
     /// A compact JSON view of the active circuit (blocks + connections) for the assistant. Kept
@@ -2542,15 +2665,31 @@ impl eframe::App for LlmcApp {
         // in the background when you switch away — so poll every document's session, apply any
         // circuit edits the reply proposed (as one undoable step, into that tab), and keep
         // repainting while any is still awaiting a reply.
+        //
+        // In agent mode the assistant iterates on its own: after applying its edits we hand it an
+        // automatic "auto-check" (the circuit's actual truth table + any problems) and dispatch
+        // the next step, until it replies with no edits (done), the user hits Stop, or the step
+        // cap is reached.
+        let ai_settings = &self.ai;
         let mut any_pending = false;
         for doc in &mut self.docs {
-            doc.ai.poll_chat();
+            let reply = doc.ai.poll_chat();
             if let Some(ops) = doc.ai.take_pending_ops() {
                 let report = doc.apply_ai_ops(ops);
                 if report.changed {
                     doc.recompute_dirty();
                 }
                 doc.ai.attach_edit_result(report.activity, report.errors);
+                if doc.ai.should_continue_or_note() {
+                    let feedback = doc.agent_observation();
+                    let prompt = doc.assistant_system_prompt();
+                    doc.ai.continue_agent(ai_settings, prompt, feedback);
+                } else {
+                    doc.ai.end_agent();
+                }
+            } else if reply {
+                // A reply with no edits ends the run (final answer, or an error).
+                doc.ai.end_agent();
             }
             any_pending |= doc.ai.is_pending();
         }
@@ -2828,5 +2967,91 @@ mod tests {
             !d.is_dirty(),
             "reverting the chip edit restores a clean project"
         );
+    }
+
+    #[test]
+    fn apply_ai_ops_builds_wires_and_reports_bad_ops() {
+        let mut d = doc();
+        let ops = vec![
+            RawOp::Add {
+                r#ref: Some("a".into()),
+                kind: BlockType::Switch,
+                x: 0,
+                y: 0,
+                inputs: None,
+                label: None,
+                state: false,
+            },
+            RawOp::Add {
+                r#ref: Some("g".into()),
+                kind: BlockType::And,
+                x: 6,
+                y: 1,
+                inputs: None,
+                label: None,
+                state: false,
+            },
+            RawOp::Add {
+                r#ref: Some("led".into()),
+                kind: BlockType::Led,
+                x: 12,
+                y: 2,
+                inputs: None,
+                label: None,
+                state: false,
+            },
+            RawOp::Connect {
+                from: "a".into(),
+                from_port: 0,
+                to: "g".into(),
+                to_port: 0,
+            },
+            RawOp::Connect {
+                from: "g".into(),
+                from_port: 0,
+                to: "led".into(),
+                to_port: 0,
+            },
+            // A switch has no input port, so this must be skipped and reported, not applied.
+            RawOp::Connect {
+                from: "g".into(),
+                from_port: 0,
+                to: "a".into(),
+                to_port: 0,
+            },
+        ];
+        let report = d.apply_ai_ops(ops);
+        assert!(report.changed);
+        assert_eq!(d.manager.circuit.blocks.len(), 3, "three blocks added");
+        assert_eq!(
+            d.manager.circuit.connections.len(),
+            2,
+            "two valid wires; the invalid one skipped"
+        );
+        assert_eq!(report.errors.len(), 1, "the bad connect is reported");
+
+        // The whole batch is one undo step.
+        assert!(d.manager.undo());
+        assert_eq!(d.manager.circuit.blocks.len(), 0, "one undo reverts it all");
+    }
+
+    #[test]
+    fn agent_observation_reports_the_real_truth_table() {
+        let mut d = doc();
+        let a = d.manager.add_block(BlockType::Switch, Pos::new(0, 0));
+        let b = d.manager.add_block(BlockType::Switch, Pos::new(0, 4));
+        let g = d.manager.add_block(BlockType::And, Pos::new(6, 1));
+        let led = d.manager.add_block(BlockType::Led, Pos::new(12, 2));
+        d.manager.connect(Port::output(a, 0), Port::input(g, 0));
+        d.manager.connect(Port::output(b, 0), Port::input(g, 1));
+        d.manager.connect(Port::output(g, 0), Port::input(led, 0));
+
+        let obs = d.agent_observation();
+        assert!(obs.contains("Truth table"), "reports a truth table");
+        // AND: high only when both inputs are high.
+        assert!(obs.contains("0 0 | 0"));
+        assert!(obs.contains("0 1 | 0"));
+        assert!(obs.contains("1 0 | 0"));
+        assert!(obs.contains("1 1 | 1"));
     }
 }
