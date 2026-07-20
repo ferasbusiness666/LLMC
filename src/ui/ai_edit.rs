@@ -151,19 +151,168 @@ fn split_reasoning(raw: &str) -> (Option<String>, String) {
     (thinking, body.trim().to_string())
 }
 
-/// Extract a `{"commands":[…]}` block from `body`, returning (ops, body-without-the-block).
+/// Extract commands from `body`, returning (ops, body-without-the-command-block).
+///
+/// Tolerant on purpose: many models emit "JSONC" — `//` comments, trailing commas, or a reply
+/// that got truncated mid-array. We first try the located command block (sanitized), then, if
+/// that yields nothing, recover individual `{"op":…}` objects wherever they appear.
 fn extract_ops(body: &str) -> (Vec<RawOp>, String) {
     if let Some((json, rest)) = find_command_json(body) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
-            if let Some(arr) = val.get("commands").and_then(|c| c.as_array()) {
-                let ops: Vec<RawOp> = arr.iter().filter_map(parse_op).collect();
-                if !ops.is_empty() {
-                    return (ops, rest.trim().to_string());
-                }
+        let ops = ops_from_text(&json);
+        if !ops.is_empty() {
+            return (ops, rest.trim().to_string());
+        }
+    }
+    // No usable block was located (missing fence, etc.) — scan the whole reply for loose op
+    // objects and, if any are found, trim the JSON-ish tail from what we display.
+    let ops = ops_from_text(body);
+    if !ops.is_empty() {
+        let cut = body
+            .find("```")
+            .or_else(|| body.find("{\""))
+            .unwrap_or(body.len());
+        return (ops, body[..cut].trim().to_string());
+    }
+    (Vec::new(), body.trim().to_string())
+}
+
+/// Parse ops from a chunk of text that should contain a command block. First tries the whole
+/// thing as JSON (after stripping comments / trailing commas), then falls back to scanning for
+/// individual op objects so a malformed or truncated array still yields its valid commands.
+fn ops_from_text(region: &str) -> Vec<RawOp> {
+    let sanitized = sanitize_json(region);
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sanitized) {
+        if let Some(arr) = val
+            .get("commands")
+            .and_then(|c| c.as_array())
+            .or_else(|| val.as_array())
+        {
+            let ops: Vec<RawOp> = arr.iter().filter_map(parse_op).collect();
+            if !ops.is_empty() {
+                return ops;
             }
         }
     }
-    (Vec::new(), body.trim().to_string())
+    scan_op_objects(&sanitized)
+}
+
+/// Recover ops by scanning for balanced `{…}` objects that look like a single command (contain
+/// `"op"` and not the `"commands"` wrapper), parsing each independently.
+fn scan_op_objects(s: &str) -> Vec<RawOp> {
+    let b = s.as_bytes();
+    let mut ops = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'{' {
+            if let Some(end) = balanced_end(b, i) {
+                let obj = &s[i..=end];
+                if obj.contains("\"op\"") && !obj.contains("\"commands\"") {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(obj) {
+                        if let Some(op) = parse_op(&v) {
+                            ops.push(op);
+                        }
+                    }
+                    i = end + 1; // skip this object (and its nested braces)
+                    continue;
+                }
+                // A wrapper / non-op object: step in to find the op objects inside it.
+            }
+        }
+        i += 1;
+    }
+    ops
+}
+
+/// Strip `//` line comments, `/* … */` block comments, and trailing commas (`,}` / `,]`) from a
+/// JSON-ish string, leaving string contents untouched — so models' "JSONC" output parses.
+fn sanitize_json(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_str = true;
+                out.push(c);
+                i += 1;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2; // consume the closing */
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    strip_trailing_commas(&String::from_utf8(out).unwrap_or_default())
+}
+
+/// Remove commas that directly precede a `}` or `]` (ignoring whitespace), outside of strings.
+fn strip_trailing_commas(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == b',' {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < b.len() && (b[j] == b'}' || b[j] == b']') {
+                i += 1; // drop the trailing comma
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// Locate the command JSON: first a ```-fenced block that mentions `"commands"`, else a raw
@@ -532,5 +681,39 @@ mod tests {
     fn live_split_hides_partial_command_json() {
         let (_r, a) = live_split("", "Adding a gate.\n```json\n{\"commands\":[{\"op\":");
         assert_eq!(a, "Adding a gate.");
+    }
+
+    #[test]
+    fn tolerates_json_comments_and_trailing_commas() {
+        // The exact shape weak models produce: // comments and a trailing comma.
+        let raw = "Let's build it.\n```json\n{\n  \"commands\": [\n    // Enable switch\n    \
+                   {\"op\":\"add\",\"ref\":\"EN\",\"kind\":\"switch\",\"x\":0,\"y\":70},\n\n    \
+                   // Bit 0\n    {\"op\":\"add\",\"ref\":\"D0\",\"kind\":\"switch\",\"x\":0,\"y\":0},\n  ]\n}\n```";
+        let parsed = parse_reply(raw);
+        assert_eq!(parsed.ops.len(), 2, "comments + trailing comma still parse");
+        assert_eq!(parsed.text, "Let's build it.");
+    }
+
+    #[test]
+    fn recovers_ops_from_truncated_array() {
+        // Reply cut off mid-stream: the array never closes, but the complete objects survive.
+        let raw = "```json\n{\"commands\":[\
+                   {\"op\":\"add\",\"ref\":\"a\",\"kind\":\"and\",\"x\":0,\"y\":0},\
+                   {\"op\":\"connect\",\"from\":\"a\",\"to\":\"b\"},\
+                   {\"op\":\"add\",\"ref\":\"b\",\"ki";
+        let parsed = parse_reply(raw);
+        assert_eq!(parsed.ops.len(), 2, "the two complete ops are recovered");
+    }
+
+    #[test]
+    fn comment_stripper_leaves_urls_in_strings_intact() {
+        // `//` inside a JSON string value must NOT be treated as a comment.
+        let raw =
+            "{\"commands\":[{\"op\":\"label\",\"target\":\"1\",\"text\":\"see http://x/y\"}]}";
+        let parsed = parse_reply(raw);
+        match &parsed.ops[0] {
+            RawOp::Label { text, .. } => assert_eq!(text.as_deref(), Some("see http://x/y")),
+            _ => panic!("expected label"),
+        }
     }
 }

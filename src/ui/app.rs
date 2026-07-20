@@ -322,8 +322,18 @@ impl Document {
              - Multi-bit register/RAM: repeat a 1-bit latch once per bit, sharing one enable/write \
              line across all bits.\n\
              \n\
-             TO CHANGE THE CIRCUIT, end your reply with ONE fenced ```json block of the form \
-             {{\"commands\":[ … ]}}. Commands:\n\
+             OUTPUT FORMAT — READ CAREFULLY. To change the circuit, end your reply with exactly \
+             ONE code block that contains a single JSON object with a \"commands\" array, like:\n\
+             ```json\n\
+             {{\"commands\": [\n\
+             \x20 {{\"op\": \"add\", \"ref\": \"a\", \"kind\": \"switch\", \"x\": 0, \"y\": 0}},\n\
+             \x20 {{\"op\": \"add\", \"ref\": \"g\", \"kind\": \"and\", \"x\": 6, \"y\": 1}},\n\
+             \x20 {{\"op\": \"connect\", \"from\": \"a\", \"to\": \"g\", \"to_port\": 0}}\n\
+             ]}}\n\
+             ```\n\
+             The JSON MUST be strictly valid: double quotes around every key and string, NO \
+             comments (no // or /* */), NO trailing commas, and nothing but the JSON object \
+             inside the code fence. Do not write the commands as prose. Commands:\n\
              - {{\"op\":\"add\",\"ref\":\"<name>\",\"kind\":\"<kind>\",\"x\":<int>,\"y\":<int>,\
              \"inputs\":<opt int>,\"label\":\"<opt>\"}}\n\
              - {{\"op\":\"connect\",\"from\":\"<ref-or-id>\",\"to\":\"<ref-or-id>\",\
