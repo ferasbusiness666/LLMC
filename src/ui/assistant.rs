@@ -397,6 +397,10 @@ pub struct AiSession {
     agent_stop: bool,
     /// Live text filter for the model picker (providers can list hundreds of models).
     model_filter: String,
+    /// Streaming buffers for the in-flight reply: reasoning and answer accumulated so far. Shown
+    /// as a live bubble until the terminal reply lands and replaces them with a parsed message.
+    stream_reason: String,
+    stream_content: String,
 }
 
 /// Safety cap on autonomous agent iterations (each is one provider call). The user can always
@@ -420,6 +424,8 @@ impl Default for AiSession {
             agent_steps: 0,
             agent_stop: false,
             model_filter: String::new(),
+            stream_reason: String::new(),
+            stream_content: String::new(),
         }
     }
 }
@@ -436,28 +442,44 @@ impl AiSession {
     /// Returns true if a reply (success or error) was received this call.
     pub fn poll_chat(&mut self) -> bool {
         let mut got = false;
-        while let Ok(ChatEvent::Reply { token, result }) = self.chat_rx.try_recv() {
-            if self.pending != Some(token) {
-                continue; // stale reply (conversation cleared, or superseded) — drop it.
-            }
-            self.pending = None;
-            got = true;
-            match result {
-                Ok(raw) => {
-                    let parsed = ai_edit::parse_reply(&raw);
-                    self.messages.push(ChatMessage {
-                        role: Role::Assistant,
-                        text: parsed.text,
-                        thinking: parsed.thinking,
-                        error: false,
-                        activity: Vec::new(),
-                        auto: false,
-                    });
-                    if !parsed.ops.is_empty() {
-                        self.pending_ops = Some(parsed.ops);
+        while let Ok(event) = self.chat_rx.try_recv() {
+            match event {
+                ChatEvent::Delta {
+                    token,
+                    reasoning,
+                    content,
+                } => {
+                    if self.pending == Some(token) {
+                        self.stream_reason = reasoning;
+                        self.stream_content = content;
                     }
                 }
-                Err(e) => self.messages.push(ChatMessage::failure(e)),
+                ChatEvent::Reply { token, result } => {
+                    if self.pending != Some(token) {
+                        continue; // stale reply (conversation cleared, or superseded) — drop it.
+                    }
+                    self.pending = None;
+                    self.stream_reason.clear();
+                    self.stream_content.clear();
+                    got = true;
+                    match result {
+                        Ok(raw) => {
+                            let parsed = ai_edit::parse_reply(&raw);
+                            self.messages.push(ChatMessage {
+                                role: Role::Assistant,
+                                text: parsed.text,
+                                thinking: parsed.thinking,
+                                error: false,
+                                activity: Vec::new(),
+                                auto: false,
+                            });
+                            if !parsed.ops.is_empty() {
+                                self.pending_ops = Some(parsed.ops);
+                            }
+                        }
+                        Err(e) => self.messages.push(ChatMessage::failure(e)),
+                    }
+                }
             }
         }
         got
@@ -631,6 +653,8 @@ impl AiSession {
         let token = self.next_token;
         self.next_token += 1;
         self.pending = Some(token);
+        self.stream_reason.clear();
+        self.stream_content.clear();
         let req = ChatRequest {
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
@@ -766,10 +790,63 @@ fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) -> bool {
                 ui.add_space(8.0);
             }
             if session.is_pending() {
-                thinking(ui, theme, session);
+                if session.stream_reason.is_empty() && session.stream_content.is_empty() {
+                    thinking(ui, theme, session);
+                } else {
+                    stream_bubble(
+                        ui,
+                        theme,
+                        &session.stream_reason,
+                        &session.stream_content,
+                        row_width,
+                    );
+                }
             }
         });
     retry
+}
+
+/// A live assistant bubble rendered from the partial streaming buffers — reasoning dimmed above,
+/// answer below — so the reply appears token by token.
+fn stream_bubble(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    reason_field: &str,
+    content_field: &str,
+    row_width: f32,
+) {
+    let (reasoning, answer) = ai_edit::live_split(reason_field, content_field);
+    ui.allocate_ui_with_layout(
+        egui::vec2(row_width, 0.0),
+        Layout::left_to_right(Align::TOP),
+        |ui| {
+            ui.add_space(12.0);
+            let max_w = (row_width * 0.82).max(140.0);
+            Frame::NONE
+                .fill(surface(theme))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_max_width(max_w);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            accent_dot(ui, theme, 3.0);
+                            ui.add_space(5.0);
+                            ui.label(RichText::new("Assistant").small().color(theme.label_dim));
+                        });
+                        if let Some(r) = &reasoning {
+                            ui.label(RichText::new(r).italics().color(theme.label_dim).size(12.5));
+                        }
+                        if !answer.is_empty() {
+                            ui.label(RichText::new(answer).color(theme.label));
+                        }
+                    });
+                });
+        },
+    );
+    // Stream smoothly.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(60));
 }
 
 /// A subtle, foldable "auto-check" row for an agent-loop feedback turn — visible so the run reads
@@ -1181,6 +1258,18 @@ pub fn settings_window(
             if changed {
                 settings.dirty = true;
             }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Request log: {}",
+                    super::ai_log::log_path_display()
+                ))
+                .small()
+                .color(theme.label_dim),
+            );
         });
     if !keep_open {
         *open = false;

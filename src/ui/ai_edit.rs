@@ -62,6 +62,48 @@ pub fn parse_reply(raw: &str) -> ParsedReply {
     }
 }
 
+/// Live view of a *partial* streaming reply: `(reasoning-so-far, answer-so-far)`, for display
+/// while tokens are still arriving. `reason_field` is a separate reasoning stream (some
+/// providers emit one); otherwise an inline `<think>` tag in `content` is used, open or closed.
+/// The answer is cut at the start of a command block so raw JSON isn't shown mid-stream.
+pub fn live_split(reason_field: &str, content: &str) -> (Option<String>, String) {
+    let opt = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    if !reason_field.trim().is_empty() {
+        return (opt(reason_field), visible_answer(content));
+    }
+    for (open_tag, close_tag) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        if let Some(open) = content.find(open_tag) {
+            let after = open + open_tag.len();
+            return match content[after..].find(close_tag) {
+                Some(rel) => {
+                    let cpos = after + rel;
+                    let answer =
+                        format!("{}{}", &content[..open], &content[cpos + close_tag.len()..]);
+                    (opt(&content[after..cpos]), visible_answer(&answer))
+                }
+                None => (opt(&content[after..]), visible_answer(&content[..open])),
+            };
+        }
+    }
+    (None, visible_answer(content))
+}
+
+/// The portion of an answer safe to show while streaming: everything before a code fence or a
+/// `{"commands"` object (the command block is rendered as an activity list once complete).
+fn visible_answer(s: &str) -> String {
+    let mut end = s.len();
+    if let Some(p) = s.find("```") {
+        end = end.min(p);
+    }
+    if let Some(p) = s.find("{\"commands\"") {
+        end = end.min(p);
+    }
+    s[..end].trim_end().to_string()
+}
+
 /// Pull the contents of any `<think>…</think>` / `<thinking>…</thinking>` blocks out of `raw`,
 /// returning (joined reasoning, body with those blocks removed). Unclosed tags are left as-is.
 fn split_reasoning(raw: &str) -> (Option<String>, String) {
@@ -469,5 +511,26 @@ mod tests {
             parsed.text,
             "An AND gate outputs 1 only when both inputs are 1."
         );
+    }
+
+    #[test]
+    fn live_split_separate_reasoning_field() {
+        let (r, a) = live_split("thinking about it", "Here is the plan");
+        assert_eq!(r.as_deref(), Some("thinking about it"));
+        assert_eq!(a, "Here is the plan");
+    }
+
+    #[test]
+    fn live_split_inline_open_think() {
+        // Mid-stream: the think tag has opened but not closed yet.
+        let (r, a) = live_split("", "<think>still reasoning");
+        assert_eq!(r.as_deref(), Some("still reasoning"));
+        assert_eq!(a, "");
+    }
+
+    #[test]
+    fn live_split_hides_partial_command_json() {
+        let (_r, a) = live_split("", "Adding a gate.\n```json\n{\"commands\":[{\"op\":");
+        assert_eq!(a, "Adding a gate.");
     }
 }

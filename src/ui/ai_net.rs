@@ -1,10 +1,13 @@
 //! Networking for the AI providers: a tiny blocking HTTP client run on worker threads so the
-//! UI thread never blocks. Results come back over a channel the panel drains each frame.
+//! UI thread never blocks. Results (and streaming tokens) come back over channels the panel
+//! drains each frame.
 //!
-//! Everything here is OpenAI-compatible (`GET {base}/models`, `Authorization: Bearer <key>`),
-//! which every configured provider speaks; provider-specific quirks can be added later without
-//! touching the UI.
+//! Everything here is OpenAI-compatible (`GET {base}/models`, `POST {base}/chat/completions`
+//! with `Authorization: Bearer <key>`), which every configured provider speaks. Chat is
+//! streamed via Server-Sent Events, with a fallback for providers that answer with a plain
+//! JSON body.
 
+use std::io::BufRead;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -50,19 +53,31 @@ pub struct ChatRequest {
     pub turns: Vec<ChatTurn>,
 }
 
-/// A chat reply handed back to the UI thread, tagged with the request `token` so it lands in
+/// A chat event handed back to the UI thread, tagged with the request `token` so it lands in
 /// the tab that started it — a request keeps running in the background when you switch tabs.
 pub enum ChatEvent {
+    /// A streaming update: the reasoning and answer accumulated so far (full snapshots, so the
+    /// UI just stores the latest).
+    Delta {
+        token: u64,
+        reasoning: String,
+        content: String,
+    },
+    /// The stream finished (or a non-streaming reply / an error arrived). `result` is the full
+    /// reply text (reasoning folded into `<think>` tags) or a short error message.
     Reply {
         token: u64,
         result: Result<String, String>,
     },
 }
 
-/// Run one chat completion on a background thread and send the reply to `tx`.
+/// Run one chat completion on a background thread, streaming tokens to `tx` as they arrive and
+/// sending a terminal [`ChatEvent::Reply`] when done. Logged to the local debug log.
 pub fn spawn_chat(tx: Sender<ChatEvent>, token: u64, req: ChatRequest) {
     std::thread::spawn(move || {
-        let result = chat(&req);
+        super::ai_log::request(&req);
+        let result = stream_chat(&tx, token, &req);
+        super::ai_log::reply(&req, &result);
         let _ = tx.send(ChatEvent::Reply { token, result });
     });
 }
@@ -72,12 +87,14 @@ pub fn spawn_chat(tx: Sender<ChatEvent>, token: u64, req: ChatRequest) {
 fn chat_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(180))
         .build()
 }
 
-/// Blocking call: POST an OpenAI-compatible chat completion and return the assistant's text.
-fn chat(req: &ChatRequest) -> Result<String, String> {
+/// POST an OpenAI-compatible chat completion with `stream: true`, forwarding each token to `tx`
+/// via [`ChatEvent::Delta`] and returning the full reply text. Providers that don't stream
+/// (respond with a normal JSON body) are handled transparently.
+fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<String, String> {
     let base = req.base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return Err("No base URL for the selected provider.".to_string());
@@ -93,18 +110,96 @@ fn chat(req: &ChatRequest) -> Result<String, String> {
     let body = serde_json::json!({
         "model": req.model,
         "messages": messages,
-        "stream": false,
+        "stream": true,
     });
     let url = format!("{base}/chat/completions");
     let resp = chat_agent()
         .post(&url)
         .set("Authorization", &format!("Bearer {}", req.api_key.trim()))
+        .set("Accept", "text/event-stream")
         .send_json(body)
         .map_err(describe_error)?;
-    let value: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("Unexpected response: {e}"))?;
-    parse_chat_reply(&value)
+
+    // Some providers ignore `stream: true` (or don't support it) and return a normal JSON body.
+    if !resp.content_type().contains("event-stream") {
+        let value: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| format!("Unexpected response: {e}"))?;
+        return parse_chat_reply(&value);
+    }
+
+    // Server-Sent Events: `data: {json}` lines, terminated by `data: [DONE]`. Each chunk carries
+    // a `choices[0].delta` with `content` and/or a reasoning field.
+    let reader = std::io::BufReader::new(resp.into_reader());
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Stream error: {e}"))?;
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if let Some(err) = v.get("error") {
+            let msg = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("stream error");
+            return Err(truncate(msg));
+        }
+        let Some(delta) = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("delta"))
+        else {
+            continue;
+        };
+        let mut changed = false;
+        if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
+            if !t.is_empty() {
+                content.push_str(t);
+                changed = true;
+            }
+        }
+        // OpenRouter streams `reasoning`; DeepSeek streams `reasoning_content`.
+        if let Some(t) = delta
+            .get("reasoning")
+            .or_else(|| delta.get("reasoning_content"))
+            .and_then(|c| c.as_str())
+        {
+            if !t.is_empty() {
+                reasoning.push_str(t);
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = tx.send(ChatEvent::Delta {
+                token,
+                reasoning: reasoning.clone(),
+                content: content.clone(),
+            });
+        }
+    }
+
+    if content.trim().is_empty() && reasoning.trim().is_empty() {
+        return Err("The provider returned an empty reply.".to_string());
+    }
+    // Fold a separate reasoning stream into `<think>` tags so the reply parser handles both
+    // streaming styles uniformly.
+    Ok(if reasoning.trim().is_empty() {
+        content
+    } else {
+        format!("<think>{reasoning}</think>{content}")
+    })
 }
 
 /// Pull the assistant text out of an OpenAI-style chat-completion response

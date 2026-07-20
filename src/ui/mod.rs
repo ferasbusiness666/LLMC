@@ -2,6 +2,7 @@
 //! lives in the `llmc` library crate.
 
 mod ai_edit;
+mod ai_log;
 mod ai_net;
 mod app;
 mod assistant;
