@@ -395,6 +395,8 @@ pub struct AiSession {
     agent_steps: u32,
     /// Set when the user presses Stop; the loop ends after the in-flight reply lands.
     agent_stop: bool,
+    /// Live text filter for the model picker (providers can list hundreds of models).
+    model_filter: String,
 }
 
 /// Safety cap on autonomous agent iterations (each is one provider call). The user can always
@@ -417,6 +419,7 @@ impl Default for AiSession {
             agent_running: false,
             agent_steps: 0,
             agent_stop: false,
+            model_filter: String::new(),
         }
     }
 }
@@ -1043,22 +1046,54 @@ fn model_switcher(
     };
 
     ui.menu_button(selected_label, |ui| {
-        ui.set_min_width(230.0);
-        for (pi, model) in &live {
-            let is_sel = session
-                .selected
-                .as_ref()
-                .is_some_and(|s| s.provider == *pi && s.model == *model);
-            let provider = settings.providers.get(*pi).map(|p| p.name.as_str());
-            let row = model_job(ui, theme, model, provider, multi_provider);
-            if ui.selectable_label(is_sel, row).clicked() {
-                session.selected = Some(ModelRef {
-                    provider: *pi,
-                    model: model.to_string(),
-                });
-                ui.close();
-            }
+        ui.set_min_width(260.0);
+        // A filter box once the list is long enough to be a pain to eyeball (e.g. OpenRouter).
+        if live.len() > 8 {
+            ui.add(
+                egui::TextEdit::singleline(&mut session.model_filter)
+                    .hint_text("Filter models\u{2026}")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(4.0);
         }
+        let filter = session.model_filter.trim().to_lowercase();
+        // Scroll so hundreds of models never run off the screen.
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut shown = 0usize;
+                for (pi, model) in &live {
+                    let provider = settings.providers.get(*pi).map(|p| p.name.as_str());
+                    if !filter.is_empty() {
+                        let hay = format!("{model} {}", provider.unwrap_or("")).to_lowercase();
+                        if !hay.contains(&filter) {
+                            continue;
+                        }
+                    }
+                    shown += 1;
+                    let is_sel = session
+                        .selected
+                        .as_ref()
+                        .is_some_and(|s| s.provider == *pi && s.model == *model);
+                    let row = model_job(ui, theme, model, provider, multi_provider);
+                    if ui.selectable_label(is_sel, row).clicked() {
+                        session.selected = Some(ModelRef {
+                            provider: *pi,
+                            model: model.to_string(),
+                        });
+                        session.model_filter.clear();
+                        ui.close();
+                    }
+                }
+                if shown == 0 {
+                    ui.label(
+                        RichText::new("No matching models")
+                            .small()
+                            .color(theme.label_dim),
+                    );
+                }
+            });
     });
 }
 
