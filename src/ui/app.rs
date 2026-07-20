@@ -134,6 +134,8 @@ struct Document {
     space_down: bool,
     /// A click-to-wire in progress: click a port, then click the target port.
     pending_wire: Option<(Port, bool)>,
+    /// A momentary Button currently held down (high while pressed, low on release).
+    pressed_button: Option<BlockId>,
     /// World position where the last context menu was opened (for paste-at-cursor).
     menu_world: Vec2f,
     /// Chip being renamed, with its editable name buffer.
@@ -182,6 +184,7 @@ impl Document {
             chip_name: String::new(),
             space_down: false,
             pending_wire: None,
+            pressed_button: None,
             menu_world: Vec2f::ZERO,
             rename_chip: None,
             chip_edit: None,
@@ -291,10 +294,33 @@ impl Document {
              PORTS: input ports are indexed 0,1,2,… top-to-bottom; every block that has an output \
              uses output port 0. A wire goes from an output port to an input port.\n\
              \n\
-             COORDINATES: an integer grid; x increases right, y increases down. Blocks are ~2 \
-             cells wide and (number of inputs) tall. Put inputs on the left (small x), gates in \
-             the middle, the LED on the right; leave ~4 cells horizontally between stages and ~3 \
-             vertically between stacked blocks so wires stay readable.\n\
+             LAYOUT (follow this to avoid overlaps and unreadable wiring):\n\
+             - The grid is integer; x increases right, y increases down. A block occupies 2 cells \
+             of width and as many cells of height as it has inputs (a 2-input gate is 2 tall, a \
+             3-input NAND is 3 tall; sources/LED are ~2 tall).\n\
+             - NEVER place two blocks at overlapping cells. Lay the circuit out in columns by \
+             stage: inputs at x=0, then each logic stage 6 cells further right (x=6, 12, 18, …), \
+             outputs last. Within a column, stack blocks top to bottom leaving a gap of at least \
+             (that block's height + 2) between their y values — e.g. 3-input gates every ~5 rows.\n\
+             - Position is cosmetic and never changes behavior, but good spacing makes the result \
+             readable and easy for you to verify.\n\
+             \n\
+             WIRING RULES (correctness):\n\
+             - Each INPUT port takes exactly ONE wire. Driving one input from two outputs is a \
+             multi-driver conflict (a bug) — the auto-check flags it; fix it by removing the extra \
+             wire. One OUTPUT may fan out to many inputs (that's fine).\n\
+             - To feed the same signal to several gates, draw a separate wire from the source \
+             output to each destination input.\n\
+             \n\
+             RECIPES (common building blocks):\n\
+             - NOT of a signal: a \"not\" gate (1 input).\n\
+             - SR latch: two \"nor\" gates cross-coupled (each gate's output feeds one input of \
+             the other); S and R are the free inputs, Q/Q' the outputs. (Use \"nand\" for an \
+             active-low SR latch.)\n\
+             - Gated D latch: from D make ~D with a \"not\"; two \"nand\"s gated by an enable feed \
+             a NAND SR latch — D drives Q when enable is high, holds when low.\n\
+             - Multi-bit register/RAM: repeat a 1-bit latch once per bit, sharing one enable/write \
+             line across all bits.\n\
              \n\
              TO CHANGE THE CIRCUIT, end your reply with ONE fenced ```json block of the form \
              {{\"commands\":[ … ]}}. Commands:\n\
@@ -317,6 +343,12 @@ impl Document {
              task). Otherwise, send more commands to fix it — you can iterate as many times as \
              needed. Always re-check the wiring after you add, remove, or replace a block, since \
              replacing a block drops the wires that were attached to it.\n\
+             \n\
+             HOW TO WORK RELIABLY: think first — decide the gates and connections before writing \
+             commands. For anything bigger than a few gates, build INCREMENTALLY: add one stage \
+             (or one bit), wire it, and let the auto-check confirm it before moving on. Reuse \
+             existing block ids from the circuit JSON rather than rebuilding. It is better to take \
+             several small, correct steps than one large step with mistakes.\n\
              \n\
              Current circuit:\n{}",
             self.circuit_context()
@@ -1580,6 +1612,29 @@ impl Document {
         let shift = ctx.input(|i| i.modifiers.shift);
         let pointer = response.interact_pointer_pos();
 
+        // Momentary buttons: a Button reads high only while the primary mouse button is held on
+        // it, and returns to low on release (unlike a Switch, which latches). This drives the
+        // live simulation state without touching the block's authored default.
+        let (primary_pressed, primary_released) =
+            ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
+        if primary_pressed {
+            if let Some(p) = pointer.or_else(|| response.hover_pos()) {
+                if let Some(bid) = self.hit_block(p, origin) {
+                    if self.manager.circuit.block(bid).map(|b| b.ty) == Some(BlockType::Button) {
+                        self.pressed_button = Some(bid);
+                        self.sim.set_switch(bid, true);
+                        self.sim.step(0.0);
+                    }
+                }
+            }
+        }
+        if primary_released {
+            if let Some(bid) = self.pressed_button.take() {
+                self.sim.set_switch(bid, false);
+                self.sim.step(0.0);
+            }
+        }
+
         // Pan with middle or secondary button anytime.
         if response.dragged_by(PointerButton::Middle)
             || response.dragged_by(PointerButton::Secondary)
@@ -1812,19 +1867,21 @@ impl Document {
             return;
         }
         if let Some(bid) = self.hit_block(p, origin) {
-            let toggle = self.manager.circuit.block(bid).map(|b| {
-                (
-                    matches!(b.ty, BlockType::Switch | BlockType::Button),
-                    b.state,
-                )
-            });
-            if let Some((is_switch, state)) = toggle {
+            // A Switch latches its state on click (Buttons are momentary — see handle_canvas_input).
+            let switch = self
+                .manager
+                .circuit
+                .block(bid)
+                .map(|b| (b.ty == BlockType::Switch, b.state));
+            if let Some((is_switch, state)) = switch {
                 if is_switch {
                     let ns = !state;
                     if let Some(bm) = self.manager.circuit.block_mut(bid) {
                         bm.state = ns;
                     }
                     self.sim.set_switch(bid, ns);
+                    // Settle immediately so LEDs/wires update even while paused.
+                    self.sim.step(0.0);
                 }
             }
             if !shift {

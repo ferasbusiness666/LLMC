@@ -1122,56 +1122,64 @@ fn model_switcher(
         None => model_job(ui, theme, "Choose a model", None, false),
     };
 
-    ui.menu_button(selected_label, |ui| {
-        ui.set_min_width(260.0);
-        // A filter box once the list is long enough to be a pain to eyeball (e.g. OpenRouter).
-        if live.len() > 8 {
-            ui.add(
-                egui::TextEdit::singleline(&mut session.model_filter)
-                    .hint_text("Filter models\u{2026}")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(4.0);
-        }
-        let filter = session.model_filter.trim().to_lowercase();
-        // Scroll so hundreds of models never run off the screen.
-        egui::ScrollArea::vertical()
-            .max_height(320.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let mut shown = 0usize;
-                for (pi, model) in &live {
-                    let provider = settings.providers.get(*pi).map(|p| p.name.as_str());
-                    if !filter.is_empty() {
-                        let hay = format!("{model} {}", provider.unwrap_or("")).to_lowercase();
-                        if !hay.contains(&filter) {
-                            continue;
+    // A real popup (not `menu_button`): menus close on *any* click by default, which was closing
+    // the panel the instant you clicked the filter box. `CloseOnClickOutside` keeps it open while
+    // you type; a model row closes it explicitly.
+    let button = ui.add(egui::Button::new(selected_label));
+    egui::Popup::menu(&button)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(260.0);
+            ui.set_max_width(360.0);
+            // A filter box once the list is long enough to be a pain to eyeball (e.g. OpenRouter).
+            if live.len() > 8 {
+                ui.add(
+                    egui::TextEdit::singleline(&mut session.model_filter)
+                        .hint_text("Filter models\u{2026}")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(4.0);
+            }
+            let filter = session.model_filter.trim().to_lowercase();
+            let mut picked: Option<(usize, String)> = None;
+            // Scroll so hundreds of models never run off the screen.
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let mut shown = 0usize;
+                    for (pi, model) in &live {
+                        let provider = settings.providers.get(*pi).map(|p| p.name.as_str());
+                        if !filter.is_empty() {
+                            let hay = format!("{model} {}", provider.unwrap_or("")).to_lowercase();
+                            if !hay.contains(&filter) {
+                                continue;
+                            }
+                        }
+                        shown += 1;
+                        let is_sel = session
+                            .selected
+                            .as_ref()
+                            .is_some_and(|s| s.provider == *pi && s.model == *model);
+                        let row = model_job(ui, theme, model, provider, multi_provider);
+                        if ui.selectable_label(is_sel, row).clicked() {
+                            picked = Some((*pi, model.to_string()));
                         }
                     }
-                    shown += 1;
-                    let is_sel = session
-                        .selected
-                        .as_ref()
-                        .is_some_and(|s| s.provider == *pi && s.model == *model);
-                    let row = model_job(ui, theme, model, provider, multi_provider);
-                    if ui.selectable_label(is_sel, row).clicked() {
-                        session.selected = Some(ModelRef {
-                            provider: *pi,
-                            model: model.to_string(),
-                        });
-                        session.model_filter.clear();
-                        ui.close();
+                    if shown == 0 {
+                        ui.label(
+                            RichText::new("No matching models")
+                                .small()
+                                .color(theme.label_dim),
+                        );
                     }
-                }
-                if shown == 0 {
-                    ui.label(
-                        RichText::new("No matching models")
-                            .small()
-                            .color(theme.label_dim),
-                    );
-                }
-            });
-    });
+                });
+            if let Some((provider, model)) = picked {
+                session.selected = Some(ModelRef { provider, model });
+                session.model_filter.clear();
+                egui::Popup::close_all(ui.ctx());
+            }
+        });
 }
 
 /// Build a two-tone label: model name in normal text, provider in a smaller, dimmer style.

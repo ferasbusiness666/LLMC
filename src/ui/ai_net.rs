@@ -111,6 +111,9 @@ fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<
         "model": req.model,
         "messages": messages,
         "stream": true,
+        // Low temperature: circuit edits are a precise, structured task, so favour reliable,
+        // deterministic output over creativity (helps weaker models emit valid commands).
+        "temperature": 0.2,
     });
     let url = format!("{base}/chat/completions");
     let resp = chat_agent()
