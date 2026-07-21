@@ -197,10 +197,10 @@ impl Document {
             ai: AiSession::default(),
             dark,
         };
-        // The freshly-loaded/empty content is the "saved" baseline.
+        // The freshly-loaded/empty content is the "saved" baseline. The simulation is NOT
+        // settled here: a document opens paused, and paused means frozen — the circuit stays
+        // dark until Run (or Step) evaluates it.
         doc.saved_fingerprint = doc.content_fingerprint();
-        // Settle once so combinational state (lit LEDs/wires) shows even when paused.
-        doc.sim.step(0.0);
         doc
     }
 
@@ -1151,8 +1151,11 @@ impl Document {
 
     fn rebuild_sim(&mut self) {
         self.sim = Simulation::build(&self.manager.circuit, &self.manager.chips);
-        // Settle once so combinational state (lit LEDs/wires) shows even when paused.
-        self.sim.step(0.0);
+        // Settle only when running — paused means frozen, so an edit made while paused leaves
+        // the circuit un-evaluated (dark) until Run or Step.
+        if self.running {
+            self.sim.step(0.0);
+        }
         self.sim_dirty = false;
     }
 
@@ -2135,7 +2138,9 @@ impl Document {
 
         // Momentary buttons: a Button reads high only while the primary mouse button is held on
         // it, and returns to low on release (unlike a Switch, which latches). This drives the
-        // live simulation state without touching the block's authored default.
+        // live simulation state without touching the block's authored default. The state is
+        // recorded even while paused, but only settles (propagates) when running — paused means
+        // frozen.
         let (primary_pressed, primary_released) =
             ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
         if primary_pressed {
@@ -2144,7 +2149,9 @@ impl Document {
                     if self.manager.circuit.block(bid).map(|b| b.ty) == Some(BlockType::Button) {
                         self.pressed_button = Some(bid);
                         self.sim.set_switch(bid, true);
-                        self.sim.step(0.0);
+                        if self.running {
+                            self.sim.step(0.0);
+                        }
                     }
                 }
             }
@@ -2152,7 +2159,9 @@ impl Document {
         if primary_released {
             if let Some(bid) = self.pressed_button.take() {
                 self.sim.set_switch(bid, false);
-                self.sim.step(0.0);
+                if self.running {
+                    self.sim.step(0.0);
+                }
             }
         }
 
@@ -2401,8 +2410,11 @@ impl Document {
                         bm.state = ns;
                     }
                     self.sim.set_switch(bid, ns);
-                    // Settle immediately so LEDs/wires update even while paused.
-                    self.sim.step(0.0);
+                    // Propagate only when running; paused means frozen (the switch glyph still
+                    // flips, and the change takes effect on the next Run/Step).
+                    if self.running {
+                        self.sim.step(0.0);
+                    }
                 }
             }
             if !shift {
@@ -3701,6 +3713,32 @@ mod tests {
         // The whole batch is one undo step.
         assert!(d.manager.undo());
         assert_eq!(d.manager.circuit.blocks.len(), 0, "one undo reverts it all");
+    }
+
+    #[test]
+    fn paused_sim_is_frozen_until_run() {
+        let mut d = doc();
+        let c = d.manager.add_block(BlockType::ConstantHigh, Pos::new(0, 0));
+        let led = d.manager.add_block(BlockType::Led, Pos::new(6, 0));
+        d.manager.connect(Port::output(c, 0), Port::input(led, 0));
+
+        // Paused (the default): rebuilding must NOT evaluate — the circuit stays dark.
+        assert!(!d.running);
+        d.rebuild_sim();
+        assert_eq!(
+            d.sim.led_value(led),
+            Some(false),
+            "paused = frozen; nothing propagates before Run/Step"
+        );
+
+        // Running: the rebuild settles immediately and the constant lights the LED.
+        d.running = true;
+        d.rebuild_sim();
+        assert_eq!(
+            d.sim.led_value(led),
+            Some(true),
+            "running = live; the constant drives the LED"
+        );
     }
 
     #[test]
