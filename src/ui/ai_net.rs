@@ -82,12 +82,14 @@ pub fn spawn_chat(tx: Sender<ChatEvent>, token: u64, req: ChatRequest) {
     });
 }
 
-/// Chat completions can take a while to generate, so allow a longer read timeout than the
-/// quick model-list fetch.
+/// Chat agent: NO overall deadline — a long generation may legitimately stream for many
+/// minutes (big circuits are hundreds of commands). Instead, an IDLE timeout per socket read:
+/// the request fails only if the provider goes completely silent, never because a healthy
+/// stream is taking a while.
 fn chat_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(180))
+        .timeout_read(Duration::from_secs(120))
         .build()
 }
 
@@ -137,7 +139,31 @@ fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<
     let mut content = String::new();
     let mut reasoning = String::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| format!("Stream error: {e}"))?;
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                // The stream broke (stalled or dropped). If real content already arrived,
+                // SALVAGE it — the tolerant parser applies every complete command, and the
+                // agent's auto-check lets the model pick up from there — instead of throwing
+                // the whole reply away.
+                if !content.trim().is_empty() {
+                    content.push_str(
+                        "\n\n(connection dropped mid-reply; continuing with what arrived)",
+                    );
+                    break;
+                }
+                let stalled = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                );
+                return Err(if stalled {
+                    "The stream stalled (no data for 2 minutes). Retry, or try another model."
+                        .to_string()
+                } else {
+                    format!("Stream error: {e}")
+                });
+            }
+        };
         let Some(data) = line.trim().strip_prefix("data:") else {
             continue;
         };
