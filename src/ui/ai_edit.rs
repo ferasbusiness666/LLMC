@@ -10,13 +10,28 @@ use std::ops::Range;
 
 use llmc::model::BlockType;
 
+/// What an `add` op places: a primitive block, or an instance of a library chip (by name).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AddKind {
+    Prim(BlockType),
+    Chip(String),
+}
+
+/// How a connect op names a port: by index, or by pin name (resolved against a chip's pins).
+/// `None` on an input side means "pick the first free input" — auto-assignment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PortSel {
+    Index(u16),
+    Name(String),
+}
+
 /// One edit the model asked for, still in "handle" form (refs/ids as strings) and unvalidated.
 /// The app resolves handles to real block ids and checks ports before applying.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RawOp {
     Add {
         r#ref: Option<String>,
-        kind: BlockType,
+        kind: AddKind,
         x: i32,
         y: i32,
         inputs: Option<u16>,
@@ -25,9 +40,9 @@ pub enum RawOp {
     },
     Connect {
         from: String,
-        from_port: u16,
+        from_port: Option<PortSel>,
         to: String,
-        to_port: u16,
+        to_port: Option<PortSel>,
     },
     Remove {
         target: String,
@@ -40,6 +55,20 @@ pub enum RawOp {
     Label {
         target: String,
         text: Option<String>,
+    },
+    /// Define a reusable chip: declared pins plus the ops that build its internals. The app
+    /// creates the pin blocks automatically (refs = pin names), runs the inner ops against a
+    /// scratch circuit, registers the chip, and truth-table-verifies it in isolation.
+    DefChip {
+        name: String,
+        inputs: Vec<String>,
+        outputs: Vec<String>,
+        ops: Vec<RawOp>,
+    },
+    /// A scripted test: each step sets switches/buttons (by handle) and then reads every LED.
+    /// This is how sequential circuits (latches, registers, memory) get verified.
+    Test {
+        steps: Vec<Vec<(String, bool)>>,
     },
 }
 
@@ -196,8 +225,9 @@ fn ops_from_text(region: &str) -> Vec<RawOp> {
     scan_op_objects(&sanitized)
 }
 
-/// Recover ops by scanning for balanced `{…}` objects that look like a single command (contain
-/// `"op"` and not the `"commands"` wrapper), parsing each independently.
+/// Recover ops by scanning for balanced `{…}` objects, parsing each independently. An object
+/// that parses as a single op (including a `defchip`, which legitimately contains an inner
+/// `"commands"` array) is consumed whole; a wrapper object is stepped into instead.
 fn scan_op_objects(s: &str) -> Vec<RawOp> {
     let b = s.as_bytes();
     let mut ops = Vec::new();
@@ -206,16 +236,27 @@ fn scan_op_objects(s: &str) -> Vec<RawOp> {
         if b[i] == b'{' {
             if let Some(end) = balanced_end(b, i) {
                 let obj = &s[i..=end];
-                if obj.contains("\"op\"") && !obj.contains("\"commands\"") {
+                if obj.contains("\"op\"") {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(obj) {
                         if let Some(op) = parse_op(&v) {
                             ops.push(op);
+                            i = end + 1; // consume this object (and its nested braces)
+                            continue;
+                        }
+                        // Valid JSON but not an op itself — a {"commands":[…]} wrapper: take
+                        // its ops directly and consume it.
+                        if let Some(arr) = v.get("commands").and_then(|c| c.as_array()) {
+                            ops.extend(arr.iter().filter_map(parse_op));
+                            i = end + 1;
+                            continue;
                         }
                     }
-                    i = end + 1; // skip this object (and its nested braces)
-                    continue;
+                    if !obj.contains("\"commands\"") {
+                        i = end + 1; // malformed lone op — skip it entirely
+                        continue;
+                    }
+                    // Malformed wrapper: step inside to salvage its inner ops.
                 }
-                // A wrapper / non-op object: step in to find the op objects inside it.
             }
         }
         i += 1;
@@ -403,13 +444,24 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
         .or_else(|| v.get("action"))
         .and_then(|o| o.as_str())?;
     match normalize(op).as_str() {
-        "add" | "addblock" | "place" | "create" | "new" => {
-            let kind = kind_from_str(
-                v.get("kind")
-                    .or_else(|| v.get("type"))
-                    .or_else(|| v.get("block"))
-                    .and_then(|k| k.as_str())?,
-            )?;
+        "add" | "addblock" | "place" | "create" | "new" | "instance" => {
+            let kind_str = v
+                .get("kind")
+                .or_else(|| v.get("type"))
+                .or_else(|| v.get("block"))
+                .or_else(|| v.get("chip"))
+                .and_then(|k| k.as_str())?;
+            // A primitive name, else a chip instance ("chip:Name" or just the chip's name).
+            let kind = match kind_from_str(kind_str) {
+                Some(prim) => AddKind::Prim(prim),
+                None => {
+                    let name = kind_str.trim().trim_start_matches("chip:").trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    AddKind::Chip(name.to_string())
+                }
+            };
             let (x, y) = xy(v);
             Some(RawOp::Add {
                 r#ref: v
@@ -447,7 +499,7 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
                 .and_then(as_handle)?;
             Some(RawOp::Connect {
                 from,
-                from_port: port(
+                from_port: port_sel(
                     v,
                     &[
                         "from_port",
@@ -458,7 +510,7 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
                     ],
                 ),
                 to,
-                to_port: port(
+                to_port: port_sel(
                     v,
                     &[
                         "to_port",
@@ -482,7 +534,7 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
                 y,
             })
         }
-        "label" | "setlabel" | "rename" | "name" => Some(RawOp::Label {
+        "label" | "setlabel" | "rename" => Some(RawOp::Label {
             target: target_handle(v)?,
             text: v
                 .get("text")
@@ -491,8 +543,71 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
                 .and_then(|t| t.as_str())
                 .map(str::to_string),
         }),
+        "defchip" | "definechip" | "chip" | "definecomponent" | "defmodule" => {
+            let name = v
+                .get("name")
+                .or_else(|| v.get("chip"))
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())?
+                .to_string();
+            let pin_list = |key: &str| -> Vec<String> {
+                v.get(key)
+                    .and_then(|a| a.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| p.as_str())
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let ops = v
+                .get("commands")
+                .or_else(|| v.get("ops"))
+                .or_else(|| v.get("body"))
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().filter_map(parse_op).collect())
+                .unwrap_or_default();
+            Some(RawOp::DefChip {
+                name,
+                inputs: pin_list("inputs"),
+                outputs: pin_list("outputs"),
+                ops,
+            })
+        }
+        "test" | "simulate" | "run" | "check" | "verify" => {
+            let mut steps: Vec<Vec<(String, bool)>> = Vec::new();
+            if let Some(arr) = v.get("steps").and_then(|s| s.as_array()) {
+                for step in arr {
+                    // Either {"set": {…}} or the {…} map directly.
+                    let map = step.get("set").unwrap_or(step);
+                    steps.push(set_map(map));
+                }
+            } else if let Some(map) = v.get("set") {
+                steps.push(set_map(map));
+            }
+            (!steps.is_empty()).then_some(RawOp::Test { steps })
+        }
         _ => None,
     }
+}
+
+/// Parse a `{"handle": value}` map of switch settings; values may be bool, 0/1, or "0"/"1".
+fn set_map(v: &serde_json::Value) -> Vec<(String, bool)> {
+    let Some(obj) = v.as_object() else {
+        return Vec::new();
+    };
+    obj.iter()
+        .filter_map(|(k, val)| {
+            let b = val
+                .as_bool()
+                .or_else(|| val.as_u64().map(|n| n != 0))
+                .or_else(|| val.as_str().map(|s| s.trim() == "1" || s.trim() == "true"))?;
+            Some((k.trim().to_string(), b))
+        })
+        .collect()
 }
 
 fn target_handle(v: &serde_json::Value) -> Option<String> {
@@ -534,13 +649,28 @@ fn as_i32(v: &serde_json::Value) -> Option<i32> {
         .or_else(|| v.as_f64().map(|n| n.round() as i32))
 }
 
-fn port(v: &serde_json::Value, keys: &[&str]) -> u16 {
+/// Read a port selector from the first present key: a number is an index, a numeric string is
+/// an index, any other string is a pin name. Absent → `None` (auto-assign on the input side).
+fn port_sel(v: &serde_json::Value, keys: &[&str]) -> Option<PortSel> {
     for k in keys {
-        if let Some(n) = v.get(*k).and_then(|n| n.as_u64()) {
-            return n as u16;
+        let Some(val) = v.get(*k) else {
+            continue;
+        };
+        if let Some(n) = val.as_u64() {
+            return Some(PortSel::Index(n as u16));
+        }
+        if let Some(s) = val.as_str() {
+            let t = s.trim();
+            if t.is_empty() {
+                continue;
+            }
+            return Some(match t.parse::<u16>() {
+                Ok(n) => PortSel::Index(n),
+                Err(_) => PortSel::Name(t.to_string()),
+            });
         }
     }
-    0
+    None
 }
 
 /// Lowercase and drop anything but a–z/0–9, so `"Add_Block"`, `"add-block"`, `"AddBlock"` all match.
@@ -587,7 +717,7 @@ mod tests {
         assert!(matches!(
             parsed.ops[0],
             RawOp::Add {
-                kind: BlockType::And,
+                kind: AddKind::Prim(BlockType::And),
                 x: 4,
                 y: 1,
                 ..
@@ -608,11 +738,73 @@ mod tests {
                 to_port,
             } => {
                 assert_eq!(from, "a");
-                assert_eq!(*from_port, 0);
+                assert_eq!(*from_port, None, "absent from_port stays unset");
                 assert_eq!(to, "b");
-                assert_eq!(*to_port, 1);
+                assert_eq!(*to_port, Some(PortSel::Index(1)));
             }
             _ => panic!("expected connect"),
+        }
+    }
+
+    #[test]
+    fn parses_defchip_with_inner_ops_and_chip_instance() {
+        let raw = r#"{"commands":[
+            {"op":"defchip","name":"And2","inputs":["a","b"],"outputs":["y"],"commands":[
+                {"op":"add","ref":"g","kind":"and","x":6,"y":0},
+                {"op":"connect","from":"a","to":"g"},
+                {"op":"connect","from":"b","to":"g"},
+                {"op":"connect","from":"g","to":"y"}
+            ]},
+            {"op":"add","ref":"u1","kind":"And2","x":6,"y":0},
+            {"op":"connect","from":"u1","from_port":"y","to":"led1","to_port":"0"}
+        ]}"#;
+        let parsed = parse_reply(raw);
+        assert_eq!(parsed.ops.len(), 3);
+        match &parsed.ops[0] {
+            RawOp::DefChip {
+                name,
+                inputs,
+                outputs,
+                ops,
+            } => {
+                assert_eq!(name, "And2");
+                assert_eq!(inputs, &["a", "b"]);
+                assert_eq!(outputs, &["y"]);
+                assert_eq!(ops.len(), 4);
+            }
+            _ => panic!("expected defchip"),
+        }
+        assert!(matches!(
+            &parsed.ops[1],
+            RawOp::Add { kind: AddKind::Chip(n), .. } if n == "And2"
+        ));
+        match &parsed.ops[2] {
+            RawOp::Connect {
+                from_port, to_port, ..
+            } => {
+                assert_eq!(*from_port, Some(PortSel::Name("y".to_string())));
+                // A numeric string is an index, not a name.
+                assert_eq!(*to_port, Some(PortSel::Index(0)));
+            }
+            _ => panic!("expected connect"),
+        }
+    }
+
+    #[test]
+    fn parses_test_op_steps() {
+        let raw = r#"{"commands":[{"op":"test","steps":[
+            {"set":{"EN":1,"D":true}},
+            {"D":0}
+        ]}]}"#;
+        let parsed = parse_reply(raw);
+        match &parsed.ops[0] {
+            RawOp::Test { steps } => {
+                assert_eq!(steps.len(), 2);
+                assert!(steps[0].contains(&("EN".to_string(), true)));
+                assert!(steps[0].contains(&("D".to_string(), true)));
+                assert_eq!(steps[1], vec![("D".to_string(), false)]);
+            }
+            _ => panic!("expected test"),
         }
     }
 

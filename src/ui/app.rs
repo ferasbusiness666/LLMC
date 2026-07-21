@@ -10,7 +10,7 @@
 //! another.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,7 @@ use llmc::model::{
     PortKind, Pos, Vec2f, MAX_GATE_INPUTS,
 };
 
-use super::ai_edit::RawOp;
+use super::ai_edit::{AddKind, PortSel, RawOp};
 use super::assistant::{self, AiSession, AiSettings};
 use super::glyphs::{draw_block, BlockStyle};
 use super::theme::{apply_style, Theme};
@@ -274,100 +274,95 @@ impl Document {
         self.recompute_dirty();
     }
 
-    /// The system prompt handed to the assistant: who it is, the JSON command protocol it uses to
-    /// build/edit the circuit, and the user's current circuit as context so edits are grounded in
-    /// what's on the canvas.
+    /// The system prompt handed to the assistant: the engineer's playbook (plan → build small
+    /// verified chips bottom-up → compose → test), the JSON command protocol, and the current
+    /// circuit + chip library as context so edits are grounded in what's on the canvas.
     fn assistant_system_prompt(&self) -> String {
         format!(
-            "You are the built-in AI inside LLMC, a native digital-logic circuit builder and \
-             simulator. You can talk to the user AND directly build or edit their circuit.\n\
+            "You are the built-in AI of LLMC, a digital-logic builder and simulator. You design, \
+             build, edit, and TEST circuits directly on the user's canvas via JSON commands.\n\
              \n\
-             BLOCK KINDS (use the quoted value as \"kind\"):\n\
-             - Gates: \"and\", \"or\", \"not\", \"nand\", \"nor\", \"xor\", \"xnor\", \"buffer\"\n\
-             - Inputs: \"switch\" (user-toggle), \"button\" (momentary), \"constant1\", \
-             \"constant0\", \"clock\"\n\
-             - Output: \"led\"\n\
-             and/or/nand/nor/xor/xnor take an optional \"inputs\" count (2-16, default 2); \
-             not/buffer have exactly 1 input; sources (switch/button/constant/clock) have no \
-             inputs and one output; led has one input and no output.\n\
+             METHOD — work like an engineer:\n\
+             1. PLAN briefly: decompose the request into sub-circuits.\n\
+             2. For anything beyond a few gates, define REUSABLE CHIPS bottom-up with \"defchip\" \
+             (each is verified in isolation the moment you define it), then stamp instances with \
+             \"add\". A CPU is chips of chips: FullAdder \u{2192} Adder8 \u{2192} ALU \u{2192} \
+             CPU. Never build a big design as one flat pile of gates.\n\
+             3. After every reply you get an AUTO-CHECK: skipped commands, each new chip's real \
+             truth table, unwired inputs, and the circuit's behavior. Compare it with the goal, \
+             fix what's wrong, repeat. Trust the auto-check over your assumptions.\n\
+             4. Verify sequential logic (latches, registers, memory, CPUs) with the \"test\" \
+             command — scripted input sequences with all outputs read after each step.\n\
              \n\
-             PORTS: input ports are indexed 0,1,2,… top-to-bottom; every block that has an output \
-             uses output port 0. A wire goes from an output port to an input port.\n\
+             BLOCK KINDS (\"kind\"): gates \"and\",\"or\",\"not\",\"nand\",\"nor\",\"xor\",\
+             \"xnor\",\"buffer\" (multi-input gates take optional \"inputs\":2-16, default 2); \
+             sources \"switch\" (click-latching),\"button\" (momentary),\"constant1\",\
+             \"constant0\",\"clock\"; output \"led\"; or ANY CHIP NAME from the library.\n\
              \n\
-             LAYOUT (follow this to avoid overlaps and unreadable wiring):\n\
-             - The grid is integer; x increases right, y increases down. A block occupies 2 cells \
-             of width and as many cells of height as it has inputs (a 2-input gate is 2 tall, a \
-             3-input NAND is 3 tall; sources/LED are ~2 tall).\n\
-             - NEVER place two blocks at overlapping cells. Lay the circuit out in columns by \
-             stage: inputs at x=0, then each logic stage 6 cells further right (x=6, 12, 18, …), \
-             outputs last. Within a column, stack blocks top to bottom leaving a gap of at least \
-             (that block's height + 2) between their y values — e.g. 3-input gates every ~5 rows.\n\
-             - Position is cosmetic and never changes behavior, but good spacing makes the result \
-             readable and easy for you to verify.\n\
+             COMMANDS — reply with exactly ONE fenced ```json block at the END of your reply, \
+             containing one object: {{\"commands\":[ \u{2026} ]}}. STRICT JSON: double quotes, \
+             NO comments, NO trailing commas, nothing else inside the fence.\n\
+             - {{\"op\":\"add\",\"ref\":\"u1\",\"kind\":\"<kind or ChipName>\",\"x\":0,\"y\":0,\
+             \"inputs\":3,\"label\":\"A\"}} (\"inputs\"/\"label\" optional)\n\
+             - {{\"op\":\"connect\",\"from\":\"u1\",\"to\":\"u2\",\"from_port\":0,\"to_port\":1}}\n\
+             - {{\"op\":\"remove\",\"target\":\"\u{2026}\"}}  \
+             {{\"op\":\"move\",\"target\":\"\u{2026}\",\"x\":8,\"y\":0}}  \
+             {{\"op\":\"label\",\"target\":\"\u{2026}\",\"text\":\"\u{2026}\"}}\n\
+             - {{\"op\":\"defchip\",\"name\":\"FullAdder\",\"inputs\":[\"a\",\"b\",\"cin\"],\
+             \"outputs\":[\"sum\",\"cout\"],\"commands\":[ \u{2026}add/connect ops\u{2026} ]}}\n\
+             \x20 Pin blocks are created for you — inside the body just wire \"from\":\"a\" or \
+             \"to\":\"sum\" by pin name. Wire EVERY output pin. Bodies may instance previously \
+             defined chips (that's how you build hierarchy). Redefining a name updates every \
+             placed instance.\n\
+             - {{\"op\":\"test\",\"steps\":[{{\"set\":{{\"WE\":1,\"D\":1}}}},\
+             {{\"set\":{{\"WE\":0}}}},{{\"set\":{{\"D\":0}}}}]}}\n\
+             \x20 Each step sets switches/buttons (by ref, #id, or label) and reports every LED \
+             after settling — settings persist across steps. Use it to prove a register HOLDS \
+             its value, a memory writes only when enabled, etc.\n\
              \n\
-             WIRING: a wire goes from an output port to an input port. One OUTPUT may fan out to \
-             many inputs. An input may also be fed by more than one wire — those drivers are \
-             OR-combined (the input is high if any driver is high), which is allowed. To feed the \
-             same signal to several gates, draw a separate wire from the source output to each \
-             destination input.\n\
+             HANDLES: \"from\"/\"to\"/\"target\" accept the \"ref\" you gave a new block, a \
+             numeric id from the context below, or a block's label.\n\
+             PORTS: input ports are 0,1,2\u{2026} top-to-bottom; outputs are usually just 0. On \
+             chip instances use PIN NAMES: \"to_port\":\"cin\", \"from_port\":\"sum\". If you \
+             OMIT \"to_port\", the first FREE input is picked automatically — so two plain \
+             connects fill a 2-input gate's ports 0 then 1. An input may take several wires \
+             (they OR together). LEDs have no outputs; switches/constants have no inputs.\n\
              \n\
-             RECIPES (common building blocks):\n\
-             - NOT of a signal: a \"not\" gate (1 input).\n\
-             - SR latch: two \"nor\" gates cross-coupled (each gate's output feeds one input of \
-             the other); S and R are the free inputs, Q/Q' the outputs. (Use \"nand\" for an \
-             active-low SR latch.)\n\
-             - Gated D latch: from D make ~D with a \"not\"; two \"nand\"s gated by an enable feed \
-             a NAND SR latch — D drives Q when enable is high, holds when low.\n\
-             - Multi-bit register/RAM: repeat a 1-bit latch once per bit, sharing one enable/write \
-             line across all bits.\n\
-             \n\
-             OUTPUT FORMAT — READ CAREFULLY. To change the circuit, end your reply with exactly \
-             ONE code block that contains a single JSON object with a \"commands\" array, like:\n\
+             EXAMPLE — define a verified building block, then use it:\n\
              ```json\n\
-             {{\"commands\": [\n\
-             \x20 {{\"op\": \"add\", \"ref\": \"a\", \"kind\": \"switch\", \"x\": 0, \"y\": 0}},\n\
-             \x20 {{\"op\": \"add\", \"ref\": \"g\", \"kind\": \"and\", \"x\": 6, \"y\": 1}},\n\
-             \x20 {{\"op\": \"connect\", \"from\": \"a\", \"to\": \"g\", \"to_port\": 0}}\n\
+             {{\"commands\":[\n\
+             \x20{{\"op\":\"defchip\",\"name\":\"HalfAdder\",\"inputs\":[\"a\",\"b\"],\
+             \"outputs\":[\"sum\",\"carry\"],\"commands\":[\n\
+             \x20 {{\"op\":\"add\",\"ref\":\"x\",\"kind\":\"xor\",\"x\":8,\"y\":0}},\n\
+             \x20 {{\"op\":\"add\",\"ref\":\"g\",\"kind\":\"and\",\"x\":8,\"y\":5}},\n\
+             \x20 {{\"op\":\"connect\",\"from\":\"a\",\"to\":\"x\"}},\n\
+             \x20 {{\"op\":\"connect\",\"from\":\"b\",\"to\":\"x\"}},\n\
+             \x20 {{\"op\":\"connect\",\"from\":\"a\",\"to\":\"g\"}},\n\
+             \x20 {{\"op\":\"connect\",\"from\":\"b\",\"to\":\"g\"}},\n\
+             \x20 {{\"op\":\"connect\",\"from\":\"x\",\"to\":\"sum\"}},\n\
+             \x20 {{\"op\":\"connect\",\"from\":\"g\",\"to\":\"carry\"}}]}},\n\
+             \x20{{\"op\":\"add\",\"ref\":\"ha\",\"kind\":\"HalfAdder\",\"x\":8,\"y\":0}}\n\
              ]}}\n\
              ```\n\
-             The JSON MUST be strictly valid: double quotes around every key and string, NO \
-             comments (no // or /* */), NO trailing commas, and nothing but the JSON object \
-             inside the code fence. Do not write the commands as prose. Commands:\n\
-             - {{\"op\":\"add\",\"ref\":\"<name>\",\"kind\":\"<kind>\",\"x\":<int>,\"y\":<int>,\
-             \"inputs\":<opt int>,\"label\":\"<opt>\"}}\n\
-             - {{\"op\":\"connect\",\"from\":\"<ref-or-id>\",\"to\":\"<ref-or-id>\",\
-             \"from_port\":<opt,def 0>,\"to_port\":<opt,def 0>}}\n\
-             - {{\"op\":\"remove\",\"target\":\"<ref-or-id>\"}}\n\
-             - {{\"op\":\"move\",\"target\":\"<ref-or-id>\",\"x\":<int>,\"y\":<int>}}\n\
-             - {{\"op\":\"label\",\"target\":\"<ref-or-id>\",\"text\":\"<string>\"}}\n\
-             Give every NEW block a short unique \"ref\" and use it in connects. Reference \
-             EXISTING blocks by the numeric id shown in the circuit JSON. Include the json block \
-             ONLY when you actually want to change the circuit — for plain questions, just \
-             answer. Keep any prose before the json short.\n\
              \n\
-             AUTONOMOUS LOOP: after your commands are applied you'll receive an automatic \
-             \"auto-check\" — the circuit's real behavior as a truth table (inputs \u{2192} \
-             outputs) plus any wiring problems. Compare it against the request. If the circuit is \
-             complete and correct, reply with a short summary and NO json block (that ends the \
-             task). Otherwise, send more commands to fix it — you can iterate as many times as \
-             needed. Always re-check the wiring after you add, remove, or replace a block, since \
-             replacing a block drops the wires that were attached to it.\n\
+             LAYOUT: integer grid, x right, y down; a gate is ~2 wide and (inputs) tall, chips ~3 \
+             wide. Never overlap blocks. One column per stage (x = 0, 8, 16, \u{2026}), ~4 rows \
+             between blocks in a column. Position is cosmetic — correctness comes from wires.\n\
              \n\
-             HOW TO WORK RELIABLY: think first — decide the gates and connections before writing \
-             commands. For anything bigger than a few gates, build INCREMENTALLY: add one stage \
-             (or one bit), wire it, and let the auto-check confirm it before moving on. Reuse \
-             existing block ids from the circuit JSON rather than rebuilding. It is better to take \
-             several small, correct steps than one large step with mistakes.\n\
+             FINISHING: when the auto-check shows the circuit does what the user asked, reply \
+             with a short summary and NO json block — that ends the run. Include a json block \
+             ONLY to change or test the circuit; for plain questions, just answer.\n\
              \n\
-             Current circuit:\n{}",
+             CURRENT STATE:\n{}",
             self.circuit_context()
         )
     }
 
-    /// The automatic post-edit "auto-check" handed back to the agent: what the circuit actually
-    /// does (a truth table over its switches → LEDs), plus any multi-driver conflicts. This is
-    /// what lets the assistant verify and fix its own work without the user prodding it.
-    fn agent_observation(&self) -> String {
+    /// The automatic post-edit "auto-check" handed back to the agent: skipped-command errors,
+    /// chip-verification and test results, unwired inputs, and the circuit's real behavior (a
+    /// truth table when small enough, else a settled snapshot). This is what lets the assistant
+    /// verify and fix its own work without the user prodding it.
+    fn agent_observation(&self, report: &AiEditReport) -> String {
         use std::fmt::Write as _;
         let c = &self.manager.circuit;
         let inputs: Vec<&Block> = c
@@ -379,30 +374,76 @@ impl Document {
 
         let mut out = String::from("Auto-check after your edits.\n");
 
-        // A fresh sim so the user's live switch settings aren't disturbed.
-        let mut sim = Simulation::build(&self.manager.circuit, &self.manager.chips);
+        if !report.errors.is_empty() {
+            out.push_str("SKIPPED COMMANDS (these did NOT happen — fix and resend them):\n");
+            for e in &report.errors {
+                let _ = writeln!(out, "  - {e}");
+            }
+        }
+        for obs in &report.observations {
+            let _ = writeln!(out, "{obs}");
+        }
 
         let name = |b: &Block| match &b.label {
             Some(l) if !l.trim().is_empty() => format!("#{}({})", b.id, l.trim()),
             _ => format!("#{}", b.id),
         };
 
-        if inputs.is_empty() || outputs.is_empty() {
-            let _ = write!(
+        // Unwired inputs are the most common silent bug — list them explicitly.
+        let unwired = self.unwired_inputs();
+        if !unwired.is_empty() {
+            let _ = writeln!(
                 out,
-                "Circuit has {} switch input(s) and {} LED output(s); a truth table needs at \
-                 least one of each.",
+                "UNWIRED INPUTS ({}): {}{}",
+                unwired.len(),
+                unwired
+                    .iter()
+                    .take(12)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if unwired.len() > 12 { ", …" } else { "" }
+            );
+        }
+
+        // A fresh sim so the user's live switch settings aren't disturbed.
+        let mut sim = Simulation::build(&self.manager.circuit, &self.manager.chips);
+
+        if inputs.is_empty() || outputs.is_empty() {
+            let _ = writeln!(
+                out,
+                "Circuit has {} switch/button input(s) and {} LED output(s); add at least one of \
+                 each to make behavior observable.",
                 inputs.len(),
                 outputs.len()
             );
-            return out;
-        }
-        if inputs.len() > 6 {
-            let _ = write!(
+        } else if inputs.len() > 6 {
+            // Too many combinations for a full table — give a settled snapshot instead and point
+            // at the `test` op for targeted verification.
+            sim.step(0.0);
+            let states: Vec<String> = inputs
+                .iter()
+                .map(|b| format!("{}={}", name(b), sim.switch_value(b.id) as u8))
+                .collect();
+            let reads: Vec<String> = outputs
+                .iter()
+                .map(|b| format!("{}={}", name(b), sim.led_value(b.id).unwrap_or(false) as u8))
+                .collect();
+            let _ = writeln!(
                 out,
-                "Circuit has {} inputs — too many for a full truth table here. Inputs: {}. \
-                 Outputs: {}.",
+                "{} inputs — too many for a full truth table. Settled snapshot: inputs {}; \
+                 LEDs {}. Use {{\"op\":\"test\",\"steps\":[…]}} to verify specific sequences.",
                 inputs.len(),
+                states.join(" "),
+                reads.join(" ")
+            );
+        } else {
+            if has_clock {
+                out.push_str("(Circuit has a clock; table is a settled snapshot at time 0.)\n");
+            }
+            let _ = writeln!(
+                out,
+                "Truth table — inputs [{}] \u{2192} outputs [{}]:",
                 inputs
                     .iter()
                     .copied()
@@ -416,55 +457,34 @@ impl Document {
                     .collect::<Vec<_>>()
                     .join(", "),
             );
-            return out;
-        }
-
-        if has_clock {
-            out.push_str("(Circuit has a clock; table is a settled snapshot at time 0.)\n");
-        }
-        let _ = writeln!(
-            out,
-            "Truth table — inputs [{}] \u{2192} outputs [{}]:",
-            inputs
-                .iter()
-                .copied()
-                .map(name)
-                .collect::<Vec<_>>()
-                .join(", "),
-            outputs
-                .iter()
-                .copied()
-                .map(name)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        let n = inputs.len();
-        for combo in 0..(1u32 << n) {
-            for (i, b) in inputs.iter().enumerate() {
-                let bit = (combo >> (n - 1 - i)) & 1 == 1;
-                sim.set_switch(b.id, bit);
+            let n = inputs.len();
+            for combo in 0..(1u32 << n) {
+                for (i, b) in inputs.iter().enumerate() {
+                    let bit = (combo >> (n - 1 - i)) & 1 == 1;
+                    sim.set_switch(b.id, bit);
+                }
+                sim.step(0.0);
+                let ins: Vec<&str> = (0..n)
+                    .map(|i| {
+                        if (combo >> (n - 1 - i)) & 1 == 1 {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                    })
+                    .collect();
+                let outs: Vec<&str> = outputs
+                    .iter()
+                    .map(|b| {
+                        if sim.led_value(b.id).unwrap_or(false) {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                    })
+                    .collect();
+                let _ = writeln!(out, "  {} | {}", ins.join(" "), outs.join(" "));
             }
-            sim.step(0.0);
-            let ins: Vec<&str> = (0..n)
-                .map(|i| {
-                    if (combo >> (n - 1 - i)) & 1 == 1 {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                })
-                .collect();
-            let outs: Vec<&str> = outputs
-                .iter()
-                .map(|b| {
-                    if sim.led_value(b.id).unwrap_or(false) {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                })
-                .collect();
-            let _ = writeln!(out, "  {} | {}", ins.join(" "), outs.join(" "));
         }
         out.push_str(
             "If this matches the request, reply with a brief summary and NO commands. Otherwise \
@@ -473,34 +493,160 @@ impl Document {
         out
     }
 
-    /// A compact JSON view of the active circuit (blocks + connections) for the assistant. Kept
-    /// small; an empty circuit is reported in words so the model isn't handed `{}`.
-    fn circuit_context(&self) -> String {
+    /// Input ports (on gates, LEDs, chip instances) with no incoming wire, as short descriptions.
+    fn unwired_inputs(&self) -> Vec<String> {
         let c = &self.manager.circuit;
-        if c.blocks.is_empty() {
-            return "The circuit is currently empty (no blocks placed yet).".to_string();
+        let mut out = Vec::new();
+        for b in c.iter_blocks() {
+            let n = b.input_count(&self.manager.chips);
+            for i in 0..n as u16 {
+                if !c.has_connection_into(Port::input(b.id, i)) {
+                    let kind = match b.ty {
+                        BlockType::Chip(cid) => self
+                            .manager
+                            .chips
+                            .get(cid)
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| "chip".to_string()),
+                        ty => palette_name(ty).to_string(),
+                    };
+                    let label = b
+                        .label
+                        .as_deref()
+                        .map(|l| format!("({l})"))
+                        .unwrap_or_default();
+                    out.push(format!("#{}{label} {kind} in{i}", b.id));
+                }
+            }
         }
-        let view = serde_json::json!({
-            "blocks": c.blocks,
-            "connections": c.connections,
-        });
-        serde_json::to_string(&view).unwrap_or_else(|_| "(unavailable)".to_string())
+        out
     }
 
-    /// Apply a batch of AI-proposed edits as one undoable step. Handles are resolved (new refs
-    /// first, then existing numeric block ids), ports are validated, and any op that can't be
-    /// applied is skipped and reported rather than aborting the whole batch. Returns a summary
-    /// for the chat "activity" view.
+    /// A compact text view of the chip library + circuit for the assistant: blocks, wires, and
+    /// each chip's pin names. Far fewer tokens than raw JSON, and easier for small models to read.
+    fn circuit_context(&self) -> String {
+        use std::fmt::Write as _;
+        let c = &self.manager.circuit;
+        let mut out = String::new();
+
+        if !self.manager.chips.is_empty() {
+            out.push_str("Chip library (instance with \"kind\":\"<Name>\"):\n");
+            for d in self.manager.chips.iter() {
+                let pins = |ids: &[BlockId]| {
+                    ids.iter()
+                        .map(|id| {
+                            d.circuit
+                                .block(*id)
+                                .and_then(|b| b.label.clone())
+                                .unwrap_or_else(|| "?".to_string())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let _ = writeln!(
+                    out,
+                    "- {}: inputs [{}] outputs [{}]",
+                    d.name,
+                    pins(&d.input_blocks),
+                    pins(&d.output_blocks)
+                );
+            }
+        }
+
+        if c.blocks.is_empty() {
+            out.push_str("The canvas is empty (no blocks placed yet).");
+            return out;
+        }
+
+        out.push_str("Blocks (#id kind @(x,y) \"label\"):\n");
+        for b in c.iter_blocks() {
+            let kind = match b.ty {
+                BlockType::Chip(cid) => self
+                    .manager
+                    .chips
+                    .get(cid)
+                    .map(|d| format!("CHIP:{}", d.name))
+                    .unwrap_or_else(|| "CHIP:?".to_string()),
+                ty if ty.variable_inputs() && b.gate_inputs() != 2 => {
+                    format!("{}({}in)", palette_name(ty), b.gate_inputs())
+                }
+                ty => palette_name(ty).to_string(),
+            };
+            let label = b
+                .label
+                .as_deref()
+                .map(|l| format!(" \"{l}\""))
+                .unwrap_or_default();
+            let state = match b.ty {
+                BlockType::Switch | BlockType::Button => format!(" ={}", b.state as u8),
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "#{} {kind} @({},{}){label}{state}",
+                b.id, b.pos.x, b.pos.y
+            );
+        }
+
+        let wires: Vec<String> = c
+            .iter_connections()
+            .map(|w| {
+                format!(
+                    "#{}.{}\u{2192}#{}.{}",
+                    w.from.block, w.from.index, w.to.block, w.to.index
+                )
+            })
+            .collect();
+        if wires.is_empty() {
+            out.push_str("No wires yet.");
+        } else {
+            let _ = writeln!(
+                out,
+                "Wires (out\u{2192}in, block.port):\n{}",
+                wires.join("  ")
+            );
+        }
+        out
+    }
+
+    /// Apply a batch of AI-proposed edits as one undoable step. Handles are resolved (batch refs
+    /// first, then numeric ids, then labels), ports are validated — with pin-name lookup on chip
+    /// instances and auto-assignment of the first free input when the port is omitted — and any
+    /// op that can't be applied is skipped and reported rather than aborting the whole batch.
+    /// `defchip` ops extend the chip library (verified in isolation); `test` ops run against the
+    /// finished circuit. Returns a summary for the chat "activity" view + agent feedback.
     fn apply_ai_ops(&mut self, ops: Vec<RawOp>) -> AiEditReport {
-        let mut refs: std::collections::HashMap<String, BlockId> = std::collections::HashMap::new();
+        let mut refs: HashMap<String, BlockId> = HashMap::new();
         let mut pending: BTreeMap<BlockId, Block> = BTreeMap::new();
+        let mut used_inputs: BTreeSet<(BlockId, u16)> = BTreeSet::new();
         let mut batch: Vec<EditCommand> = Vec::new();
         let mut activity: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        let mut observations: Vec<String> = Vec::new();
         let mut new_ids: Vec<BlockId> = Vec::new();
+        let mut tests: Vec<Vec<Vec<(String, bool)>>> = Vec::new();
 
+        let mut chips_changed = false;
         for op in ops {
             match op {
+                RawOp::DefChip {
+                    name,
+                    inputs,
+                    outputs,
+                    ops,
+                } => match self.build_chip(&name, &inputs, &outputs, ops) {
+                    Ok(obs) => {
+                        activity.push(format!(
+                            "Define chip {name} ({} in, {} out)",
+                            inputs.len(),
+                            outputs.len()
+                        ));
+                        observations.push(obs);
+                        self.sim_dirty = true;
+                        chips_changed = true;
+                    }
+                    Err(e) => errors.push(format!("defchip {name}: {e}")),
+                },
                 RawOp::Add {
                     r#ref,
                     kind,
@@ -510,9 +656,21 @@ impl Document {
                     label,
                     state,
                 } => {
+                    let (ty, shown) = match &kind {
+                        AddKind::Prim(p) => (*p, palette_name(*p).to_string()),
+                        AddKind::Chip(n) => match self.find_chip(n) {
+                            Some(cid) => (BlockType::Chip(cid), n.clone()),
+                            None => {
+                                errors.push(format!(
+                                    "add: unknown chip \"{n}\" — define it with defchip first"
+                                ));
+                                continue;
+                            }
+                        },
+                    };
                     let id = self.manager.circuit.allocate_block_id();
-                    let mut b = Block::new(id, kind, Pos::new(x, y));
-                    if kind.variable_inputs() {
+                    let mut b = Block::new(id, ty, Pos::new(x, y));
+                    if ty.variable_inputs() {
                         if let Some(n) = inputs {
                             b.inputs = Some(n.clamp(2, MAX_GATE_INPUTS as u16));
                         }
@@ -528,7 +686,7 @@ impl Document {
                         refs.insert(r, id);
                     }
                     new_ids.push(id);
-                    activity.push(format!("Add {} at ({x}, {y})", palette_name(kind)));
+                    activity.push(format!("Add {shown} at ({x}, {y})"));
                     batch.push(EditCommand::AddBlock { block: b });
                 }
                 RawOp::Connect {
@@ -538,38 +696,52 @@ impl Document {
                     to_port,
                 } => {
                     let (Some(fb), Some(tb)) = (
-                        resolve_handle(&refs, &self.manager.circuit, &from),
-                        resolve_handle(&refs, &self.manager.circuit, &to),
+                        resolve_handle(&refs, &pending, &self.manager.circuit, &from),
+                        resolve_handle(&refs, &pending, &self.manager.circuit, &to),
                     ) else {
                         errors.push(format!("connect: unknown block ({from} \u{2192} {to})"));
                         continue;
                     };
-                    let out_ok = block_ref(&pending, &self.manager.circuit, fb).is_some_and(|b| {
-                        (from_port as usize) < b.output_count(&self.manager.chips)
-                    });
-                    let in_ok = block_ref(&pending, &self.manager.circuit, tb)
-                        .is_some_and(|b| (to_port as usize) < b.input_count(&self.manager.chips));
-                    if !out_ok || !in_ok {
-                        errors.push(format!(
-                            "connect: invalid port ({from}.{from_port} \u{2192} {to}.{to_port})"
-                        ));
-                        continue;
-                    }
-                    // An input may have several drivers (OR-combined), so wires are added, never
-                    // replaced — this lets the AI intentionally merge signals into one input.
-                    let to_p = Port::input(tb, to_port);
+                    let fp = match port_out(
+                        &pending,
+                        &self.manager.circuit,
+                        &self.manager.chips,
+                        fb,
+                        from_port.as_ref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            errors.push(format!("connect {from}\u{2192}{to}: {e}"));
+                            continue;
+                        }
+                    };
+                    let tp = match port_in(
+                        &pending,
+                        &self.manager.circuit,
+                        &self.manager.chips,
+                        &used_inputs,
+                        tb,
+                        to_port.as_ref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            errors.push(format!("connect {from}\u{2192}{to}: {e}"));
+                            continue;
+                        }
+                    };
+                    used_inputs.insert((tb, tp));
                     let cid = self.manager.circuit.allocate_conn_id();
-                    activity.push(format!("Wire {from}.{from_port} \u{2192} {to}.{to_port}"));
+                    activity.push(format!("Wire {from}.{fp} \u{2192} {to}.{tp}"));
                     batch.push(EditCommand::AddConnection {
                         conn: Connection {
                             id: cid,
-                            from: Port::output(fb, from_port),
-                            to: to_p,
+                            from: Port::output(fb, fp),
+                            to: Port::input(tb, tp),
                         },
                     });
                 }
                 RawOp::Remove { target } => {
-                    match resolve_handle(&refs, &self.manager.circuit, &target) {
+                    match resolve_handle(&refs, &pending, &self.manager.circuit, &target) {
                         Some(id) if self.manager.circuit.block(id).is_some() => {
                             activity.push(format!("Remove block {target}"));
                             batch.push(EditCommand::RemoveBlock { id });
@@ -578,7 +750,7 @@ impl Document {
                     }
                 }
                 RawOp::Move { target, x, y } => {
-                    match resolve_handle(&refs, &self.manager.circuit, &target) {
+                    match resolve_handle(&refs, &pending, &self.manager.circuit, &target) {
                         Some(id) => {
                             activity.push(format!("Move {target} to ({x}, {y})"));
                             batch.push(EditCommand::MoveBlock {
@@ -590,7 +762,7 @@ impl Document {
                     }
                 }
                 RawOp::Label { target, text } => {
-                    match resolve_handle(&refs, &self.manager.circuit, &target) {
+                    match resolve_handle(&refs, &pending, &self.manager.circuit, &target) {
                         Some(id) => {
                             activity.push(match &text {
                                 Some(t) => format!("Label {target} \u{201c}{t}\u{201d}"),
@@ -601,11 +773,12 @@ impl Document {
                         None => errors.push(format!("label: unknown block {target}")),
                     }
                 }
+                RawOp::Test { steps } => tests.push(steps),
             }
         }
 
-        let changed = !batch.is_empty();
-        if changed {
+        let applied = !batch.is_empty();
+        if applied {
             self.manager.apply(batch);
             self.after_structural_edit();
             // Select what the AI just created, so it's easy to see/move/delete.
@@ -615,11 +788,357 @@ impl Document {
                 .collect();
             self.selected_conns.clear();
         }
+        // Scripted tests run against the finished circuit (they see this batch's edits).
+        for steps in &tests {
+            activity.push(format!("Ran test ({} steps)", steps.len()));
+            observations.push(self.run_ai_test(&refs, steps));
+        }
         AiEditReport {
             activity,
             errors,
-            changed,
+            // Chip-library changes also count: they're saved with the project (dirty tracking).
+            changed: applied || chips_changed,
+            observations,
         }
+    }
+
+    /// Find a chip in the library by name (case-insensitive).
+    fn find_chip(&self, name: &str) -> Option<ChipId> {
+        let want = name.trim().to_lowercase();
+        self.manager
+            .chips
+            .iter()
+            .find(|d| d.name.trim().to_lowercase() == want)
+            .map(|d| d.id)
+    }
+
+    /// Build and register a reusable chip from declared pins + inner ops run against a scratch
+    /// circuit. Pin blocks (Switch = input, Led = output) are created automatically, labeled and
+    /// ref'd by their pin names. Redefining an existing name replaces the chip in place, so all
+    /// instances update. Returns the observation shown to the model (pins + isolated truth
+    /// table when feasible).
+    fn build_chip(
+        &mut self,
+        name: &str,
+        inputs: &[String],
+        outputs: &[String],
+        ops: Vec<RawOp>,
+    ) -> Result<String, String> {
+        if name.trim().is_empty() {
+            return Err("chip name is empty".to_string());
+        }
+        if outputs.is_empty() {
+            return Err("a chip needs at least one output pin".to_string());
+        }
+        if inputs.len() > 16 || outputs.len() > 16 {
+            return Err("too many pins (max 16 inputs and 16 outputs)".to_string());
+        }
+
+        let mut c = Circuit::new(name);
+        let mut refs: HashMap<String, BlockId> = HashMap::new();
+        let mut used_inputs: BTreeSet<(BlockId, u16)> = BTreeSet::new();
+        let mut errs: Vec<String> = Vec::new();
+        let empty_pending: BTreeMap<BlockId, Block> = BTreeMap::new();
+
+        let mut in_ids = Vec::with_capacity(inputs.len());
+        for (i, pin) in inputs.iter().enumerate() {
+            let id = c.allocate_block_id();
+            let mut b = Block::new(id, BlockType::Switch, Pos::new(0, (i as i32) * 4));
+            b.label = Some(pin.clone());
+            c.insert_block(b);
+            refs.insert(pin.clone(), id);
+            in_ids.push(id);
+        }
+        let mut out_ids = Vec::with_capacity(outputs.len());
+        for (i, pin) in outputs.iter().enumerate() {
+            let id = c.allocate_block_id();
+            let mut b = Block::new(id, BlockType::Led, Pos::new(28, (i as i32) * 4));
+            b.label = Some(pin.clone());
+            c.insert_block(b);
+            refs.insert(pin.clone(), id);
+            out_ids.push(id);
+        }
+
+        for op in ops {
+            match op {
+                RawOp::Add {
+                    r#ref,
+                    kind,
+                    x,
+                    y,
+                    inputs: n_in,
+                    label,
+                    state,
+                } => {
+                    let ty = match &kind {
+                        AddKind::Prim(p) => *p,
+                        AddKind::Chip(n) => match self.find_chip(n) {
+                            Some(cid) => BlockType::Chip(cid),
+                            None => {
+                                errs.push(format!("unknown chip \"{n}\" inside body"));
+                                continue;
+                            }
+                        },
+                    };
+                    let id = c.allocate_block_id();
+                    let mut b = Block::new(id, ty, Pos::new(x, y));
+                    if ty.variable_inputs() {
+                        if let Some(n) = n_in {
+                            b.inputs = Some(n.clamp(2, MAX_GATE_INPUTS as u16));
+                        }
+                    }
+                    if let Some(l) = label {
+                        if !l.trim().is_empty() {
+                            b.label = Some(l);
+                        }
+                    }
+                    b.state = state;
+                    c.insert_block(b);
+                    if let Some(r) = r#ref {
+                        refs.insert(r, id);
+                    }
+                }
+                RawOp::Connect {
+                    from,
+                    from_port,
+                    to,
+                    to_port,
+                } => {
+                    let (Some(fb), Some(tb)) = (
+                        resolve_handle(&refs, &empty_pending, &c, &from),
+                        resolve_handle(&refs, &empty_pending, &c, &to),
+                    ) else {
+                        errs.push(format!("connect: unknown block ({from} \u{2192} {to})"));
+                        continue;
+                    };
+                    let fp = match port_out(
+                        &empty_pending,
+                        &c,
+                        &self.manager.chips,
+                        fb,
+                        from_port.as_ref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            errs.push(format!("connect {from}\u{2192}{to}: {e}"));
+                            continue;
+                        }
+                    };
+                    let tp = match port_in(
+                        &empty_pending,
+                        &c,
+                        &self.manager.chips,
+                        &used_inputs,
+                        tb,
+                        to_port.as_ref(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            errs.push(format!("connect {from}\u{2192}{to}: {e}"));
+                            continue;
+                        }
+                    };
+                    used_inputs.insert((tb, tp));
+                    let cid = c.allocate_conn_id();
+                    c.insert_connection(Connection {
+                        id: cid,
+                        from: Port::output(fb, fp),
+                        to: Port::input(tb, tp),
+                    });
+                }
+                RawOp::DefChip {
+                    name: n,
+                    inputs: i,
+                    outputs: o,
+                    ops: body,
+                } => {
+                    // Nested definition: register it globally, then the outer body can use it.
+                    if let Err(e) = self.build_chip(&n, &i, &o, body) {
+                        errs.push(format!("nested defchip {n}: {e}"));
+                    }
+                }
+                RawOp::Label { target, text } => {
+                    match resolve_handle(&refs, &empty_pending, &c, &target) {
+                        Some(id) => {
+                            if let Some(b) = c.block_mut(id) {
+                                b.label = text;
+                            }
+                        }
+                        None => errs.push(format!("label: unknown block {target}")),
+                    }
+                }
+                RawOp::Move { target, x, y } => {
+                    match resolve_handle(&refs, &empty_pending, &c, &target) {
+                        Some(id) => {
+                            if let Some(b) = c.block_mut(id) {
+                                b.pos = Pos::new(x, y);
+                            }
+                        }
+                        None => errs.push(format!("move: unknown block {target}")),
+                    }
+                }
+                RawOp::Remove { target } => {
+                    match resolve_handle(&refs, &empty_pending, &c, &target) {
+                        Some(id) if !in_ids.contains(&id) && !out_ids.contains(&id) => {
+                            c.remove_block(id);
+                        }
+                        _ => errs.push(format!("remove: unknown block or pin {target}")),
+                    }
+                }
+                RawOp::Test { .. } => {
+                    errs.push("test inside a defchip body is ignored".to_string());
+                }
+            }
+        }
+
+        // Register (reusing the id when redefining, so every instance updates).
+        let id = self
+            .find_chip(name)
+            .unwrap_or_else(|| self.manager.chips.allocate_id());
+        let def = ChipDef {
+            id,
+            name: name.trim().to_string(),
+            circuit: c,
+            input_blocks: in_ids,
+            output_blocks: out_ids,
+        };
+        self.manager.chips.insert(def);
+
+        // Verify the chip in isolation and report what it actually does.
+        let mut obs = self.chip_observation(id, name, inputs, outputs);
+        for e in errs {
+            obs.push_str(&format!("\n  skipped: {e}"));
+        }
+        Ok(obs)
+    }
+
+    /// Describe a freshly (re)defined chip to the model: pins, unwired-output warnings, and an
+    /// isolated truth table when the pin count allows one.
+    fn chip_observation(
+        &self,
+        id: ChipId,
+        name: &str,
+        inputs: &[String],
+        outputs: &[String],
+    ) -> String {
+        use std::fmt::Write as _;
+        let mut out = format!(
+            "Defined chip {name}: inputs [{}] outputs [{}].",
+            inputs.join(", "),
+            outputs.join(", ")
+        );
+        let Some(def) = self.manager.chips.get(id) else {
+            return out;
+        };
+        // An output pin whose Led marker has no incoming wire is always a bug.
+        for (i, ob) in def.output_blocks.iter().enumerate() {
+            if !def.circuit.has_connection_into(Port::input(*ob, 0)) {
+                let _ = write!(
+                    out,
+                    "\n  WARNING: output pin \"{}\" is not wired to anything.",
+                    outputs.get(i).map(String::as_str).unwrap_or("?")
+                );
+            }
+        }
+        if inputs.len() <= 6 && !outputs.is_empty() {
+            let mut sim = Simulation::build(&def.circuit, &self.manager.chips);
+            let _ = write!(
+                out,
+                "\n  Verified truth table [{}] \u{2192} [{}]:",
+                inputs.join(" "),
+                outputs.join(" ")
+            );
+            let n = def.input_blocks.len();
+            for combo in 0..(1u32 << n) {
+                for (i, bid) in def.input_blocks.iter().enumerate() {
+                    sim.set_switch(*bid, (combo >> (n - 1 - i)) & 1 == 1);
+                }
+                sim.step(0.0);
+                let ins: Vec<&str> = (0..n)
+                    .map(|i| {
+                        if (combo >> (n - 1 - i)) & 1 == 1 {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                    })
+                    .collect();
+                let outs: Vec<&str> = def
+                    .output_blocks
+                    .iter()
+                    .map(|bid| {
+                        if sim.led_value(*bid).unwrap_or(false) {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                    })
+                    .collect();
+                let _ = write!(out, "\n    {} | {}", ins.join(" "), outs.join(" "));
+            }
+        }
+        out
+    }
+
+    /// Run a scripted test on a scratch simulation of the current circuit (the user's live
+    /// switch states are untouched). Each step sets switches/buttons then reads every LED.
+    fn run_ai_test(
+        &self,
+        refs: &HashMap<String, BlockId>,
+        steps: &[Vec<(String, bool)>],
+    ) -> String {
+        use std::fmt::Write as _;
+        let empty: BTreeMap<BlockId, Block> = BTreeMap::new();
+        let mut sim = Simulation::build(&self.manager.circuit, &self.manager.chips);
+        sim.step(0.0);
+        let name = |b: &Block| match &b.label {
+            Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+            _ => format!("#{}", b.id),
+        };
+        let leds: Vec<&Block> = self
+            .manager
+            .circuit
+            .iter_blocks()
+            .filter(|b| b.ty == BlockType::Led)
+            .collect();
+        let mut out = String::from("Test results:");
+        if leds.is_empty() {
+            out.push_str("\n  (no LEDs to observe — add LEDs to make outputs visible)");
+        }
+        for (i, step) in steps.iter().enumerate() {
+            let mut sets: Vec<String> = Vec::new();
+            for (handle, val) in step {
+                match resolve_handle(refs, &empty, &self.manager.circuit, handle) {
+                    Some(id)
+                        if self.manager.circuit.block(id).is_some_and(|b| {
+                            matches!(b.ty, BlockType::Switch | BlockType::Button)
+                        }) =>
+                    {
+                        sim.set_switch(id, *val);
+                        sets.push(format!("{handle}={}", *val as u8));
+                    }
+                    Some(_) => sets.push(format!("{handle}\u{2260}switch(ignored)")),
+                    None => sets.push(format!("{handle}=unknown(ignored)")),
+                }
+            }
+            sim.step(0.0);
+            let reads: Vec<String> = leds
+                .iter()
+                .map(|b| format!("{}={}", name(b), sim.led_value(b.id).unwrap_or(false) as u8))
+                .collect();
+            let _ = write!(
+                out,
+                "\n  step {}: set {} \u{2192} {}",
+                i + 1,
+                if sets.is_empty() {
+                    "(nothing)".to_string()
+                } else {
+                    sets.join(", ")
+                },
+                reads.join(", ")
+            );
+        }
+        out
     }
 
     fn theme(&self) -> Theme {
@@ -2732,9 +3251,11 @@ impl eframe::App for LlmcApp {
                 if report.changed {
                     doc.recompute_dirty();
                 }
+                // Build the agent feedback from the full report (skips, chip tables, test
+                // results) BEFORE the activity list is handed to the chat view.
+                let feedback = doc.agent_observation(&report);
                 doc.ai.attach_edit_result(report.activity, report.errors);
                 if doc.ai.should_continue_or_note() {
-                    let feedback = doc.agent_observation();
                     let prompt = doc.assistant_system_prompt();
                     doc.ai.continue_agent(ai_settings, prompt, feedback);
                 } else {
@@ -2789,21 +3310,26 @@ impl eframe::App for LlmcApp {
     }
 }
 
-/// The outcome of applying a batch of AI-proposed edits, surfaced in the chat "activity" view.
+/// The outcome of applying a batch of AI-proposed edits, surfaced in the chat "activity" view
+/// and fed back to the agent as its auto-check.
 struct AiEditReport {
     /// One human-readable line per edit that was applied.
     activity: Vec<String>,
     /// One line per edit that was skipped (bad handle / port), so the user can see what didn't
-    /// happen.
+    /// happen — and the model can fix it.
     errors: Vec<String>,
     /// Whether anything actually changed (empty batches touch nothing).
     changed: bool,
+    /// Rich feedback for the agent loop: chip truth tables, scripted-test results, warnings.
+    observations: Vec<String>,
 }
 
-/// Resolve an AI block handle to a real block id: a new-block ref first, else an existing numeric
-/// id that is actually present in the circuit. A leading `#` is tolerated.
+/// Resolve an AI block handle to a real block id: a batch ref first, then a numeric id (with a
+/// leading `#` tolerated), then a block label (case-insensitive) — so a model can say
+/// `"target":"EN"` about a labeled switch.
 fn resolve_handle(
-    refs: &std::collections::HashMap<String, BlockId>,
+    refs: &HashMap<String, BlockId>,
+    pending: &BTreeMap<BlockId, Block>,
     circuit: &Circuit,
     handle: &str,
 ) -> Option<BlockId> {
@@ -2813,11 +3339,21 @@ fn resolve_handle(
     let trimmed = handle.trim().trim_start_matches('#');
     if let Ok(n) = trimmed.parse::<u32>() {
         let id = BlockId(n);
-        if circuit.block(id).is_some() {
+        if circuit.block(id).is_some() || pending.contains_key(&id) {
             return Some(id);
         }
     }
-    None
+    let want = trimmed.to_lowercase();
+    let by_label = |b: &Block| {
+        b.label
+            .as_ref()
+            .is_some_and(|l| l.trim().to_lowercase() == want)
+    };
+    pending
+        .values()
+        .find(|b| by_label(b))
+        .or_else(|| circuit.iter_blocks().find(|b| by_label(b)))
+        .map(|b| b.id)
 }
 
 /// Look up a block among the not-yet-applied additions first, then the live circuit — so a wire
@@ -2828,6 +3364,102 @@ fn block_ref<'a>(
     id: BlockId,
 ) -> Option<&'a Block> {
     pending.get(&id).or_else(|| circuit.block(id))
+}
+
+/// Pin index of `name` on chip `cid` (input or output side), matched against the pin blocks'
+/// labels case-insensitively.
+fn chip_pin_by_name(
+    chips: &llmc::model::ChipLibrary,
+    cid: ChipId,
+    name: &str,
+    input: bool,
+) -> Option<u16> {
+    let def = chips.get(cid)?;
+    let list = if input {
+        &def.input_blocks
+    } else {
+        &def.output_blocks
+    };
+    let want = name.trim().to_lowercase();
+    list.iter()
+        .position(|bid| {
+            def.circuit
+                .block(*bid)
+                .and_then(|b| b.label.as_ref())
+                .is_some_and(|l| l.trim().to_lowercase() == want)
+        })
+        .map(|i| i as u16)
+}
+
+/// Resolve an output-port selector on `id`: omitted → 0, an index is validated, a name is looked
+/// up among a chip's output pins.
+fn port_out(
+    pending: &BTreeMap<BlockId, Block>,
+    circuit: &Circuit,
+    chips: &llmc::model::ChipLibrary,
+    id: BlockId,
+    sel: Option<&PortSel>,
+) -> Result<u16, String> {
+    let Some(b) = block_ref(pending, circuit, id) else {
+        return Err("unknown source block".to_string());
+    };
+    let count = b.output_count(chips);
+    if count == 0 {
+        return Err("the source block has no outputs (LEDs can't drive wires)".to_string());
+    }
+    match sel {
+        None => Ok(0),
+        Some(PortSel::Index(i)) if (*i as usize) < count => Ok(*i),
+        Some(PortSel::Index(i)) => Err(format!("output port {i} out of range (block has {count})")),
+        Some(PortSel::Name(n)) => match b.ty {
+            BlockType::Chip(cid) => chip_pin_by_name(chips, cid, n, false)
+                .ok_or_else(|| format!("no output pin named \"{n}\" on that chip")),
+            _ => Err(format!(
+                "\"{n}\": named ports only work on chip instances; use a number"
+            )),
+        },
+    }
+}
+
+/// Resolve an input-port selector on `id`: omitted → the first FREE input (not wired in the
+/// circuit and not used earlier in this batch; falls back to 0, since inputs OR-combine), an
+/// index is validated, a name is looked up among a chip's input pins.
+fn port_in(
+    pending: &BTreeMap<BlockId, Block>,
+    circuit: &Circuit,
+    chips: &llmc::model::ChipLibrary,
+    used: &BTreeSet<(BlockId, u16)>,
+    id: BlockId,
+    sel: Option<&PortSel>,
+) -> Result<u16, String> {
+    let Some(b) = block_ref(pending, circuit, id) else {
+        return Err("unknown destination block".to_string());
+    };
+    let count = b.input_count(chips);
+    if count == 0 {
+        return Err(
+            "the destination block has no inputs (switches/constants can't be driven)".to_string(),
+        );
+    }
+    match sel {
+        None => {
+            for i in 0..count as u16 {
+                if !used.contains(&(id, i)) && !circuit.has_connection_into(Port::input(id, i)) {
+                    return Ok(i);
+                }
+            }
+            Ok(0)
+        }
+        Some(PortSel::Index(i)) if (*i as usize) < count => Ok(*i),
+        Some(PortSel::Index(i)) => Err(format!("input port {i} out of range (block has {count})")),
+        Some(PortSel::Name(n)) => match b.ty {
+            BlockType::Chip(cid) => chip_pin_by_name(chips, cid, n, true)
+                .ok_or_else(|| format!("no input pin named \"{n}\" on that chip")),
+            _ => Err(format!(
+                "\"{n}\": named ports only work on chip instances; use a number"
+            )),
+        },
+    }
 }
 
 fn palette_name(ty: BlockType) -> &'static str {
@@ -3022,56 +3654,39 @@ mod tests {
         );
     }
 
+    fn add_op(r: &str, kind: BlockType, x: i32, y: i32) -> RawOp {
+        RawOp::Add {
+            r#ref: Some(r.to_string()),
+            kind: AddKind::Prim(kind),
+            x,
+            y,
+            inputs: None,
+            label: None,
+            state: false,
+        }
+    }
+
+    /// A connect with auto-assigned ports (both selectors omitted).
+    fn wire_op(from: &str, to: &str) -> RawOp {
+        RawOp::Connect {
+            from: from.to_string(),
+            from_port: None,
+            to: to.to_string(),
+            to_port: None,
+        }
+    }
+
     #[test]
     fn apply_ai_ops_builds_wires_and_reports_bad_ops() {
         let mut d = doc();
         let ops = vec![
-            RawOp::Add {
-                r#ref: Some("a".into()),
-                kind: BlockType::Switch,
-                x: 0,
-                y: 0,
-                inputs: None,
-                label: None,
-                state: false,
-            },
-            RawOp::Add {
-                r#ref: Some("g".into()),
-                kind: BlockType::And,
-                x: 6,
-                y: 1,
-                inputs: None,
-                label: None,
-                state: false,
-            },
-            RawOp::Add {
-                r#ref: Some("led".into()),
-                kind: BlockType::Led,
-                x: 12,
-                y: 2,
-                inputs: None,
-                label: None,
-                state: false,
-            },
-            RawOp::Connect {
-                from: "a".into(),
-                from_port: 0,
-                to: "g".into(),
-                to_port: 0,
-            },
-            RawOp::Connect {
-                from: "g".into(),
-                from_port: 0,
-                to: "led".into(),
-                to_port: 0,
-            },
+            add_op("a", BlockType::Switch, 0, 0),
+            add_op("g", BlockType::And, 6, 1),
+            add_op("led", BlockType::Led, 12, 2),
+            wire_op("a", "g"),
+            wire_op("g", "led"),
             // A switch has no input port, so this must be skipped and reported, not applied.
-            RawOp::Connect {
-                from: "g".into(),
-                from_port: 0,
-                to: "a".into(),
-                to_port: 0,
-            },
+            wire_op("g", "a"),
         ];
         let report = d.apply_ai_ops(ops);
         assert!(report.changed);
@@ -3086,6 +3701,179 @@ mod tests {
         // The whole batch is one undo step.
         assert!(d.manager.undo());
         assert_eq!(d.manager.circuit.blocks.len(), 0, "one undo reverts it all");
+    }
+
+    #[test]
+    fn omitted_to_port_auto_assigns_free_inputs() {
+        let mut d = doc();
+        let ops = vec![
+            add_op("a", BlockType::Switch, 0, 0),
+            add_op("b", BlockType::Switch, 0, 4),
+            add_op("g", BlockType::And, 6, 1),
+            // Neither connect names a port — they must land on inputs 0 and 1, not both on 0.
+            wire_op("a", "g"),
+            wire_op("b", "g"),
+        ];
+        let report = d.apply_ai_ops(ops);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        let mut to_ports: Vec<u16> = d
+            .manager
+            .circuit
+            .iter_connections()
+            .map(|c| c.to.index)
+            .collect();
+        to_ports.sort_unstable();
+        assert_eq!(to_ports, vec![0, 1], "both gate inputs used");
+    }
+
+    #[test]
+    fn defchip_registers_verifies_and_instances_work() {
+        let mut d = doc();
+        let ops = vec![
+            RawOp::DefChip {
+                name: "And2".to_string(),
+                inputs: vec!["a".to_string(), "b".to_string()],
+                outputs: vec!["y".to_string()],
+                ops: vec![
+                    add_op("g", BlockType::And, 8, 0),
+                    wire_op("a", "g"),
+                    wire_op("b", "g"),
+                    wire_op("g", "y"),
+                ],
+            },
+            add_op("s1", BlockType::Switch, 0, 0),
+            add_op("s2", BlockType::Switch, 0, 4),
+            RawOp::Add {
+                r#ref: Some("u1".to_string()),
+                kind: AddKind::Chip("And2".to_string()),
+                x: 8,
+                y: 0,
+                inputs: None,
+                label: None,
+                state: false,
+            },
+            add_op("out", BlockType::Led, 16, 1),
+            // Chip pins addressed by NAME.
+            RawOp::Connect {
+                from: "s1".to_string(),
+                from_port: None,
+                to: "u1".to_string(),
+                to_port: Some(PortSel::Name("a".to_string())),
+            },
+            RawOp::Connect {
+                from: "s2".to_string(),
+                from_port: None,
+                to: "u1".to_string(),
+                to_port: Some(PortSel::Name("b".to_string())),
+            },
+            RawOp::Connect {
+                from: "u1".to_string(),
+                from_port: Some(PortSel::Name("y".to_string())),
+                to: "out".to_string(),
+                to_port: None,
+            },
+        ];
+        let report = d.apply_ai_ops(ops);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        // The chip was verified in isolation: its truth table is in the observations.
+        let obs = report.observations.join("\n");
+        assert!(obs.contains("Defined chip And2"), "obs: {obs}");
+        assert!(obs.contains("1 1 | 1"), "verified AND table: {obs}");
+
+        // The instanced chip actually computes AND on the canvas.
+        d.rebuild_sim();
+        let s1 = d
+            .manager
+            .circuit
+            .iter_blocks()
+            .find(|b| b.ty == BlockType::Switch)
+            .unwrap()
+            .id;
+        let led = d
+            .manager
+            .circuit
+            .iter_blocks()
+            .find(|b| b.ty == BlockType::Led)
+            .unwrap()
+            .id;
+        let s2 = d
+            .manager
+            .circuit
+            .iter_blocks()
+            .filter(|b| b.ty == BlockType::Switch)
+            .nth(1)
+            .unwrap()
+            .id;
+        d.sim.set_switch(s1, true);
+        d.sim.set_switch(s2, true);
+        d.sim.step(0.0);
+        assert_eq!(
+            d.sim.led_value(led),
+            Some(true),
+            "1 AND 1 = 1 through the chip"
+        );
+        d.sim.set_switch(s2, false);
+        d.sim.step(0.0);
+        assert_eq!(
+            d.sim.led_value(led),
+            Some(false),
+            "1 AND 0 = 0 through the chip"
+        );
+    }
+
+    #[test]
+    fn scripted_test_reports_outputs_per_step() {
+        let mut d = doc();
+        let ops = vec![
+            RawOp::Add {
+                r#ref: Some("d0".to_string()),
+                kind: AddKind::Prim(BlockType::Switch),
+                x: 0,
+                y: 0,
+                inputs: None,
+                label: Some("D".to_string()),
+                state: false,
+            },
+            RawOp::Add {
+                r#ref: Some("q0".to_string()),
+                kind: AddKind::Prim(BlockType::Led),
+                x: 8,
+                y: 0,
+                inputs: None,
+                label: Some("Q".to_string()),
+                state: false,
+            },
+            wire_op("d0", "q0"),
+            RawOp::Test {
+                steps: vec![
+                    vec![("D".to_string(), true)],
+                    vec![("D".to_string(), false)],
+                ],
+            },
+        ];
+        let report = d.apply_ai_ops(ops);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        let obs = report.observations.join("\n");
+        assert!(obs.contains("step 1: set D=1 \u{2192} Q=1"), "obs: {obs}");
+        assert!(obs.contains("step 2: set D=0 \u{2192} Q=0"), "obs: {obs}");
+    }
+
+    #[test]
+    fn observation_reports_skips_and_unwired_inputs() {
+        let mut d = doc();
+        let ops = vec![
+            add_op("g", BlockType::And, 6, 1),
+            // Bad connect: unknown block — must be skipped AND fed back to the model.
+            wire_op("ghost", "g"),
+        ];
+        let report = d.apply_ai_ops(ops);
+        assert_eq!(report.errors.len(), 1);
+        let obs = d.agent_observation(&report);
+        assert!(obs.contains("SKIPPED COMMANDS"), "skips fed back: {obs}");
+        assert!(
+            obs.contains("UNWIRED INPUTS"),
+            "unwired gate inputs listed: {obs}"
+        );
     }
 
     #[test]
@@ -3132,7 +3920,13 @@ mod tests {
         d.manager.connect(Port::output(b, 0), Port::input(g, 1));
         d.manager.connect(Port::output(g, 0), Port::input(led, 0));
 
-        let obs = d.agent_observation();
+        let report = AiEditReport {
+            activity: Vec::new(),
+            errors: Vec::new(),
+            changed: true,
+            observations: Vec::new(),
+        };
+        let obs = d.agent_observation(&report);
         assert!(obs.contains("Truth table"), "reports a truth table");
         // AND: high only when both inputs are high.
         assert!(obs.contains("0 0 | 0"));
