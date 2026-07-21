@@ -807,7 +807,8 @@ fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) -> bool {
 }
 
 /// A live assistant bubble rendered from the partial streaming buffers — reasoning dimmed above,
-/// answer below — so the reply appears token by token.
+/// answer below, and a collapsible "Writing commands…" row showing the raw command JSON as it
+/// is typed — so the reply appears token by token.
 fn stream_bubble(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -815,7 +816,7 @@ fn stream_bubble(
     content_field: &str,
     row_width: f32,
 ) {
-    let (reasoning, answer) = ai_edit::live_split(reason_field, content_field);
+    let live = ai_edit::live_split(reason_field, content_field);
     ui.allocate_ui_with_layout(
         egui::vec2(row_width, 0.0),
         Layout::left_to_right(Align::TOP),
@@ -834,11 +835,34 @@ fn stream_bubble(
                             ui.add_space(5.0);
                             ui.label(RichText::new("Assistant").small().color(theme.label_dim));
                         });
-                        if let Some(r) = &reasoning {
+                        if let Some(r) = &live.reasoning {
                             ui.label(RichText::new(r).italics().color(theme.label_dim).size(12.5));
                         }
-                        if !answer.is_empty() {
-                            ui.label(RichText::new(answer).color(theme.label));
+                        if !live.answer.is_empty() {
+                            ui.label(RichText::new(&live.answer).color(theme.label));
+                        }
+                        if let Some(cmds) = &live.commands {
+                            // Progress row while the model emits its JSON; expand to watch it
+                            // being typed live (a rough count of ops written so far is shown).
+                            let ops = cmds.matches("\"op\"").count();
+                            let title = if ops > 0 {
+                                format!("Writing commands\u{2026} ({ops} so far)")
+                            } else {
+                                "Writing commands\u{2026}".to_string()
+                            };
+                            egui::CollapsingHeader::new(
+                                RichText::new(title).small().italics().color(theme.accent),
+                            )
+                            .id_salt("ai-live-commands")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(cmds)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(theme.label_dim),
+                                );
+                            });
                         }
                     });
                 });

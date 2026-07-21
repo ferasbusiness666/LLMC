@@ -91,17 +91,36 @@ pub fn parse_reply(raw: &str) -> ParsedReply {
     }
 }
 
-/// Live view of a *partial* streaming reply: `(reasoning-so-far, answer-so-far)`, for display
-/// while tokens are still arriving. `reason_field` is a separate reasoning stream (some
-/// providers emit one); otherwise an inline `<think>` tag in `content` is used, open or closed.
-/// The answer is cut at the start of a command block so raw JSON isn't shown mid-stream.
-pub fn live_split(reason_field: &str, content: &str) -> (Option<String>, String) {
+/// Live view of a *partial* streaming reply, for display while tokens are still arriving.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LiveView {
+    /// Reasoning so far (from a separate reasoning stream or an inline `<think>` tag).
+    pub reasoning: Option<String>,
+    /// The prose answer so far, cut just before any command block.
+    pub answer: String,
+    /// The raw command JSON typed so far (fence markers stripped) — shown in a collapsible
+    /// "Writing commands…" section so the user can watch the build being written.
+    pub commands: Option<String>,
+}
+
+/// Split a partial streaming reply into reasoning / answer / in-progress command text.
+/// `reason_field` is a separate reasoning stream (some providers emit one); otherwise an inline
+/// `<think>` tag in `content` is used, open or closed.
+pub fn live_split(reason_field: &str, content: &str) -> LiveView {
     let opt = |s: &str| {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
     };
+    let view = |reasoning: Option<String>, body: &str| {
+        let (answer, commands) = split_live_answer(body);
+        LiveView {
+            reasoning,
+            answer,
+            commands,
+        }
+    };
     if !reason_field.trim().is_empty() {
-        return (opt(reason_field), visible_answer(content));
+        return view(opt(reason_field), content);
     }
     for (open_tag, close_tag) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
         if let Some(open) = content.find(open_tag) {
@@ -109,28 +128,42 @@ pub fn live_split(reason_field: &str, content: &str) -> (Option<String>, String)
             return match content[after..].find(close_tag) {
                 Some(rel) => {
                     let cpos = after + rel;
-                    let answer =
+                    let body =
                         format!("{}{}", &content[..open], &content[cpos + close_tag.len()..]);
-                    (opt(&content[after..cpos]), visible_answer(&answer))
+                    view(opt(&content[after..cpos]), &body)
                 }
-                None => (opt(&content[after..]), visible_answer(&content[..open])),
+                None => view(opt(&content[after..]), &content[..open]),
             };
         }
     }
-    (None, visible_answer(content))
+    view(None, content)
 }
 
-/// The portion of an answer safe to show while streaming: everything before a code fence or a
-/// `{"commands"` object (the command block is rendered as an activity list once complete).
-fn visible_answer(s: &str) -> String {
-    let mut end = s.len();
+/// Split partial body text into (prose answer, in-progress command text). The answer stops at
+/// the first code fence or `{"commands"` object; everything from there on — with fence markers
+/// stripped — is the live command text.
+fn split_live_answer(s: &str) -> (String, Option<String>) {
+    let mut cut = s.len();
     if let Some(p) = s.find("```") {
-        end = end.min(p);
+        cut = cut.min(p);
     }
     if let Some(p) = s.find("{\"commands\"") {
-        end = end.min(p);
+        cut = cut.min(p);
     }
-    s[..end].trim_end().to_string()
+    let answer = s[..cut].trim_end().to_string();
+    if cut == s.len() {
+        return (answer, None);
+    }
+    // Strip the opening fence line (```json) and any closing fence from the tail.
+    let mut tail = s[cut..].trim_start();
+    if let Some(rest) = tail.strip_prefix("```") {
+        tail = match rest.find('\n') {
+            Some(nl) => &rest[nl + 1..],
+            None => "", // fence opened but its line isn't complete yet
+        };
+    }
+    let tail = tail.trim_end().trim_end_matches("```").trim_end();
+    (answer, (!tail.is_empty()).then(|| tail.to_string()))
 }
 
 /// Pull the contents of any `<think>…</think>` / `<thinking>…</thinking>` blocks out of `raw`,
@@ -856,23 +889,29 @@ mod tests {
 
     #[test]
     fn live_split_separate_reasoning_field() {
-        let (r, a) = live_split("thinking about it", "Here is the plan");
-        assert_eq!(r.as_deref(), Some("thinking about it"));
-        assert_eq!(a, "Here is the plan");
+        let v = live_split("thinking about it", "Here is the plan");
+        assert_eq!(v.reasoning.as_deref(), Some("thinking about it"));
+        assert_eq!(v.answer, "Here is the plan");
+        assert_eq!(v.commands, None);
     }
 
     #[test]
     fn live_split_inline_open_think() {
         // Mid-stream: the think tag has opened but not closed yet.
-        let (r, a) = live_split("", "<think>still reasoning");
-        assert_eq!(r.as_deref(), Some("still reasoning"));
-        assert_eq!(a, "");
+        let v = live_split("", "<think>still reasoning");
+        assert_eq!(v.reasoning.as_deref(), Some("still reasoning"));
+        assert_eq!(v.answer, "");
     }
 
     #[test]
-    fn live_split_hides_partial_command_json() {
-        let (_r, a) = live_split("", "Adding a gate.\n```json\n{\"commands\":[{\"op\":");
-        assert_eq!(a, "Adding a gate.");
+    fn live_split_exposes_partial_command_json() {
+        let v = live_split("", "Adding a gate.\n```json\n{\"commands\":[{\"op\":");
+        assert_eq!(v.answer, "Adding a gate.", "prose stops before the fence");
+        assert_eq!(
+            v.commands.as_deref(),
+            Some("{\"commands\":[{\"op\":"),
+            "the in-progress JSON is exposed for the live 'Writing commands' view"
+        );
     }
 
     #[test]

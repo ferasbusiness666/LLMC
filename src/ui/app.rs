@@ -82,12 +82,14 @@ struct Clipboard {
     connections: Vec<Connection>,
 }
 
-/// Active "edit this chip's internals" session. The working circuit is swapped for the
-/// chip's, and the previous circuit/path are stashed to restore on save or cancel.
+/// A chip-editing TAB: this document holds a working copy of a chip's internals, opened in its
+/// own tab so the project it came from stays visible and untouched. "Update chip" (or Save)
+/// writes the circuit back into the source document's chip library.
 struct ChipEdit {
-    id: ChipId,
-    prev_circuit: Circuit,
-    prev_path: Option<PathBuf>,
+    /// [`Document::id`] of the project the chip belongs to.
+    source_doc: u64,
+    /// The chip being edited in that project's library.
+    chip: ChipId,
 }
 
 /// Human-friendly tab label derived from a file path (its stem), e.g. `adder.llmc` → `adder`.
@@ -140,8 +142,10 @@ struct Document {
     menu_world: Vec2f,
     /// Chip being renamed, with its editable name buffer.
     rename_chip: Option<(ChipId, String)>,
-    /// Active chip-internals editing session.
+    /// Set when this tab IS a chip-editing session (see [`ChipEdit`]).
     chip_edit: Option<ChipEdit>,
+    /// Set by the palette's "Edit…" — the app opens the chip in a new tab and clears this.
+    request_chip_edit: Option<ChipId>,
     /// Block whose Properties window is open, plus its editable buffers.
     props_for: Option<BlockId>,
     props_name: String,
@@ -188,6 +192,7 @@ impl Document {
             menu_world: Vec2f::ZERO,
             rename_chip: None,
             chip_edit: None,
+            request_chip_edit: None,
             props_for: None,
             props_name: String::new(),
             props_color: [0x5b, 0x9d, 0xf9],
@@ -261,11 +266,10 @@ impl Document {
         self.dirty
     }
 
-    /// Recompute the cached dirty flag from actual content. An in-progress chip edit always
-    /// counts as unsaved work (the sub-edit isn't committed to the project yet).
+    /// Recompute the cached dirty flag from actual content. Chip-editing tabs use the same
+    /// rule: clean when the working copy matches what was last applied to the source chip.
     fn recompute_dirty(&mut self) {
-        self.dirty =
-            self.chip_edit.is_some() || self.content_fingerprint() != self.saved_fingerprint;
+        self.dirty = self.content_fingerprint() != self.saved_fingerprint;
     }
 
     /// Record the current content as the saved baseline and refresh the dirty flag.
@@ -1341,64 +1345,19 @@ impl Document {
         self.status = format!("Deleted chip '{name}'");
     }
 
-    /// Open a chip's internal circuit for editing (stashing the current circuit).
-    fn begin_chip_edit(&mut self, id: ChipId) {
-        if self.chip_edit.is_some() {
-            return;
-        }
-        let Some(def) = self.manager.chips.get(id) else {
-            return;
+    /// Apply an edited chip circuit back into this (source) document's library, keeping the
+    /// chip's id and name so every placed instance updates. Returns false if the chip no
+    /// longer exists here.
+    fn apply_chip_circuit(&mut self, chip: ChipId, circuit: Circuit) -> bool {
+        let Some(name) = self.manager.chips.get(chip).map(|c| c.name.clone()) else {
+            return false;
         };
-        let name = def.name.clone();
-        let circuit = def.circuit.clone();
-        let prev_circuit = std::mem::replace(&mut self.manager.circuit, circuit);
-        self.manager.undo.clear();
-        self.chip_edit = Some(ChipEdit {
-            id,
-            prev_circuit,
-            prev_path: self.path.take(),
-        });
-        self.tool = Tool::Select;
-        self.selection.clear();
-        self.selected_conns.clear();
-        self.interaction = Interaction::Idle;
-        self.pending_wire = None;
-        self.sim_dirty = true;
-        self.status = format!("Editing chip '{name}' — Update or Cancel in the toolbar");
-    }
-
-    fn save_chip_edit(&mut self) {
-        let Some(edit) = self.chip_edit.take() else {
-            return;
-        };
-        let name = self
-            .manager
-            .chips
-            .get(edit.id)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| "chip".to_string());
-        let def = ChipDef::from_circuit(edit.id, name.clone(), self.manager.circuit.clone());
+        let def = ChipDef::from_circuit(chip, name.clone(), circuit);
         self.manager.chips.insert(def);
-        self.manager.circuit = edit.prev_circuit;
-        self.path = edit.prev_path;
-        self.manager.undo.clear();
-        self.selection.clear();
-        self.selected_conns.clear();
         self.sim_dirty = true;
+        self.recompute_dirty();
         self.status = format!("Updated chip '{name}'");
-    }
-
-    fn cancel_chip_edit(&mut self) {
-        let Some(edit) = self.chip_edit.take() else {
-            return;
-        };
-        self.manager.circuit = edit.prev_circuit;
-        self.path = edit.prev_path;
-        self.manager.undo.clear();
-        self.selection.clear();
-        self.selected_conns.clear();
-        self.sim_dirty = true;
-        self.status = "Cancelled chip edit".to_string();
+        true
     }
 
     // ----- block properties -----
@@ -1710,7 +1669,9 @@ impl Document {
                                 ui.close();
                             }
                             if ui.button("Edit\u{2026}").clicked() {
-                                self.begin_chip_edit(id);
+                                // Opens in a NEW tab (handled by the app), so the circuit
+                                // being worked on stays right where it is.
+                                self.request_chip_edit = Some(id);
                                 ui.close();
                             }
                             if ui.button("Rename\u{2026}").clicked() {
@@ -2816,11 +2777,10 @@ impl LlmcApp {
         if i >= self.docs.len() {
             return false;
         }
-        // An in-progress chip edit swaps the live circuit for the chip's internals and
-        // stashes the project. Commit it first so we persist the real project (with the
-        // chip changes folded in) instead of the chip's sub-circuit, and never lose either.
+        // A chip-editing tab doesn't save to a file — "saving" it means applying the working
+        // copy back into the source project's chip (this also serves the close prompt's Save).
         if self.docs[i].chip_edit.is_some() {
-            self.docs[i].save_chip_edit();
+            return self.apply_chip_edit(i);
         }
         let path = self.docs[i].path.clone();
         match path {
@@ -2849,8 +2809,10 @@ impl LlmcApp {
         if i >= self.docs.len() {
             return;
         }
+        // A chip tab has no file of its own — Save As just applies it back to the source.
         if self.docs[i].chip_edit.is_some() {
-            self.docs[i].save_chip_edit();
+            self.apply_chip_edit(i);
+            return;
         }
         let mut dlg = rfd::FileDialog::new()
             .add_filter("LLMC circuit", &["llmc"])
@@ -2897,6 +2859,71 @@ impl LlmcApp {
             self.config.last_dir = Some(parent.to_path_buf());
             self.config.save();
         }
+    }
+
+    /// Open a chip's internals for editing in a NEW tab, leaving the source project's tab
+    /// untouched. If a tab is already editing this exact chip, focus it instead.
+    fn open_chip_edit_tab(&mut self, src: usize, chip: ChipId) {
+        let source_doc = self.docs[src].id;
+        if let Some(existing) = self.docs.iter().position(|d| {
+            d.chip_edit
+                .as_ref()
+                .is_some_and(|e| e.source_doc == source_doc && e.chip == chip)
+        }) {
+            self.active = existing;
+            return;
+        }
+        let Some(def) = self.docs[src].manager.chips.get(chip) else {
+            return;
+        };
+        let name = def.name.clone();
+        let circuit = def.circuit.clone();
+        // The chip may instance other chips, so the editing tab carries a copy of the source's
+        // whole library — but only THIS chip's circuit is written back on update.
+        let chips = self.docs[src].manager.chips.clone();
+        let camera = Camera {
+            pan: Vec2::new(140.0, 90.0),
+            zoom: DEFAULT_ZOOM,
+        };
+        let mut doc = Document::assemble(
+            CircuitManager::from_parts(circuit, chips),
+            self.dark,
+            None,
+            format!("\u{270e} {name}"),
+            camera,
+        );
+        doc.chip_edit = Some(ChipEdit { source_doc, chip });
+        doc.status = format!(
+            "Editing chip '{name}' \u{2014} \u{201c}Update chip\u{201d} applies changes; your \
+             project stays open in its own tab"
+        );
+        self.active = self.push_doc(doc);
+    }
+
+    /// Apply a chip-editing tab's working copy back into its source project (every placed
+    /// instance updates). Returns whether the update landed — false when the source tab or the
+    /// chip itself no longer exists.
+    fn apply_chip_edit(&mut self, i: usize) -> bool {
+        let Some((source_doc, chip)) = self.docs[i]
+            .chip_edit
+            .as_ref()
+            .map(|e| (e.source_doc, e.chip))
+        else {
+            return false;
+        };
+        let circuit = self.docs[i].manager.circuit.clone();
+        let Some(src) = self.docs.iter().position(|d| d.id == source_doc) else {
+            self.docs[i].status =
+                "Can't update: the project this chip belongs to was closed".to_string();
+            return false;
+        };
+        if !self.docs[src].apply_chip_circuit(chip, circuit) {
+            self.docs[i].status = "Can't update: the chip was deleted from its project".to_string();
+            return false;
+        }
+        self.docs[i].mark_saved();
+        self.docs[i].status = "Chip updated in its project".to_string();
+        true
     }
 
     fn toggle_theme(&mut self, ctx: &egui::Context) {
@@ -3007,10 +3034,7 @@ impl LlmcApp {
                 if self.docs[active].chip_edit.is_some() {
                     ui.colored_label(self.theme().accent, "\u{270e} Editing chip");
                     if ui.button("Update chip").clicked() {
-                        self.docs[active].save_chip_edit();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.docs[active].cancel_chip_edit();
+                        self.apply_chip_edit(active);
                     }
                 } else if ui.button("Create Chip").clicked() {
                     self.docs[active].show_chip_dialog = true;
@@ -3306,6 +3330,12 @@ impl eframe::App for LlmcApp {
         let ai_open = self.ai_open;
         let ai_settings_open = &mut self.ai_settings_open;
         self.docs[active].frame(ui, &ctx, clipboard, ai_settings, ai_open, ai_settings_open);
+
+        // The palette's "Edit…" on a chip asks for a NEW editing tab (never swaps the circuit
+        // out from under the tab you're working in).
+        if let Some(chip) = self.docs[active].request_chip_edit.take() {
+            self.open_chip_edit_tab(active, chip);
+        }
 
         // Only the active document can have changed this frame; refresh its dirty flag from
         // the actual content so the tab bar and close prompts stay accurate (inactive tabs
@@ -3641,28 +3671,67 @@ mod tests {
     }
 
     #[test]
-    fn in_progress_chip_edit_counts_as_unsaved() {
+    fn chip_edit_applies_back_and_updates_instances() {
         let mut d = doc();
-        d.mark_saved();
-        assert!(!d.is_dirty());
-
-        // While a chip is being edited the live circuit is the chip's internals; the project
-        // has uncommitted sub-work, so the document must read as dirty regardless of content.
-        d.chip_edit = Some(ChipEdit {
-            id: ChipId(0),
-            prev_circuit: Circuit::new("proj"),
-            prev_path: None,
+        // Register a pass-through chip: switch pin "in" wired straight to led pin "out".
+        let mut c = Circuit::new("Thru");
+        let pin_in = c.allocate_block_id();
+        let mut b = Block::new(pin_in, BlockType::Switch, Pos::new(0, 0));
+        b.label = Some("in".to_string());
+        c.insert_block(b);
+        let pin_out = c.allocate_block_id();
+        let mut b = Block::new(pin_out, BlockType::Led, Pos::new(8, 0));
+        b.label = Some("out".to_string());
+        c.insert_block(b);
+        let w = c.allocate_conn_id();
+        c.insert_connection(Connection {
+            id: w,
+            from: Port::output(pin_in, 0),
+            to: Port::input(pin_out, 0),
         });
-        d.recompute_dirty();
-        assert!(d.is_dirty(), "an open chip edit is unsaved work");
+        let chip_id = d.manager.chips.allocate_id();
+        d.manager
+            .chips
+            .insert(ChipDef::from_circuit(chip_id, "Thru", c.clone()));
 
-        // Cancelling restores the exact pre-edit content, which must read clean again
-        // (finding: cancel left the project spuriously dirty).
-        d.chip_edit = None;
-        d.recompute_dirty();
-        assert!(
-            !d.is_dirty(),
-            "reverting the chip edit restores a clean project"
+        // Instance it: switch -> chip -> LED.
+        let sw = d.manager.add_block(BlockType::Switch, Pos::new(0, 6));
+        let inst = d
+            .manager
+            .add_block(BlockType::Chip(chip_id), Pos::new(6, 6));
+        let led = d.manager.add_block(BlockType::Led, Pos::new(12, 6));
+        d.manager.connect(Port::output(sw, 0), Port::input(inst, 0));
+        d.manager
+            .connect(Port::output(inst, 0), Port::input(led, 0));
+
+        // Edit the working copy (as a chip-editing tab would): insert a NOT between the pins.
+        let mut edited = c.clone();
+        edited.remove_connection(w);
+        let inv = edited.allocate_block_id();
+        edited.insert_block(Block::new(inv, BlockType::Not, Pos::new(4, 0)));
+        let w1 = edited.allocate_conn_id();
+        edited.insert_connection(Connection {
+            id: w1,
+            from: Port::output(pin_in, 0),
+            to: Port::input(inv, 0),
+        });
+        let w2 = edited.allocate_conn_id();
+        edited.insert_connection(Connection {
+            id: w2,
+            from: Port::output(inv, 0),
+            to: Port::input(pin_out, 0),
+        });
+        assert!(d.apply_chip_circuit(chip_id, edited), "update lands");
+
+        // The already-placed instance now inverts: switch low -> LED high.
+        d.running = true;
+        d.rebuild_sim();
+        d.sim.set_switch(sw, false);
+        d.sim.step(0.0);
+        assert_eq!(
+            d.sim.led_value(led),
+            Some(true),
+            "instances pick up the edited chip (0 -> 1 through the new NOT)"
         );
     }
 
