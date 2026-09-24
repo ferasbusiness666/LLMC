@@ -10,7 +10,10 @@
 //! panel itself reads like a real product — a clear header, roomy chat, and a composer with
 //! the model switcher right where you type.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
 
@@ -324,40 +327,54 @@ pub struct ChatMessage {
     /// An automatic agent-loop message (the "auto-check" fed back after edits). Sent to the model
     /// as a user turn, but rendered as a subtle step note rather than a chat bubble.
     pub auto: bool,
+    /// A status line for the user only (e.g. "Stopped") — rendered as a quiet centered note and
+    /// never sent to the model.
+    pub notice: bool,
 }
 
 impl ChatMessage {
-    fn user(text: String) -> Self {
+    fn base(role: Role, text: String) -> Self {
         Self {
-            role: Role::User,
+            role,
             text,
             thinking: None,
             error: false,
             activity: Vec::new(),
             auto: false,
+            notice: false,
+        }
+    }
+
+    fn user(text: String) -> Self {
+        Self::base(Role::User, text)
+    }
+
+    fn reply(text: String, thinking: Option<String>) -> Self {
+        Self {
+            thinking,
+            ..Self::base(Role::Assistant, text)
         }
     }
 
     fn failure(text: String) -> Self {
         Self {
-            role: Role::Assistant,
-            text,
-            thinking: None,
             error: true,
-            activity: Vec::new(),
-            auto: false,
+            ..Self::base(Role::Assistant, text)
         }
     }
 
     /// An automatic agent-loop feedback turn (the post-edit "auto-check").
     fn auto(text: String) -> Self {
         Self {
-            role: Role::User,
-            text,
-            thinking: None,
-            error: false,
-            activity: Vec::new(),
             auto: true,
+            ..Self::base(Role::User, text)
+        }
+    }
+
+    fn notice(text: String) -> Self {
+        Self {
+            notice: true,
+            ..Self::base(Role::Assistant, text)
         }
     }
 }
@@ -391,10 +408,20 @@ pub struct AiSession {
     pub agent_enabled: bool,
     /// Whether an autonomous run is currently in flight (drives the Stop button / status line).
     agent_running: bool,
-    /// Auto-continue steps taken in the current run (bounded by [`MAX_AGENT_STEPS`]).
+    /// Auto-continue steps taken in the current run. Unbounded: a run lasts as long as the model
+    /// keeps making progress — only the user's Stop (or finishing) ends it.
     agent_steps: u32,
-    /// Set when the user presses Stop; the loop ends after the in-flight reply lands.
+    /// Set when the user presses Stop.
     agent_stop: bool,
+    /// Cancel flag of the in-flight request (raised by Stop so the worker abandons the stream).
+    cancel: Arc<AtomicBool>,
+    /// When a transient failure (rate limit, overloaded provider, dropped connection) interrupts
+    /// a run, the next attempt is scheduled here instead of ending the run.
+    retry_at: Option<Instant>,
+    /// Consecutive automatic retries (reset by any successful reply).
+    retries: u32,
+    /// Why the run is waiting to retry (shown in the status row).
+    retry_reason: String,
     /// Live text filter for the model picker (providers can list hundreds of models).
     model_filter: String,
     /// Streaming buffers for the in-flight reply: reasoning and answer accumulated so far. Shown
@@ -403,9 +430,20 @@ pub struct AiSession {
     stream_content: String,
 }
 
-/// Safety cap on autonomous agent iterations (each is one provider call). The user can always
-/// Stop sooner, or re-prompt to go further.
-const MAX_AGENT_STEPS: u32 = 40;
+/// How many of the most recent conversation turns are sent verbatim each step. Older assistant
+/// turns are trimmed (the user's own messages are always kept): the system prompt already
+/// carries the complete *current* circuit, so a long run never outgrows the model's context
+/// window and dies from it.
+const HISTORY_TAIL: usize = 16;
+
+/// Consecutive transient failures tolerated before a run gives up (≈ 18 minutes of an
+/// unusable provider at the capped backoff). Any successful reply resets the count.
+const MAX_CONSECUTIVE_RETRIES: u32 = 20;
+
+/// Backoff before automatic retry `n` (1-based): 5s, 10s, 20s, 40s, then 60s.
+fn retry_delay(n: u32) -> Duration {
+    Duration::from_secs((5u64 << n.saturating_sub(1).min(4)).min(60))
+}
 
 impl Default for AiSession {
     fn default() -> Self {
@@ -423,6 +461,10 @@ impl Default for AiSession {
             agent_running: false,
             agent_steps: 0,
             agent_stop: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            retry_at: None,
+            retries: 0,
+            retry_reason: String::new(),
             model_filter: String::new(),
             stream_reason: String::new(),
             stream_content: String::new(),
@@ -454,9 +496,13 @@ impl AiSession {
                         self.stream_content = content;
                     }
                 }
-                ChatEvent::Reply { token, result } => {
+                ChatEvent::Reply {
+                    token,
+                    result,
+                    retryable,
+                } => {
                     if self.pending != Some(token) {
-                        continue; // stale reply (conversation cleared, or superseded) — drop it.
+                        continue; // stale reply (stopped, cleared, or superseded) — drop it.
                     }
                     self.pending = None;
                     self.stream_reason.clear();
@@ -464,18 +510,31 @@ impl AiSession {
                     got = true;
                     match result {
                         Ok(raw) => {
+                            self.retries = 0;
                             let parsed = ai_edit::parse_reply(&raw);
-                            self.messages.push(ChatMessage {
-                                role: Role::Assistant,
-                                text: parsed.text,
-                                thinking: parsed.thinking,
-                                error: false,
-                                activity: Vec::new(),
-                                auto: false,
-                            });
+                            self.messages
+                                .push(ChatMessage::reply(parsed.text, parsed.thinking));
                             if !parsed.ops.is_empty() {
                                 self.pending_ops = Some(parsed.ops);
                             }
+                        }
+                        // A transient failure mid-run (rate limit, overloaded provider, dropped
+                        // connection) doesn't end the run: back off and try the same step again.
+                        Err(e)
+                            if retryable
+                                && self.agent_running
+                                && !self.agent_stop
+                                && self.retries < MAX_CONSECUTIVE_RETRIES =>
+                        {
+                            self.retries += 1;
+                            self.retry_at = Some(Instant::now() + retry_delay(self.retries));
+                            self.retry_reason = e;
+                        }
+                        Err(e) if retryable && self.retries >= MAX_CONSECUTIVE_RETRIES => {
+                            self.messages.push(ChatMessage::failure(format!(
+                                "{e} \u{2014} still failing after {MAX_CONSECUTIVE_RETRIES} \
+                                 automatic retries. Press Retry to resume, or switch model."
+                            )));
                         }
                         Err(e) => self.messages.push(ChatMessage::failure(e)),
                     }
@@ -513,33 +572,32 @@ impl AiSession {
         self.agent_steps
     }
 
-    /// Ask the running agent to stop after the in-flight reply lands.
+    /// Stop the assistant NOW: cancel the in-flight request (its worker abandons the stream, and
+    /// any late reply is dropped as stale), drop a scheduled retry, and end the run. The user is
+    /// never left waiting on a slow or stalled provider.
     pub fn request_stop(&mut self) {
+        let was_busy = self.pending.is_some() || self.retry_at.is_some();
+        self.cancel.store(true, Ordering::Relaxed);
+        self.pending = None;
+        self.pending_ops = None;
+        self.retry_at = None;
+        self.stream_reason.clear();
+        self.stream_content.clear();
         self.agent_stop = true;
         self.agent_running = false;
+        if was_busy {
+            self.messages.push(ChatMessage::notice(
+                "Stopped. Send a message (e.g. \u{201c}continue\u{201d}) to pick up from here."
+                    .to_string(),
+            ));
+        }
     }
 
-    /// After a reply that made edits, decide whether the agent keeps iterating on its own. If it
-    /// stops purely because it hit the step cap (not user Stop / agent off), leave a short note so
-    /// the pause isn't silent.
-    pub fn should_continue_or_note(&mut self) -> bool {
-        if !self.agent_enabled || self.agent_stop {
-            return false;
-        }
-        if self.agent_steps < MAX_AGENT_STEPS {
-            return true;
-        }
-        self.messages.push(ChatMessage {
-            role: Role::Assistant,
-            text: format!(
-                "Paused after {MAX_AGENT_STEPS} steps. Tell me to continue if it isn't finished."
-            ),
-            thinking: None,
-            error: false,
-            activity: Vec::new(),
-            auto: false,
-        });
-        false
+    /// After a reply that made edits, should the agent keep iterating on its own? There is no
+    /// step cap: a run continues until the model finishes (replies with no edits), the user
+    /// presses Stop, or Agent mode is switched off.
+    pub fn should_continue(&self) -> bool {
+        self.agent_enabled && !self.agent_stop
     }
 
     /// Feed the post-edit auto-check back to the model and dispatch the next step of the run.
@@ -554,9 +612,40 @@ impl AiSession {
         self.dispatch(settings, system_prompt);
     }
 
-    /// End the current run (the model replied with no further edits, or hit an error / the cap).
+    /// End the current run (the model replied with no further edits, or a non-retryable error
+    /// arrived). A run that is merely waiting to retry a transient failure keeps going.
     pub fn end_agent(&mut self) {
-        self.agent_running = false;
+        if self.retry_at.is_none() {
+            self.agent_running = false;
+        }
+    }
+
+    /// Is an automatic retry scheduled (the run is backing off after a transient failure)?
+    pub fn retry_scheduled(&self) -> bool {
+        self.retry_at.is_some()
+    }
+
+    /// Has the scheduled retry's backoff elapsed (and nothing else is in flight)?
+    pub fn retry_due(&self) -> bool {
+        self.pending.is_none() && self.retry_at.is_some_and(|t| Instant::now() >= t)
+    }
+
+    /// Re-send the step that failed transiently. The conversation already ends with the turn that
+    /// failed (the user's message or the latest auto-check), so it is simply dispatched again.
+    pub fn retry_now(&mut self, settings: &AiSettings, system_prompt: String) {
+        self.retry_at = None;
+        self.dispatch(settings, system_prompt);
+    }
+
+    /// Status text while backing off, e.g. "Rate limited (HTTP 429) — retrying in 12s (retry 3)".
+    pub fn retry_status(&self) -> Option<String> {
+        let at = self.retry_at?;
+        let secs = at.saturating_duration_since(Instant::now()).as_secs() + 1;
+        Some(format!(
+            "{} \u{2014} retrying in {secs}s (retry {})",
+            self.retry_reason.trim_end_matches('.'),
+            self.retries
+        ))
     }
 
     /// If nothing valid is selected, fall back to the first available model (and recover from a
@@ -589,12 +678,12 @@ impl AiSession {
     }
 
     /// Re-run the conversation after a failed reply (the "Retry" affordance). Drops trailing
-    /// error bubbles and resends the existing turns; no new user message is added.
+    /// error bubbles / notices and resends the existing turns; no new user message is added.
     pub fn resend(&mut self, settings: &AiSettings, system_prompt: String) {
         if self.pending.is_some() {
             return;
         }
-        while self.messages.last().is_some_and(|m| m.error) {
+        while self.messages.last().is_some_and(|m| m.error || m.notice) {
             self.messages.pop();
         }
         if !self.messages.iter().any(|m| m.role == Role::User) {
@@ -604,11 +693,13 @@ impl AiSession {
         self.dispatch(settings, system_prompt);
     }
 
-    /// Reset the agent counters for a new run started by the user.
+    /// Reset the run state for a new run started by the user.
     fn begin_run(&mut self) {
         self.agent_running = true;
         self.agent_steps = 0;
         self.agent_stop = false;
+        self.retries = 0;
+        self.retry_at = None;
     }
 
     /// Build the request from the current turns + `system_prompt` and fire it off-thread.
@@ -616,53 +707,84 @@ impl AiSession {
         let Some(sel) = self.selected.clone() else {
             self.messages
                 .push(ChatMessage::failure("No model selected.".to_string()));
+            self.agent_running = false;
             return;
         };
         let Some(provider) = settings.providers.get(sel.provider).filter(|p| p.is_live()) else {
             self.messages.push(ChatMessage::failure(
                 "The selected provider isn't connected.".to_string(),
             ));
+            self.agent_running = false;
             return;
         };
 
-        // system prompt + the visible conversation. Skip error bubbles and empty turns; the
-        // system prompt already carries the *current* circuit, so include only the newest
-        // auto-check turn (older ones describe superseded states and would just waste tokens).
-        let last_auto = self.messages.iter().rposition(|m| m.auto);
+        let (history, trimmed) = history_turns(&self.messages);
+        let mut system = system_prompt;
+        if trimmed {
+            system.push_str(
+                "\n\nNOTE: this is a long run, so earlier steps were trimmed from the \
+                 conversation. CURRENT STATE above reflects everything built so far \u{2014} \
+                 continue from it.",
+            );
+        }
         let mut turns = vec![ChatTurn {
             role: "system".to_string(),
-            content: system_prompt,
+            content: system,
         }];
-        for (i, m) in self.messages.iter().enumerate() {
-            if m.error || m.text.trim().is_empty() {
-                continue;
-            }
-            if m.auto && Some(i) != last_auto {
-                continue;
-            }
-            let role = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            };
-            turns.push(ChatTurn {
-                role: role.to_string(),
-                content: m.text.clone(),
-            });
-        }
+        turns.extend(history);
 
         let token = self.next_token;
         self.next_token += 1;
         self.pending = Some(token);
         self.stream_reason.clear();
         self.stream_content.clear();
+        // A fresh cancel flag per request, so Stop aborts exactly the one in flight.
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = cancel.clone();
         let req = ChatRequest {
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
             model: sel.model.clone(),
             turns,
+            cancel,
         };
         ai_net::spawn_chat(self.chat_tx.clone(), token, req);
     }
+}
+
+/// The conversation turns to send, trimmed so an arbitrarily long run never outgrows the model's
+/// context window: every message the USER typed is kept (the goal and any follow-ups); the last
+/// [`HISTORY_TAIL`] turns are kept verbatim; of the automatic auto-checks only the newest (older
+/// ones describe superseded states). Errors, notices and empty turns are never sent. The system
+/// prompt carries the complete *current* circuit, so trimming loses no work — only old chatter.
+/// Returns the turns and whether anything was trimmed.
+fn history_turns(messages: &[ChatMessage]) -> (Vec<ChatTurn>, bool) {
+    let last_auto = messages.iter().rposition(|m| m.auto);
+    let tail_start = messages.len().saturating_sub(HISTORY_TAIL);
+    let mut trimmed = false;
+    let mut history = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        if m.error || m.notice || m.text.trim().is_empty() {
+            continue;
+        }
+        if m.auto && Some(i) != last_auto {
+            continue;
+        }
+        let user_typed = m.role == Role::User && !m.auto;
+        if i < tail_start && !user_typed {
+            trimmed = true;
+            continue;
+        }
+        let role = match m.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        history.push(ChatTurn {
+            role: role.to_string(),
+            content: m.text.clone(),
+        });
+    }
+    (history, trimmed)
 }
 
 // ===================== rendering =====================
@@ -705,9 +827,11 @@ pub fn panel(
                     if text_button(ui, theme, "Settings", "Providers & API keys") {
                         *open_settings = true;
                     }
-                    // Don't offer "Clear" mid-request; the reply would land in a cleared thread.
+                    // Don't offer "Clear" mid-run; the next step would land in a cleared thread.
                     if !session.messages.is_empty()
                         && !session.is_pending()
+                        && !session.is_running()
+                        && !session.retry_scheduled()
                         && text_button(ui, theme, "Clear", "Clear conversation")
                     {
                         session.messages.clear();
@@ -784,12 +908,19 @@ fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) -> bool {
             for (i, msg) in session.messages.iter().enumerate() {
                 if msg.auto {
                     auto_note(ui, theme, msg, i);
+                } else if msg.notice {
+                    notice(ui, theme, &msg.text);
                 } else {
                     retry |= bubble(ui, theme, msg, row_width, i);
                 }
                 ui.add_space(8.0);
             }
-            if session.is_pending() {
+            if let Some(status) = session.retry_status().filter(|_| !session.is_pending()) {
+                // Backing off after a transient provider failure; the run resumes on its own.
+                status_row(ui, theme, &status);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            } else if session.is_pending() {
                 if session.stream_reason.is_empty() && session.stream_content.is_empty() {
                     thinking(ui, theme, session);
                 } else {
@@ -900,15 +1031,28 @@ fn thinking(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) {
     } else {
         "Thinking\u{2026}".to_string()
     };
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        accent_dot(ui, theme, 3.5);
-        ui.add_space(6.0);
-        ui.label(RichText::new(label).italics().color(theme.label_dim));
-    });
+    status_row(ui, theme, &label);
     // Keep animating so the reply (and this indicator) refresh promptly.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(120));
+}
+
+/// A quiet left-aligned status line with the accent dot (thinking / retry countdown).
+fn status_row(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(12.0);
+        accent_dot(ui, theme, 3.5);
+        ui.add_space(6.0);
+        ui.label(RichText::new(text).italics().color(theme.label_dim));
+    });
+}
+
+/// A system notice (e.g. "Stopped.") — a dim, centered line rather than a bubble, so it reads as
+/// part of the timeline and not as something either side said.
+fn notice(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new(text).small().italics().color(theme.label_dim));
+    });
 }
 
 /// A single chat bubble: user right-aligned/accent, assistant left-aligned/panel, errors muted-red.
@@ -964,7 +1108,7 @@ fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32, i
                     if !msg.text.trim().is_empty() {
                         ui.label(RichText::new(&msg.text).color(theme.label));
                     }
-                    activity_view(ui, theme, &msg.activity);
+                    activity_view(ui, theme, &msg.activity, idx);
                     if msg.error && text_button(ui, theme, "Retry", "Send this prompt again") {
                         retry = true;
                     }
@@ -976,7 +1120,7 @@ fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32, i
 
 /// The "activity" view under an assistant reply: the concrete edits it applied to the circuit,
 /// one line each, with skipped ops shown in muted-red. Nothing is drawn when the list is empty.
-fn activity_view(ui: &mut egui::Ui, theme: &Theme, activity: &[String]) {
+fn activity_view(ui: &mut egui::Ui, theme: &Theme, activity: &[String], idx: usize) {
     if activity.is_empty() {
         return;
     }
@@ -985,15 +1129,35 @@ fn activity_view(ui: &mut egui::Ui, theme: &Theme, activity: &[String]) {
         .iter()
         .filter(|a| !a.starts_with("Skipped"))
         .count();
+    let title = RichText::new(format!(
+        "Applied {applied} change{}",
+        if applied == 1 { "" } else { "s" }
+    ))
+    .small()
+    .strong()
+    .color(theme.label_dim);
+    // Big steps (a whole ALU in one reply) fold their list away so a long run stays readable
+    // and cheap to draw; short lists are shown inline.
+    const INLINE_MAX: usize = 8;
+    if activity.len() > INLINE_MAX {
+        egui::CollapsingHeader::new(title)
+            .id_salt(("ai-activity", idx))
+            .default_open(false)
+            .show(ui, |ui| activity_lines(ui, theme, activity));
+    } else {
+        ui.label(title);
+        activity_lines(ui, theme, activity);
+    }
+    ui.add_space(2.0);
     ui.label(
-        RichText::new(format!(
-            "Applied {applied} change{}",
-            if applied == 1 { "" } else { "s" }
-        ))
-        .small()
-        .strong()
-        .color(theme.label_dim),
+        RichText::new("Undo (Ctrl+Z) to revert")
+            .small()
+            .color(theme.label_dim),
     );
+}
+
+/// One muted line per applied edit; skipped ops in muted-red.
+fn activity_lines(ui: &mut egui::Ui, theme: &Theme, activity: &[String]) {
     for line in activity {
         let skipped = line.starts_with("Skipped");
         let color = if skipped {
@@ -1016,12 +1180,6 @@ fn activity_view(ui: &mut egui::Ui, theme: &Theme, activity: &[String]) {
             ui.label(RichText::new(line).small().color(color));
         });
     }
-    ui.add_space(2.0);
-    ui.label(
-        RichText::new("Undo (Ctrl+Z) to revert")
-            .small()
-            .color(theme.label_dim),
-    );
 }
 
 /// The bottom composer: model switcher + input + send. Returns true when the user asked to
@@ -1049,14 +1207,16 @@ fn composer(
                 let hint = if !ready {
                     "Connect a provider to start\u{2026}"
                 } else if pending {
-                    "Waiting for a reply\u{2026}"
+                    "Working\u{2026} you can type your next message meanwhile"
                 } else {
                     "Ask the assistant to build or edit your circuit\u{2026}"
                 };
-                // Enter sends; Shift+Enter inserts a newline.
+                // Enter sends; Shift+Enter inserts a newline. The box stays editable (and keeps
+                // keyboard focus) while a reply is pending: disabling it would drop focus, and
+                // whatever you typed next would fall through to the canvas as shortcuts. Only
+                // *sending* waits until the current reply lands.
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                let editor = ui.add_enabled(
-                    !pending,
+                let editor = ui.add(
                     egui::TextEdit::multiline(&mut session.input)
                         .frame(Frame::NONE)
                         .desired_rows(2)
@@ -1076,15 +1236,15 @@ fn composer(
             ui.checkbox(&mut session.agent_enabled, RichText::new("Agent").small())
                 .on_hover_text(
                     "Let the assistant work on its own: build, auto-check the circuit's \
-                     behavior, and fix it until it matches your request. Uses several provider \
-                     calls; press Stop any time.",
+                     behavior, and fix it until it matches your request — for as long as it \
+                     needs. Uses several provider calls; press Stop any time.",
                 );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if session.is_running() {
                     // Mid-run: offer Stop instead of Send.
                     if ui
                         .add(accent_widget(theme, "Stop"))
-                        .on_hover_text("Stop after the current step")
+                        .on_hover_text("Stop the assistant now")
                         .clicked()
                     {
                         session.request_stop();
@@ -1464,4 +1624,167 @@ fn accent_widget(theme: &Theme, text: &str) -> egui::Button<'static> {
 
 fn accent_button(ui: &mut egui::Ui, theme: &Theme, text: &str) -> egui::Response {
     ui.add(accent_widget(theme, text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply_event(token: u64, result: Result<String, String>, retryable: bool) -> ChatEvent {
+        ChatEvent::Reply {
+            token,
+            result,
+            retryable,
+        }
+    }
+
+    /// A session mid-run with request `0` in flight.
+    fn running_session() -> AiSession {
+        let mut s = AiSession::default();
+        s.messages
+            .push(ChatMessage::user("build a full adder".into()));
+        s.begin_run();
+        s.pending = Some(0);
+        s.next_token = 1;
+        s
+    }
+
+    #[test]
+    fn retry_backoff_grows_then_caps_at_a_minute() {
+        let secs: Vec<u64> = (1..=7).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, vec![5, 10, 20, 40, 60, 60, 60]);
+    }
+
+    #[test]
+    fn transient_failure_mid_run_backs_off_instead_of_ending() {
+        let mut s = running_session();
+        s.chat_tx
+            .send(reply_event(0, Err("Rate limited (HTTP 429).".into()), true))
+            .unwrap();
+        assert!(s.poll_chat());
+        s.end_agent();
+        assert!(s.is_running(), "a transient failure must not end the run");
+        assert!(s.retry_scheduled());
+        assert!(!s.retry_due(), "the retry waits out its backoff first");
+        assert!(s.retry_status().unwrap().contains("retrying in"));
+        assert!(
+            !s.messages.iter().any(|m| m.error),
+            "no error bubble while retrying"
+        );
+    }
+
+    #[test]
+    fn fatal_failure_ends_the_run_with_an_error() {
+        let mut s = running_session();
+        s.chat_tx
+            .send(reply_event(
+                0,
+                Err("Rejected: check your API key.".into()),
+                false,
+            ))
+            .unwrap();
+        assert!(s.poll_chat());
+        s.end_agent();
+        assert!(!s.is_running());
+        assert!(!s.retry_scheduled());
+        assert!(s.messages.last().unwrap().error);
+    }
+
+    #[test]
+    fn retries_give_up_after_the_consecutive_cap() {
+        let mut s = running_session();
+        s.retries = MAX_CONSECUTIVE_RETRIES;
+        s.chat_tx
+            .send(reply_event(0, Err("Overloaded.".into()), true))
+            .unwrap();
+        s.poll_chat();
+        s.end_agent();
+        assert!(!s.is_running());
+        assert!(s.messages.last().unwrap().error);
+    }
+
+    #[test]
+    fn success_resets_the_retry_count_and_never_caps_steps() {
+        let mut s = running_session();
+        s.retries = 3;
+        s.agent_steps = 10_000;
+        s.chat_tx
+            .send(reply_event(0, Ok("Done.".into()), false))
+            .unwrap();
+        s.poll_chat();
+        assert_eq!(s.retries, 0);
+        assert!(
+            s.should_continue(),
+            "no step limit: only Stop or finishing ends a run"
+        );
+    }
+
+    #[test]
+    fn stop_cancels_the_request_and_drops_its_late_reply() {
+        let mut s = running_session();
+        let cancel = s.cancel.clone();
+        s.request_stop();
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the worker is told to abandon the stream"
+        );
+        assert!(!s.is_pending());
+        assert!(!s.is_running());
+        assert!(!s.should_continue());
+        assert!(s.messages.last().unwrap().notice);
+        let before = s.messages.len();
+        s.chat_tx
+            .send(reply_event(0, Ok("late".into()), false))
+            .unwrap();
+        assert!(!s.poll_chat(), "a reply for a stopped request is stale");
+        assert_eq!(s.messages.len(), before);
+    }
+
+    #[test]
+    fn stop_also_cancels_a_scheduled_retry() {
+        let mut s = running_session();
+        s.pending = None;
+        s.retry_at = Some(Instant::now());
+        s.request_stop();
+        assert!(!s.retry_scheduled());
+        assert!(!s.retry_due());
+    }
+
+    #[test]
+    fn long_runs_trim_old_turns_but_keep_what_the_user_typed() {
+        let mut msgs = vec![ChatMessage::user("GOAL: build an 8-bit ALU".into())];
+        for i in 0..50 {
+            msgs.push(ChatMessage::reply(format!("step {i}"), None));
+            msgs.push(ChatMessage::auto(format!("check {i}")));
+        }
+        msgs.push(ChatMessage::failure("boom".into()));
+        msgs.push(ChatMessage::notice("Stopped.".into()));
+        let (turns, trimmed) = history_turns(&msgs);
+        assert!(trimmed);
+        assert!(turns.len() <= HISTORY_TAIL + 1);
+        assert_eq!(turns[0].content, "GOAL: build an 8-bit ALU");
+        // Only the newest auto-check survives; errors and notices are never sent.
+        let autos: Vec<_> = turns
+            .iter()
+            .filter(|t| t.content.starts_with("check"))
+            .collect();
+        assert_eq!(autos.len(), 1);
+        assert_eq!(autos[0].content, "check 49");
+        assert!(!turns
+            .iter()
+            .any(|t| t.content == "boom" || t.content == "Stopped."));
+        assert_eq!(turns.last().unwrap().content, "check 49");
+    }
+
+    #[test]
+    fn short_conversations_are_sent_whole() {
+        let msgs = vec![
+            ChatMessage::user("hi".into()),
+            ChatMessage::reply("hello".into(), None),
+        ];
+        let (turns, trimmed) = history_turns(&msgs);
+        assert!(!trimmed);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].role, "assistant");
+    }
 }

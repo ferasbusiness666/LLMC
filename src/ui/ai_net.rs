@@ -8,7 +8,9 @@
 //! JSON body.
 
 use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// A result handed back to the UI thread from a worker.
@@ -51,6 +53,9 @@ pub struct ChatRequest {
     pub api_key: String,
     pub model: String,
     pub turns: Vec<ChatTurn>,
+    /// Raised by the UI's Stop: the worker abandons the stream at the next chunk, so a stopped
+    /// run stops consuming tokens (and rate-limit budget) right away.
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// A chat event handed back to the UI thread, tagged with the request `token` so it lands in
@@ -64,11 +69,42 @@ pub enum ChatEvent {
         content: String,
     },
     /// The stream finished (or a non-streaming reply / an error arrived). `result` is the full
-    /// reply text (reasoning folded into `<think>` tags) or a short error message.
+    /// reply text (reasoning folded into `<think>` tags) or a short error message; `retryable`
+    /// marks failures that may succeed if simply tried again later (rate limits, overloaded
+    /// providers, dropped or stalled connections), which the agent retries on its own.
     Reply {
         token: u64,
         result: Result<String, String>,
+        retryable: bool,
     },
+}
+
+/// Why a chat request failed, and whether trying again later could succeed.
+struct ChatFailure {
+    message: String,
+    retryable: bool,
+}
+
+impl ChatFailure {
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    /// Classify a provider-supplied error message by its wording.
+    fn from_message(message: String) -> Self {
+        let retryable = looks_transient(&message);
+        Self { message, retryable }
+    }
 }
 
 /// Run one chat completion on a background thread, streaming tokens to `tx` as they arrive and
@@ -76,33 +112,44 @@ pub enum ChatEvent {
 pub fn spawn_chat(tx: Sender<ChatEvent>, token: u64, req: ChatRequest) {
     std::thread::spawn(move || {
         super::ai_log::request(&req);
-        let result = stream_chat(&tx, token, &req);
+        let (result, retryable) = match stream_chat(&tx, token, &req) {
+            Ok(text) => (Ok(text), false),
+            Err(f) => (Err(f.message), f.retryable),
+        };
         super::ai_log::reply(&req, &result);
-        let _ = tx.send(ChatEvent::Reply { token, result });
+        let _ = tx.send(ChatEvent::Reply {
+            token,
+            result,
+            retryable,
+        });
     });
 }
 
-/// Chat agent: NO overall deadline — a long generation may legitimately stream for many
-/// minutes (big circuits are hundreds of commands). Instead, an IDLE timeout per socket read:
-/// the request fails only if the provider goes completely silent, never because a healthy
-/// stream is taking a while.
+/// Chat agent: NO overall deadline — a generation may legitimately stream for as long as it
+/// needs (big circuits are hundreds of commands). The only limit is a very generous IDLE
+/// timeout per socket read: a provider that sends absolutely nothing — not even a keep-alive —
+/// for 10 minutes is treated as dead (and, in a run, retried rather than ending it).
 fn chat_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(120))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(600))
         .build()
 }
 
 /// POST an OpenAI-compatible chat completion with `stream: true`, forwarding each token to `tx`
 /// via [`ChatEvent::Delta`] and returning the full reply text. Providers that don't stream
 /// (respond with a normal JSON body) are handled transparently.
-fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<String, String> {
+fn stream_chat(
+    tx: &Sender<ChatEvent>,
+    token: u64,
+    req: &ChatRequest,
+) -> Result<String, ChatFailure> {
     let base = req.base_url.trim().trim_end_matches('/');
     if base.is_empty() {
-        return Err("No base URL for the selected provider.".to_string());
+        return Err(ChatFailure::fatal("No base URL for the selected provider."));
     }
     if req.api_key.trim().is_empty() {
-        return Err("No API key for the selected provider.".to_string());
+        return Err(ChatFailure::fatal("No API key for the selected provider."));
     }
     let messages: Vec<serde_json::Value> = req
         .turns
@@ -123,14 +170,14 @@ fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<
         .set("Authorization", &format!("Bearer {}", req.api_key.trim()))
         .set("Accept", "text/event-stream")
         .send_json(body)
-        .map_err(describe_error)?;
+        .map_err(describe_chat_error)?;
 
     // Some providers ignore `stream: true` (or don't support it) and return a normal JSON body.
     if !resp.content_type().contains("event-stream") {
         let value: serde_json::Value = resp
             .into_json()
-            .map_err(|e| format!("Unexpected response: {e}"))?;
-        return parse_chat_reply(&value);
+            .map_err(|e| ChatFailure::transient(format!("Unexpected response: {e}")))?;
+        return parse_chat_reply(&value).map_err(ChatFailure::from_message);
     }
 
     // Server-Sent Events: `data: {json}` lines, terminated by `data: [DONE]`. Each chunk carries
@@ -139,6 +186,10 @@ fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<
     let mut content = String::new();
     let mut reasoning = String::new();
     for line in reader.lines() {
+        // Stop pressed: abandon the stream now (the UI already discarded this request).
+        if req.cancel.load(Ordering::Relaxed) {
+            return Err(ChatFailure::fatal("Stopped."));
+        }
         let line = match line {
             Ok(l) => l,
             Err(e) => {
@@ -156,12 +207,11 @@ fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 );
-                return Err(if stalled {
-                    "The stream stalled (no data for 2 minutes). Retry, or try another model."
-                        .to_string()
+                return Err(ChatFailure::transient(if stalled {
+                    "The provider stopped responding (no data for 10 minutes).".to_string()
                 } else {
-                    format!("Stream error: {e}")
-                });
+                    format!("Connection dropped: {e}")
+                }));
             }
         };
         let Some(data) = line.trim().strip_prefix("data:") else {
@@ -182,7 +232,7 @@ fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("stream error");
-            return Err(truncate(msg));
+            return Err(ChatFailure::from_message(truncate(msg)));
         }
         let Some(delta) = v
             .get("choices")
@@ -220,7 +270,9 @@ fn stream_chat(tx: &Sender<ChatEvent>, token: u64, req: &ChatRequest) -> Result<
     }
 
     if content.trim().is_empty() && reasoning.trim().is_empty() {
-        return Err("The provider returned an empty reply.".to_string());
+        return Err(ChatFailure::transient(
+            "The provider returned an empty reply.",
+        ));
     }
     // Fold a separate reasoning stream into `<think>` tags so the reply parser handles both
     // streaming styles uniformly.
@@ -337,21 +389,59 @@ fn parse_models(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// The model-list fetch's error text (the chat path uses the classified [`describe_chat_error`]).
 fn describe_error(e: ureq::Error) -> String {
+    describe_chat_error(e).message
+}
+
+/// Turn an HTTP/transport failure into a message plus a retry verdict. Rate limits, timeouts,
+/// server-side (5xx) failures and dropped connections are worth trying again later; client
+/// errors (bad key, unknown model, oversized request) are not.
+fn describe_chat_error(e: ureq::Error) -> ChatFailure {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
             let detail = extract_message(&body);
-            match code {
+            let message = match code {
                 401 | 403 => format!("Rejected (HTTP {code}) — check the API key."),
-                404 => format!("Not found (HTTP {code}) — check the base URL."),
-                429 => "Rate limited (HTTP 429) — try again shortly.".to_string(),
+                404 => format!("Not found (HTTP {code}) — check the base URL or model name."),
+                429 => "Rate limited (HTTP 429).".to_string(),
                 _ if !detail.is_empty() => format!("HTTP {code}: {detail}"),
                 _ => format!("HTTP {code}."),
-            }
+            };
+            let retryable = matches!(code, 408 | 425 | 429)
+                || code >= 500
+                || (code >= 400 && looks_transient(&detail));
+            ChatFailure { message, retryable }
         }
-        ureq::Error::Transport(t) => format!("Network error: {t}"),
+        ureq::Error::Transport(t) => ChatFailure::transient(format!("Network error: {t}")),
     }
+}
+
+/// Does a provider's error wording describe a temporary condition (overload, rate limit,
+/// timeout) rather than a problem with the request itself?
+fn looks_transient(message: &str) -> bool {
+    let m = message.to_lowercase();
+    [
+        "rate limit",
+        "rate-limit",
+        "ratelimit",
+        "too many requests",
+        "overload",
+        "capacity",
+        "temporar",
+        "unavailable",
+        "try again",
+        "timeout",
+        "timed out",
+        "busy",
+        "server error",
+        "internal error",
+        "upstream",
+        "empty reply",
+    ]
+    .iter()
+    .any(|w| m.contains(w))
 }
 
 /// Pull a human-readable message out of a JSON error body, else the first line of text.
@@ -440,5 +530,24 @@ mod tests {
     fn chat_reply_empty_is_error() {
         let v = serde_json::json!({ "choices": [] });
         assert!(parse_chat_reply(&v).is_err());
+    }
+
+    #[test]
+    fn transient_errors_are_recognized() {
+        for m in [
+            "Rate limit reached for model",
+            "The server is overloaded, try again later",
+            "Service Unavailable",
+            "upstream connect error",
+        ] {
+            assert!(looks_transient(m), "{m}");
+        }
+        for m in [
+            "Invalid API Key",
+            "model not found",
+            "context length exceeded",
+        ] {
+            assert!(!looks_transient(m), "{m}");
+        }
     }
 }

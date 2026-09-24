@@ -1540,8 +1540,11 @@ impl Document {
     // ----- keyboard -----
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, clipboard: &mut Option<Clipboard>) {
-        // While the chip dialog is open its text field owns the keyboard.
-        if self.show_chip_dialog {
+        // Whenever ANY text field has keyboard focus — the assistant's chat box, the model
+        // filter, API-key fields, the rename / properties / chip dialogs — keystrokes belong to
+        // that field. Canvas shortcuts must not fire, or typing Backspace in the chat deletes the
+        // selected blocks, Ctrl+Z undoes the circuit, "r" rotates, Space arms panning, etc.
+        if self.show_chip_dialog || ctx.text_edit_focused() {
             self.space_down = false;
             return;
         }
@@ -1605,88 +1608,97 @@ impl Document {
             .resizable(false)
             .exact_size(152.0)
             .show(ui, |ui| {
-                ui.add_space(6.0);
-                if ui
-                    .selectable_label(matches!(self.tool, Tool::Select), "  Select")
-                    .clicked()
-                {
-                    self.tool = Tool::Select;
-                }
-                ui.separator();
-                self.palette_section(
-                    ui,
-                    "INPUTS",
-                    &[
-                        BlockType::Switch,
-                        BlockType::Button,
-                        BlockType::ConstantHigh,
-                        BlockType::ConstantLow,
-                        BlockType::Clock,
-                    ],
-                );
-                self.palette_section(ui, "OUTPUT", &[BlockType::Led]);
-                self.palette_section(
-                    ui,
-                    "GATES",
-                    &[
-                        BlockType::And,
-                        BlockType::Or,
-                        BlockType::Not,
-                        BlockType::Nand,
-                        BlockType::Nor,
-                        BlockType::Xor,
-                        BlockType::Xnor,
-                        BlockType::Buffer,
-                    ],
-                );
-
-                let chips: Vec<(ChipId, String)> = self
-                    .manager
-                    .chips
-                    .iter()
-                    .map(|c| (c.id, c.name.clone()))
-                    .collect();
-                if !chips.is_empty() {
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("CHIPS").small().color(self.theme().label_dim));
-                        ui.label(
-                            RichText::new("(right-click)")
-                                .small()
-                                .color(self.theme().label_dim),
-                        );
-                    });
-                    for (id, name) in chips {
-                        let selected =
-                            matches!(self.tool, Tool::Place(BlockType::Chip(cid)) if cid == id);
-                        let resp = ui.selectable_label(selected, format!("  {name}"));
-                        if resp.clicked() {
-                            self.tool = Tool::Place(BlockType::Chip(id));
-                        }
-                        resp.context_menu(|ui| {
-                            if ui.button("Place").clicked() {
-                                self.tool = Tool::Place(BlockType::Chip(id));
-                                ui.close();
-                            }
-                            if ui.button("Edit\u{2026}").clicked() {
-                                // Opens in a NEW tab (handled by the app), so the circuit
-                                // being worked on stays right where it is.
-                                self.request_chip_edit = Some(id);
-                                ui.close();
-                            }
-                            if ui.button("Rename\u{2026}").clicked() {
-                                self.rename_chip = Some((id, name.clone()));
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button("Delete").clicked() {
-                                self.delete_chip(id);
-                                ui.close();
-                            }
-                        });
-                    }
-                }
+                // Scrolls: the built-ins plus a growing chip library (the assistant defines chips
+                // freely) easily exceed the window height, and without this the rest were simply
+                // unreachable below the bottom edge.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.palette_contents(ui));
             });
+    }
+
+    fn palette_contents(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        if ui
+            .selectable_label(matches!(self.tool, Tool::Select), "  Select")
+            .clicked()
+        {
+            self.tool = Tool::Select;
+        }
+        ui.separator();
+        self.palette_section(
+            ui,
+            "INPUTS",
+            &[
+                BlockType::Switch,
+                BlockType::Button,
+                BlockType::ConstantHigh,
+                BlockType::ConstantLow,
+                BlockType::Clock,
+            ],
+        );
+        self.palette_section(ui, "OUTPUT", &[BlockType::Led]);
+        self.palette_section(
+            ui,
+            "GATES",
+            &[
+                BlockType::And,
+                BlockType::Or,
+                BlockType::Not,
+                BlockType::Nand,
+                BlockType::Nor,
+                BlockType::Xor,
+                BlockType::Xnor,
+                BlockType::Buffer,
+            ],
+        );
+
+        let chips: Vec<(ChipId, String)> = self
+            .manager
+            .chips
+            .iter()
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+        if !chips.is_empty() {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("CHIPS").small().color(self.theme().label_dim));
+                ui.label(
+                    RichText::new("(right-click)")
+                        .small()
+                        .color(self.theme().label_dim),
+                );
+            });
+            for (id, name) in chips {
+                let selected = matches!(self.tool, Tool::Place(BlockType::Chip(cid)) if cid == id);
+                let resp = ui.selectable_label(selected, format!("  {name}"));
+                if resp.clicked() {
+                    self.tool = Tool::Place(BlockType::Chip(id));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("Place").clicked() {
+                        self.tool = Tool::Place(BlockType::Chip(id));
+                        ui.close();
+                    }
+                    if ui.button("Edit\u{2026}").clicked() {
+                        // Opens in a NEW tab (handled by the app), so the circuit
+                        // being worked on stays right where it is.
+                        self.request_chip_edit = Some(id);
+                        ui.close();
+                    }
+                    if ui.button("Rename\u{2026}").clicked() {
+                        self.rename_chip = Some((id, name.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Delete").clicked() {
+                        self.delete_chip(id);
+                        ui.close();
+                    }
+                });
+            }
+        }
+        ui.add_space(8.0);
     }
 
     fn palette_section(&mut self, ui: &mut egui::Ui, title: &str, items: &[BlockType]) {
@@ -3276,10 +3288,13 @@ impl eframe::App for LlmcApp {
         //
         // In agent mode the assistant iterates on its own: after applying its edits we hand it an
         // automatic "auto-check" (the circuit's actual truth table + any problems) and dispatch
-        // the next step, until it replies with no edits (done), the user hits Stop, or the step
-        // cap is reached.
+        // the next step, until it replies with no edits (done) or the user hits Stop. There is
+        // deliberately no step or time limit: a long build can run for as long as it needs.
+        // Transient provider failures (rate limits, overload, dropped connections) don't end the
+        // run either — the session schedules an automatic retry with backoff, dispatched here.
         let ai_settings = &self.ai;
         let mut any_pending = false;
+        let mut any_waiting = false;
         for doc in &mut self.docs {
             let reply = doc.ai.poll_chat();
             if let Some(ops) = doc.ai.take_pending_ops() {
@@ -3291,20 +3306,30 @@ impl eframe::App for LlmcApp {
                 // results) BEFORE the activity list is handed to the chat view.
                 let feedback = doc.agent_observation(&report);
                 doc.ai.attach_edit_result(report.activity, report.errors);
-                if doc.ai.should_continue_or_note() {
+                if doc.ai.should_continue() {
                     let prompt = doc.assistant_system_prompt();
                     doc.ai.continue_agent(ai_settings, prompt, feedback);
                 } else {
                     doc.ai.end_agent();
                 }
             } else if reply {
-                // A reply with no edits ends the run (final answer, or an error).
+                // A reply with no edits ends the run (final answer, or an error) — unless a
+                // retry was just scheduled, which `end_agent` leaves running.
                 doc.ai.end_agent();
             }
+            if doc.ai.retry_due() {
+                // Re-send against the circuit as it is NOW, not as it was when the call failed.
+                let prompt = doc.assistant_system_prompt();
+                doc.ai.retry_now(ai_settings, prompt);
+            }
             any_pending |= doc.ai.is_pending();
+            any_waiting |= doc.ai.retry_scheduled();
         }
         if any_pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
+        } else if any_waiting {
+            // Keep the retry countdown ticking and wake up in time to dispatch it.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         // Persist provider config (never keys) when it changed.
         if self.ai.take_dirty() {
