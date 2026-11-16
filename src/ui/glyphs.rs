@@ -226,8 +226,7 @@ fn build_shape(fam: Family, bubble: bool, inputs: usize, h: f32) -> GateShape {
     let n = 24;
     let mut pts: Vec<Vec2f> = Vec::new();
     let mut extra_back = None;
-    let back_x: Box<dyn Fn(f32) -> f32>;
-    match fam {
+    let back_x: Box<dyn Fn(f32) -> f32> = match fam {
         Family::And => {
             let xm = X0 + 0.32;
             let rx = tip - xm;
@@ -240,7 +239,7 @@ fn build_shape(fam: Family, bubble: bool, inputs: usize, h: f32) -> GateShape {
             }
             pts.push(Vec2f::new(xm, bot));
             pts.push(Vec2f::new(X0, bot));
-            back_x = Box::new(|_| X0);
+            Box::new(|_| X0)
         }
         Family::Or | Family::Xor => {
             let shift = if fam == Family::Xor { 0.14 } else { 0.0 };
@@ -287,22 +286,22 @@ fn build_shape(fam: Family, bubble: bool, inputs: usize, h: f32) -> GateShape {
             }
             // Stubs end at the outermost back curve (XOR's detached one, else the body's).
             let back_ref = if fam == Family::Xor { X0 - 0.02 } else { X0 };
-            back_x = Box::new(move |y: f32| {
+            Box::new(move |y: f32| {
                 if y <= top || y >= bot {
                     back_ref
                 } else {
                     let sft = (y - top) / bh;
                     back_ref + bulge * (std::f32::consts::PI * sft).sin()
                 }
-            });
+            })
         }
         Family::Buf => {
             pts.push(Vec2f::new(X0, top));
             pts.push(Vec2f::new(tip, mid));
             pts.push(Vec2f::new(X0, bot));
-            back_x = Box::new(|_| X0);
+            Box::new(|_| X0)
         }
-    }
+    };
     let tris = triangulate(&pts);
     // Input positions follow the model's layout: variable gates have inputs at y = i + 0.5,
     // single-input gates at y = 1.
