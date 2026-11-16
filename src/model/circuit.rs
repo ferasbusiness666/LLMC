@@ -49,6 +49,20 @@ impl Circuit {
         self.blocks.insert(block.id, block);
     }
 
+    /// Re-sync the id counters with the stored blocks/wires (a hand-written or damaged file may
+    /// omit them, and a stale counter would hand out an id that is already taken).
+    pub(crate) fn fix_counters(&mut self) {
+        let max_block = self.blocks.keys().map(|id| id.0 + 1).max().unwrap_or(0);
+        let max_conn = self
+            .connections
+            .keys()
+            .map(|id| id.0 + 1)
+            .max()
+            .unwrap_or(0);
+        self.next_block = self.next_block.max(max_block);
+        self.next_conn = self.next_conn.max(max_conn);
+    }
+
     pub fn insert_connection(&mut self, conn: Connection) {
         self.next_conn = self.next_conn.max(conn.id.0 + 1);
         self.connections.insert(conn.id, conn);

@@ -3,7 +3,7 @@
 //! command layer in `llmc::backend`; the canvas (see `canvas.rs`) only decides *what* to do.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
@@ -179,6 +179,20 @@ pub struct Document {
     pub notices: Vec<Notice>,
     /// Successive pastes offset from each other.
     paste_count: i32,
+    /// Blocks the assistant just built or pointed at: a fading halo on the canvas (they are no
+    /// longer selected, so a stray Backspace can't delete what it built).
+    pub glow: Option<Glow>,
+    /// Blocks the assistant created in this tab (it may freely change those; the user's own
+    /// blocks are protected unless the request asks for changes).
+    pub ai_blocks: HashSet<BlockId>,
+}
+
+/// A temporary highlight drawn around some blocks.
+pub struct Glow {
+    pub blocks: Vec<BlockId>,
+    pub note: Option<String>,
+    pub since: std::time::Instant,
+    pub duration: f32,
 }
 
 impl Document {
@@ -220,6 +234,8 @@ impl Document {
             props_series: 1,
             notices: Vec::new(),
             paste_count: 0,
+            glow: None,
+            ai_blocks: HashSet::new(),
         };
         // The loaded/empty content is the "saved" baseline. A document opens paused — and paused
         // means frozen, so nothing is evaluated until Run or Step.
@@ -233,7 +249,10 @@ impl Document {
     }
 
     pub fn from_project(project: Project, path: PathBuf) -> Self {
-        let manager = CircuitManager::from_parts(project.circuit, project.chips);
+        let (mut circuit, mut chips) = (project.circuit, project.chips);
+        // Make a damaged or hand-edited file consistent before anything touches it.
+        let repairs = llmc::model::repair_project(&mut circuit, &mut chips);
+        let manager = CircuitManager::from_parts(circuit, chips);
         let camera = Camera {
             pan: Vec2::new(project.camera.pan_x, project.camera.pan_y),
             zoom: project.camera.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
@@ -241,6 +260,18 @@ impl Document {
         let title = title_from_path(&path);
         let mut doc = Self::new(manager, Some(path), title, camera);
         doc.ai.restore(&project.chat);
+        if !repairs.is_empty() {
+            doc.notify(
+                NoticeKind::Warning,
+                format!(
+                    "This file had problems that were fixed: {}. Save to keep the repaired version.",
+                    repairs.join("; ")
+                ),
+            );
+            // The repaired content differs from the file on disk.
+            doc.saved_fingerprint = doc.saved_fingerprint.wrapping_add(1);
+            doc.fingerprint_rev = u64::MAX;
+        }
         if project.camera.zoom <= 0.0 || !project.camera.pan_x.is_finite() {
             doc.frame_request = Some(FrameRequest::All);
         }
@@ -385,12 +416,19 @@ impl Document {
         // skips them.
         self.sync_sim();
         if persist {
+            // Flipping an input is using the circuit, not editing it: a clean file stays clean
+            // (the level is still written on the next save).
+            self.refresh_dirty();
+            let was_clean = !self.dirty;
             if let Some(b) = self.manager.circuit.block_mut(id) {
                 b.state = level;
             }
             self.manager.touch();
             // The sim is updated directly; no recompile needed for a level change.
             self.sim_rev = self.manager.revision();
+            if was_clean {
+                self.mark_saved();
+            }
         }
         self.sim.set_switch(id, level);
         if self.running {
@@ -750,25 +788,53 @@ impl Document {
     // ----- assistant -----
 
     pub fn system_prompt(&self) -> String {
-        ai::system_prompt(&self.manager)
+        let selected: Vec<BlockId> = self.selection.iter().copied().collect();
+        ai::system_prompt(&self.manager, &selected)
     }
 
-    /// Apply the assistant's commands (one undo step), select what it created, and make sure
-    /// it's in view.
-    pub fn apply_ai_ops(&mut self, ops: Vec<RawOp>) -> ApplyReport {
-        let report = ai::apply_ops(&mut self.manager, ops);
+    /// Apply the assistant's commands (one undo step), make what it built glow, and make sure
+    /// it's in view. `allow_changes` says whether the user's request asked to change existing
+    /// work; if not, blocks the user placed are protected from deletion.
+    pub fn apply_ai_ops(&mut self, ops: Vec<RawOp>, allow_changes: bool) -> ApplyReport {
+        let opts = ai::ApplyOptions {
+            protected: if allow_changes {
+                HashSet::new()
+            } else {
+                self.manager
+                    .circuit
+                    .iter_blocks()
+                    .map(|b| b.id)
+                    .filter(|id| !self.ai_blocks.contains(id))
+                    .collect()
+            },
+        };
+        let report = ai::apply_ops_with(&mut self.manager, ops, &opts);
+        self.ai_blocks.extend(report.new_blocks.iter().copied());
         if report.changed {
             self.after_edit();
-            if !report.new_blocks.is_empty() {
-                self.selection = report.new_blocks.iter().copied().collect();
-                self.selected_conns.clear();
-                self.frame_request = Some(FrameRequest::IfOffscreen(report.new_blocks.clone()));
-            }
+        }
+        let (blocks, note, duration) = if !report.highlight.is_empty() {
+            (report.highlight.clone(), report.highlight_note.clone(), 9.0)
+        } else {
+            (report.new_blocks.clone(), None, 3.5)
+        };
+        if !blocks.is_empty() {
+            // What it built is NOT selected (a Backspace meant for the chat must never delete
+            // it); it glows for a moment instead.
+            self.selection
+                .retain(|id| self.manager.circuit.block(*id).is_some());
+            self.frame_request = Some(FrameRequest::IfOffscreen(blocks.clone()));
+            self.glow = Some(Glow {
+                blocks,
+                note,
+                since: std::time::Instant::now(),
+                duration,
+            });
         }
         report
     }
 
-    pub fn agent_observation(&self, report: &ApplyReport) -> String {
+    pub fn agent_observation(&self, report: &ApplyReport) -> ai::Observation {
         ai::agent_observation(&self.manager, report)
     }
 
@@ -1002,26 +1068,93 @@ mod tests {
     }
 
     #[test]
-    fn ai_edits_select_and_frame_new_blocks() {
+    fn ai_edits_glow_and_frame_new_blocks_without_selecting_them() {
         let mut d = doc();
         let ops = llmc::ai::parse_reply(
             r#"{"commands":[{"op":"add","ref":"g","kind":"and","x":500,"y":500}]}"#,
         )
         .ops;
-        let r = d.apply_ai_ops(ops);
+        let r = d.apply_ai_ops(ops, false);
         assert!(r.changed);
-        assert_eq!(d.selection.len(), 1);
+        assert!(
+            d.selection.is_empty(),
+            "a Backspace meant for the chat can't delete what the AI built"
+        );
+        assert_eq!(d.glow.as_ref().unwrap().blocks, r.new_blocks);
         assert!(matches!(
             d.frame_request,
             Some(FrameRequest::IfOffscreen(_))
         ));
         d.resolve_frame_request();
-        let g = *d.selection.iter().next().unwrap();
+        let g = r.new_blocks[0];
         let b = d.manager.circuit.block(g).unwrap();
         let p = d.camera.to_screen(b.pos.as_vec(), d.canvas_rect.min);
         assert!(
             d.canvas_rect.contains(p),
             "the new block was brought into view"
         );
+    }
+
+    #[test]
+    fn flipping_a_switch_does_not_mark_a_clean_file_unsaved() {
+        let mut d = doc();
+        let s = d.manager.add_block(BlockType::Switch, Pos::new(0, 0));
+        d.mark_saved();
+        d.set_input(s, true, true);
+        d.refresh_dirty();
+        assert!(!d.is_dirty());
+        assert!(
+            d.manager.circuit.block(s).unwrap().state,
+            "the level is still saved"
+        );
+    }
+
+    #[test]
+    fn the_assistant_cannot_delete_the_users_blocks_unasked() {
+        let mut d = doc();
+        let mine = d.manager.add_block(BlockType::Not, Pos::new(0, 0));
+        let ops = |j: &str| llmc::ai::parse_reply(j).ops;
+        let r = d.apply_ai_ops(ops(r#"{"commands":[{"op":"remove","target":"0"}]}"#), false);
+        assert!(d.manager.circuit.block(mine).is_some());
+        assert_eq!(r.errors.len(), 1);
+        // Its own blocks it may remove.
+        let r = d.apply_ai_ops(
+            ops(r#"{"commands":[{"op":"add","ref":"x","kind":"or"}]}"#),
+            false,
+        );
+        let theirs = r.new_blocks[0];
+        d.apply_ai_ops(
+            ops(&format!(
+                r#"{{"commands":[{{"op":"remove","target":"{theirs}"}}]}}"#
+            )),
+            false,
+        );
+        assert!(d.manager.circuit.block(theirs).is_none());
+        // When the user asked for changes, theirs can go too.
+        d.apply_ai_ops(ops(r#"{"commands":[{"op":"remove","target":"0"}]}"#), true);
+        assert!(d.manager.circuit.block(mine).is_none());
+    }
+
+    #[test]
+    fn damaged_files_are_repaired_and_flagged() {
+        let mut c = llmc::model::Circuit::new("x");
+        let a = c.allocate_block_id();
+        c.insert_block(llmc::model::Block::new(
+            a,
+            BlockType::Switch,
+            Pos::new(0, 0),
+        ));
+        let cid = c.allocate_conn_id();
+        c.insert_connection(llmc::model::Connection {
+            id: cid,
+            from: llmc::model::Port::output(a, 0),
+            to: llmc::model::Port::input(llmc::model::BlockId(77), 0),
+        });
+        let p = Project::new(c, Default::default(), Default::default());
+        let mut d = Document::from_project(p, PathBuf::from("x.llmc"));
+        assert!(d.manager.circuit.connections.is_empty());
+        d.refresh_dirty();
+        assert!(d.is_dirty(), "the repaired version isn't on disk yet");
+        assert!(matches!(d.notices[0].kind, NoticeKind::Warning));
     }
 }

@@ -454,8 +454,8 @@ fn draw_gate_shape(p: &egui::Painter, pl: &Placement, s: &BlockStyle) {
     for &pt in &screen {
         mesh.colored_vertex(pt, fill);
     }
-    for tri in shape.tris.chunks_exact(3) {
-        mesh.add_triangle(tri[0], tri[1], tri[2]);
+    for &[a, b, c] in shape.tris.as_chunks::<3>().0 {
+        mesh.add_triangle(a, b, c);
     }
     p.add(egui::Shape::mesh(mesh));
     p.add(egui::Shape::closed_line(

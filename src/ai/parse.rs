@@ -85,6 +85,31 @@ pub enum RawOp {
     Test {
         steps: Vec<TestStep>,
     },
+    /// Remove wires between two blocks (one port pair, or every wire from `from` to `to`).
+    Disconnect {
+        from: String,
+        from_port: Option<PortSel>,
+        to: String,
+        to_port: Option<PortSel>,
+    },
+    /// Read-only: report blocks' current pin values and what drives each input.
+    Inspect {
+        targets: Vec<String>,
+    },
+    /// Read-only: walk back from a block through everything that feeds it, with live values
+    /// ("why is CARRY off?").
+    Trace {
+        target: String,
+    },
+    /// Point at blocks on the canvas (no edit) — used when explaining a circuit.
+    Highlight {
+        targets: Vec<String>,
+        note: Option<String>,
+    },
+    /// Delete a chip definition (and every placed instance of it).
+    DeleteChip {
+        name: String,
+    },
 }
 
 /// One step of a scripted test.
@@ -98,6 +123,8 @@ pub struct TestStep {
     pub wait: Option<f64>,
     /// Number of clock edges (transitions of the fastest clock) to advance.
     pub ticks: Option<u32>,
+    /// LED levels this step should end with; mismatches are reported as failures.
+    pub expect: Vec<(String, bool)>,
 }
 
 /// A parsed assistant reply: the reasoning (if any), the prose to show, and edit ops.
@@ -106,16 +133,20 @@ pub struct ParsedReply {
     pub thinking: Option<String>,
     pub text: String,
     pub ops: Vec<RawOp>,
+    /// Commands that were present but couldn't be read (unknown op, missing field, broken
+    /// JSON) — fed back to the model instead of failing silently.
+    pub problems: Vec<String>,
 }
 
 /// Split reasoning, strip the command block, and parse it into ops.
 pub fn parse_reply(raw: &str) -> ParsedReply {
     let (thinking, body) = split_reasoning(raw);
-    let (ops, text) = extract_ops(&body);
+    let (ops, text, problems) = extract_ops(&body);
     ParsedReply {
         thinking,
         text,
         ops,
+        problems,
     }
 }
 
@@ -246,30 +277,47 @@ fn split_reasoning(raw: &str) -> (Option<String>, String) {
 /// Tolerant on purpose: many models emit "JSONC" — `//` comments, trailing commas, or a reply
 /// that got truncated mid-array. We first try the located command block (sanitized), then, if
 /// that yields nothing, recover individual `{"op":…}` objects wherever they appear.
-fn extract_ops(body: &str) -> (Vec<RawOp>, String) {
+fn extract_ops(body: &str) -> (Vec<RawOp>, String, Vec<String>) {
     if let Some((json, rest)) = find_command_json(body) {
-        let ops = ops_from_text(&json);
+        let (ops, mut problems) = ops_from_text(&json);
         if !ops.is_empty() {
-            return (ops, rest.trim().to_string());
+            return (ops, rest.trim().to_string(), problems);
         }
+        if problems.is_empty() {
+            let detail = serde_json::from_str::<serde_json::Value>(&sanitize_json(&json))
+                .err()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
+            problems.push(format!(
+                "your command block could not be read as JSON{detail} \u{2014} nothing was \
+                 applied; resend it as strict JSON"
+            ));
+        }
+        // Keep the prose; the broken block isn't shown.
+        let fallback = ops_from_text(body).0;
+        if !fallback.is_empty() {
+            return (fallback, rest.trim().to_string(), Vec::new());
+        }
+        return (Vec::new(), rest.trim().to_string(), problems);
     }
     // No usable block was located (missing fence, etc.) — scan the whole reply for loose op
     // objects and, if any are found, trim the JSON-ish tail from what we display.
-    let ops = ops_from_text(body);
+    let (ops, problems) = ops_from_text(body);
     if !ops.is_empty() {
         let cut = body
             .find("```")
             .or_else(|| body.find("{\""))
             .unwrap_or(body.len());
-        return (ops, body[..cut].trim().to_string());
+        return (ops, body[..cut].trim().to_string(), problems);
     }
-    (Vec::new(), body.trim().to_string())
+    (Vec::new(), body.trim().to_string(), Vec::new())
 }
 
 /// Parse ops from a chunk of text that should contain a command block. First tries the whole
 /// thing as JSON (after stripping comments / trailing commas), then falls back to scanning for
 /// individual op objects so a malformed or truncated array still yields its valid commands.
-fn ops_from_text(region: &str) -> Vec<RawOp> {
+/// Also returns a note for every command that was present but unreadable.
+fn ops_from_text(region: &str) -> (Vec<RawOp>, Vec<String>) {
     let sanitized = sanitize_json(region);
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sanitized) {
         if let Some(arr) = val
@@ -277,14 +325,102 @@ fn ops_from_text(region: &str) -> Vec<RawOp> {
             .and_then(|c| c.as_array())
             .or_else(|| val.as_array())
         {
-            let ops: Vec<RawOp> = arr.iter().filter_map(parse_op).collect();
-            if !ops.is_empty() {
-                return ops;
+            let mut ops = Vec::new();
+            let mut problems = Vec::new();
+            for (i, item) in arr.iter().enumerate() {
+                match parse_op(item) {
+                    Some(op) => ops.push(op),
+                    None => problems.push(describe_unreadable(i + 1, item)),
+                }
+            }
+            if !ops.is_empty() || !problems.is_empty() {
+                return (ops, problems);
             }
         }
     }
-    scan_op_objects(&sanitized)
+    (scan_op_objects(&sanitized), Vec::new())
 }
+
+/// Why command `n` couldn't be used, in words the model can act on.
+fn describe_unreadable(n: usize, v: &serde_json::Value) -> String {
+    let mut snippet = v.to_string();
+    if snippet.chars().count() > 90 {
+        snippet = format!("{}\u{2026}", snippet.chars().take(90).collect::<String>());
+    }
+    match v
+        .get("op")
+        .or_else(|| v.get("action"))
+        .and_then(|o| o.as_str())
+    {
+        None => format!("command {n} has no \"op\" field: {snippet}"),
+        Some(op) if !KNOWN_OPS.contains(&normalize(op).as_str()) => format!(
+            "command {n}: unknown op \"{op}\" (use add, connect, disconnect, set, remove, move, \
+             label, defchip, delete_chip, test, inspect, trace, highlight)"
+        ),
+        Some(op) => format!("command {n} (\"{op}\") is missing a required field: {snippet}"),
+    }
+}
+
+/// Every op spelling [`parse_op`] accepts (normalized).
+const KNOWN_OPS: &[&str] = &[
+    "add",
+    "addblock",
+    "place",
+    "create",
+    "new",
+    "instance",
+    "set",
+    "setprops",
+    "props",
+    "properties",
+    "configure",
+    "update",
+    "modify",
+    "connect",
+    "wire",
+    "addconnection",
+    "link",
+    "join",
+    "remove",
+    "removeblock",
+    "delete",
+    "deleteblock",
+    "erase",
+    "move",
+    "moveblock",
+    "reposition",
+    "label",
+    "setlabel",
+    "rename",
+    "defchip",
+    "definechip",
+    "chip",
+    "definecomponent",
+    "defmodule",
+    "test",
+    "simulate",
+    "run",
+    "check",
+    "verify",
+    "disconnect",
+    "unwire",
+    "removewire",
+    "deletewire",
+    "removeconnection",
+    "deleteconnection",
+    "inspect",
+    "probe",
+    "read",
+    "query",
+    "trace",
+    "why",
+    "highlight",
+    "point",
+    "show",
+    "focus",
+    "deletechip",
+    "removechip",
+];
 
 /// Recover ops by scanning for balanced `{…}` objects, parsing each independently. An object
 /// that parses as a single op (including a `defchip`, which legitimately contains an inner
@@ -677,14 +813,68 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
             }
             (!steps.is_empty()).then_some(RawOp::Test { steps })
         }
+        "disconnect" | "unwire" | "removewire" | "deletewire" | "removeconnection"
+        | "deleteconnection" => {
+            let from = v
+                .get("from")
+                .or_else(|| v.get("source"))
+                .and_then(as_handle)?;
+            let to = v
+                .get("to")
+                .or_else(|| v.get("target"))
+                .or_else(|| v.get("dest"))
+                .and_then(as_handle)?;
+            Some(RawOp::Disconnect {
+                from,
+                from_port: port_sel(v, &["from_port", "output", "out_port", "fromport"]),
+                to,
+                to_port: port_sel(v, &["to_port", "input", "in_port", "port", "toport"]),
+            })
+        }
+        "inspect" | "probe" | "read" | "query" => {
+            let targets = handle_list(v);
+            (!targets.is_empty()).then_some(RawOp::Inspect { targets })
+        }
+        "trace" | "why" => Some(RawOp::Trace {
+            target: target_handle(v)?,
+        }),
+        "highlight" | "point" | "show" | "focus" => {
+            let targets = handle_list(v);
+            (!targets.is_empty()).then(|| RawOp::Highlight {
+                targets,
+                note: v
+                    .get("note")
+                    .or_else(|| v.get("text"))
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string),
+            })
+        }
+        "deletechip" | "removechip" => Some(RawOp::DeleteChip {
+            name: v
+                .get("name")
+                .or_else(|| v.get("chip"))
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())?
+                .to_string(),
+        }),
         _ => None,
+    }
+}
+
+/// Block handles from `targets` (array or single), else a single `target`.
+fn handle_list(v: &serde_json::Value) -> Vec<String> {
+    match v.get("targets").or_else(|| v.get("blocks")) {
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(as_handle).collect(),
+        Some(one) => as_handle(one).into_iter().collect(),
+        None => target_handle(v).into_iter().collect(),
     }
 }
 
 /// One test step: `{"set":{…},"pulse":["CLK"],"wait":0.5,"ticks":2}` — or, for backwards
 /// compatibility, a bare `{"A":1,"B":0}` map of switch levels.
 fn test_step(step: &serde_json::Value) -> TestStep {
-    const KEYS: [&str; 4] = ["set", "pulse", "wait", "ticks"];
+    const KEYS: [&str; 6] = ["set", "pulse", "wait", "ticks", "expect", "assert"];
     let structured = step
         .as_object()
         .is_some_and(|o| o.keys().any(|k| KEYS.contains(&k.as_str())));
@@ -711,6 +901,11 @@ fn test_step(step: &serde_json::Value) -> TestStep {
             .or_else(|| step.get("tick"))
             .and_then(|t| t.as_u64())
             .map(|t| t.min(100_000) as u32),
+        expect: step
+            .get("expect")
+            .or_else(|| step.get("assert"))
+            .map(set_map)
+            .unwrap_or_default(),
     }
 }
 
@@ -1133,5 +1328,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unreadable_commands_are_reported_not_dropped_silently() {
+        let r = parse_reply(
+            "ok\n```json\n{\"commands\":[{\"op\":\"add\",\"kind\":\"and\"},{\"op\":\"nand3\"},{\"kind\":\"or\"}]}\n```",
+        );
+        assert_eq!(r.ops.len(), 1);
+        assert!(
+            r.problems[0].contains("unknown op \"nand3\""),
+            "{:?}",
+            r.problems
+        );
+        assert!(
+            r.problems[1].contains("no \"op\" field"),
+            "{:?}",
+            r.problems
+        );
+        let broken =
+            parse_reply("```json\n{\"commands\": [ {\"op\": \"add\", \"kind\" \"and\"} ]}\n```");
+        assert!(broken.ops.is_empty());
+        assert!(
+            broken.problems[0].contains("could not be read as JSON"),
+            "{:?}",
+            broken.problems
+        );
+    }
+
+    #[test]
+    fn new_ops_parse() {
+        let r = parse_reply(
+            r#"{"commands":[{"op":"disconnect","from":"a","to":"b","to_port":1},
+              {"op":"inspect","targets":["a",3]},{"op":"trace","target":"Y"},
+              {"op":"highlight","targets":"g","note":"n"},{"op":"delete_chip","name":"X"},
+              {"op":"test","steps":[{"set":{"A":1},"expect":{"Y":0}}]}]}"#,
+        );
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
+        assert_eq!(r.ops.len(), 6);
+        assert!(matches!(&r.ops[1], RawOp::Inspect { targets } if targets == &["a", "3"]));
+        match &r.ops[5] {
+            RawOp::Test { steps } => assert_eq!(steps[0].expect, vec![("Y".to_string(), false)]),
+            other => panic!("{other:?}"),
+        }
     }
 }

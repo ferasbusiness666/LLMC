@@ -158,6 +158,57 @@ fn bezier(p0: Pos2, p1: Pos2, d0: Vec2, d1: Vec2, zoom: f32) -> Vec<Pos2> {
         .collect()
 }
 
+/// A wire that runs BACKWARDS (feedback into an earlier stage, or a block feeding itself):
+/// instead of cutting straight through the blocks, it leaves the output, drops below both blocks
+/// (`below` is that y), runs back, and climbs into the input. Rounded for the curved style.
+fn loop_around(
+    p0: Pos2,
+    p1: Pos2,
+    d0: Vec2,
+    d1: Vec2,
+    below: f32,
+    zoom: f32,
+    curved: bool,
+) -> Vec<Pos2> {
+    let stub = zoom * 0.9;
+    let a = p0 + d0 * stub;
+    let b = p1 + d1 * stub;
+    let pts = vec![p0, a, Pos2::new(a.x, below), Pos2::new(b.x, below), b, p1];
+    if curved {
+        round_corners(&pts, zoom * 0.7)
+    } else {
+        pts
+    }
+}
+
+/// Replace each interior corner of a polyline with a short quadratic arc of radius ≈ `r`.
+fn round_corners(pts: &[Pos2], r: f32) -> Vec<Pos2> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut out = vec![pts[0]];
+    for i in 1..pts.len() - 1 {
+        let (prev, c, next) = (pts[i - 1], pts[i], pts[i + 1]);
+        let (lin, lout) = ((c - prev).length(), (next - c).length());
+        if lin < 1e-3 || lout < 1e-3 {
+            continue;
+        }
+        let rr = r.min(lin * 0.5).min(lout * 0.5);
+        let s = c - (c - prev) / lin * rr;
+        let e = c + (next - c) / lout * rr;
+        for k in 0..=6 {
+            let t = k as f32 / 6.0;
+            let u = 1.0 - t;
+            out.push(Pos2::new(
+                u * u * s.x + 2.0 * u * t * c.x + t * t * e.x,
+                u * u * s.y + 2.0 * u * t * c.y + t * t * e.y,
+            ));
+        }
+    }
+    out.push(pts[pts.len() - 1]);
+    out
+}
+
 /// Right-angle routing between two ports, with a short stub out of each port. `lane` nudges the
 /// middle segment so parallel wires don't sit exactly on top of each other.
 fn orthogonal(p0: Pos2, p1: Pos2, d0: Vec2, d1: Vec2, zoom: f32, lane: f32) -> Vec<Pos2> {
@@ -290,11 +341,34 @@ impl Document {
             let (Some((p0, d0)), Some((p1, d1))) = (geo.port(w.from), geo.port(w.to)) else {
                 continue;
             };
-            let pts = match s.wire_style {
-                WireStyle::Curved => bezier(p0, p1, d0, d1, self.camera.zoom),
-                WireStyle::Orthogonal => {
-                    let lane = ((w.to.index as i32 % 3) - 1) as f32 * self.camera.zoom * 0.12;
-                    orthogonal(p0, p1, d0, d1, self.camera.zoom, lane)
+            let z = self.camera.zoom;
+            // Feedback (into an earlier stage, or a block into itself) loops around underneath.
+            let facing = d0.x.abs() > 0.9 && d1.x.abs() > 0.9 && d0.x * d1.x < 0.0;
+            let backward = facing && ((p1.x + d1.x * z) - (p0.x + d0.x * z)) * d0.x < z * 0.5;
+            let pts = if backward || w.from.block == w.to.block {
+                let rect_of = |id: BlockId| geo.index.get(&id).map(|&i| geo.blocks[i].rect);
+                let bottom = [rect_of(w.from.block), rect_of(w.to.block)]
+                    .into_iter()
+                    .flatten()
+                    .map(|r| r.bottom())
+                    .fold(p0.y.max(p1.y), f32::max);
+                let lane = (w.to.index % 3) as f32 * z * 0.3;
+                loop_around(
+                    p0,
+                    p1,
+                    d0,
+                    d1,
+                    bottom + z * 0.9 + lane,
+                    z,
+                    s.wire_style == WireStyle::Curved,
+                )
+            } else {
+                match s.wire_style {
+                    WireStyle::Curved => bezier(p0, p1, d0, d1, z),
+                    WireStyle::Orthogonal => {
+                        let lane = ((w.to.index as i32 % 3) - 1) as f32 * z * 0.12;
+                        orthogonal(p0, p1, d0, d1, z, lane)
+                    }
                 }
             };
             let bbox = Rect::from_points(&pts);
@@ -316,16 +390,22 @@ impl Document {
             if !b.rect.expand(radius).contains(cursor) {
                 continue;
             }
+            // Over a block's body, only a click right on a pin counts as the pin: when zoomed
+            // out, a generous pin radius would otherwise swallow a whole switch and start a
+            // wire instead of toggling it.
+            let inside = b.rect.shrink(1.0).contains(cursor);
+            let near = (b.rect.width().min(b.rect.height()) * 0.22).max(4.0);
+            let limit = if inside { near * near } else { f32::INFINITY };
             for (i, (p, _)) in b.outputs.iter().enumerate() {
                 let d = p.distance_sq(cursor);
-                if d < best_d {
+                if d < best_d && d < limit {
                     best_d = d;
                     best = Some((Port::output(b.id, i as u16), true));
                 }
             }
             for (i, (p, _)) in b.inputs.iter().enumerate() {
                 let d = p.distance_sq(cursor);
-                if d < best_d {
+                if d < best_d && d < limit {
                     best_d = d;
                     best = Some((Port::input(b.id, i as u16), false));
                 }
@@ -451,6 +531,7 @@ impl Document {
             self.draw_grid(&painter, rect, origin, t);
         }
         self.draw_wires(&painter, &geo, clip, hover_wire, t);
+        self.draw_glow(&painter, &geo, &ctx, t);
         self.draw_blocks(&painter, &geo, clip, hover_block, s, t);
         self.draw_ports(&painter, &geo, clip, hover_port, t);
         self.draw_overlay(&painter, &geo, origin, cursor, s, t);
@@ -1054,6 +1135,61 @@ impl Document {
                 pressed: self.pressed_button == Some(b.id),
             };
             draw_block(p, &bg.pl, &style);
+        }
+    }
+
+    /// A soft fading halo around blocks the assistant just built or pointed at, plus its note.
+    fn draw_glow(&self, p: &egui::Painter, geo: &Geo, ctx: &egui::Context, t: &Theme) {
+        let Some(glow) = &self.glow else {
+            return;
+        };
+        let age = glow.since.elapsed().as_secs_f32();
+        if age > glow.duration {
+            return;
+        }
+        ctx.request_repaint();
+        // Pulse in quickly, hold, then fade out over the last second.
+        let fade = (age / 0.25).min(1.0) * ((glow.duration - age).min(1.0));
+        let color = if glow.note.is_some() {
+            t.warning
+        } else {
+            t.accent
+        };
+        let z = self.camera.zoom;
+        let mut first: Option<Rect> = None;
+        for id in &glow.blocks {
+            let Some(&i) = geo.index.get(id) else {
+                continue;
+            };
+            let r = geo.blocks[i].rect.expand(z * 0.25);
+            first.get_or_insert(r);
+            for (k, a) in [(3.0, 26.0), (1.5, 60.0)] {
+                p.rect_stroke(
+                    r.expand(k),
+                    CornerRadius::same((z * 0.35 + k) as u8),
+                    Stroke::new(k * 1.6, color.gamma_multiply(fade * a / 255.0 * 4.0)),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            p.rect_stroke(
+                r,
+                CornerRadius::same((z * 0.3) as u8),
+                Stroke::new(1.5, color.gamma_multiply(fade)),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if let (Some(note), Some(r)) = (&glow.note, first) {
+            let galley = p.layout(note.clone(), super::design::medium(12.0), t.text, 260.0);
+            let pos = Pos2::new(r.left(), r.top() - galley.size().y - 14.0);
+            let bg = Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(9.0, 6.0));
+            p.rect_filled(bg, CornerRadius::same(8), t.surface.gamma_multiply(fade));
+            p.rect_stroke(
+                bg,
+                CornerRadius::same(8),
+                Stroke::new(1.0, color.gamma_multiply(fade)),
+                egui::StrokeKind::Inside,
+            );
+            p.galley_with_override_text_color(pos, galley, t.text.gamma_multiply(fade));
         }
     }
 

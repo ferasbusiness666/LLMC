@@ -5,7 +5,7 @@ edition = "2021"
 description = "LLMC — a clean, powerful digital-logic builder and simulator"
 license = "MIT"
 repository = "https://github.com/ferasbusiness666/llmc"
-rust-version = "1.80"
+rust-version = "1.92"
 
 [[bin]]
 name = "llmc"

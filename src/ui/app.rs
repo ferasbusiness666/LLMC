@@ -126,6 +126,8 @@ impl LlmcApp {
         let saved = app.config.ai_providers.clone();
         app.ai.apply_config(&saved);
         app.ai.preferred = app.config.last_model.clone();
+        app.ai.fallbacks = app.config.fallback_models.clone();
+        app.ai.log_prompts = app.config.log_prompts;
         app
     }
 
@@ -453,7 +455,12 @@ impl LlmcApp {
         };
         let ops = llmc::ai::parse_reply(json).ops;
         let doc = &mut self.docs[self.active];
-        let report = doc.apply_ai_ops(ops);
+        let report = doc.apply_ai_ops(ops, true);
+        // The user inserted these: they're the user's blocks, not the assistant's.
+        doc.glow = None;
+        for id in &report.new_blocks {
+            doc.ai_blocks.remove(id);
+        }
         if report.changed {
             doc.clear_selection();
             doc.frame_request = Some(FrameRequest::All);
@@ -1963,13 +1970,17 @@ impl LlmcApp {
 
     /// The assistant's agent loop for every tab (requests keep running in background tabs).
     fn run_agents(&mut self, ctx: &egui::Context) {
-        let settings = &self.ai;
+        let settings = &mut self.ai;
         let mut any_pending = false;
         let mut any_waiting = false;
         for doc in &mut self.docs {
             let reply = doc.ai.poll_chat();
             if let Some(ops) = doc.ai.take_pending_ops() {
-                let report = doc.apply_ai_ops(ops);
+                // The user's own blocks may only be removed when their request asked for
+                // changes ("replace", "fix", "delete", …).
+                let allow = llmc::ai::user_allows_removal(doc.ai.last_user_text());
+                let mut report = doc.apply_ai_ops(ops, allow);
+                report.errors.extend(doc.ai.take_problems());
                 // Build the feedback from the full report BEFORE handing activity to the chat.
                 let feedback = doc.agent_observation(&report);
                 doc.ai.attach_edit_result(report.activity, report.errors);
@@ -1980,8 +1991,11 @@ impl LlmcApp {
                     doc.ai.end_agent();
                 }
             } else if reply {
-                doc.ai.end_agent();
+                let prompt = doc.system_prompt();
+                doc.ai.handle_reply_without_edits(settings, prompt);
             }
+            // A rate-limited model hands over to the next one in the fallback chain at once.
+            doc.ai.try_fallback(settings);
             if doc.ai.retry_due() {
                 let prompt = doc.system_prompt();
                 doc.ai.retry_now(settings, prompt);
@@ -2205,6 +2219,8 @@ impl eframe::App for LlmcApp {
         if self.ai.take_dirty() {
             self.config.ai_providers = self.ai.config_snapshot();
             self.config.last_model = self.ai.preferred.clone();
+            self.config.fallback_models = self.ai.fallbacks.clone();
+            self.config.log_prompts = self.ai.log_prompts;
             self.config.save();
         }
 
@@ -2312,7 +2328,12 @@ impl eframe::App for LlmcApp {
         if panel.open_settings {
             self.ai_settings_open = true;
         }
-        if panel.send {
+        if panel.continue_reply {
+            let doc = &mut self.docs[self.active];
+            doc.ai.input = "Continue exactly where you left off.".to_string();
+            let prompt = doc.system_prompt();
+            doc.ai.send(&self.ai, prompt);
+        } else if panel.send {
             let doc = &mut self.docs[self.active];
             let prompt = doc.system_prompt();
             doc.ai.send(&self.ai, prompt);

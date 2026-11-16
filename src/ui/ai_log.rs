@@ -1,6 +1,8 @@
-//! A best-effort local debug log of AI requests and replies, appended to a file in the OS data
-//! directory. Handy when a weak model thrashes in agent mode: you can see exactly what was sent
-//! and what came back. Never logs the API key.
+//! A local debug log of AI requests and replies: one JSON object per line in `ai.log` in the OS
+//! data directory, so it can be read by people and tools alike. Every request logs its metadata
+//! (model, provider host, timing, HTTP status, sizes, token usage when the provider reports it);
+//! the prompt and reply TEXT is included only while "Log prompts and replies" is on. The API key
+//! is never logged. The file is rotated to `ai.log.1` when it passes a size cap.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -11,8 +13,8 @@ use super::ai_net::ChatRequest;
 /// Serializes concurrent appends from multiple worker threads.
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// Keep the log from growing without bound (rotated by simple truncation past this size).
-const MAX_BYTES: u64 = 4_000_000;
+/// Rotate past this size (the previous log is kept as `ai.log.1`).
+const MAX_BYTES: u64 = 2_000_000;
 
 fn path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "llmc", "LLMC").map(|d| d.data_dir().join("ai.log"))
@@ -25,11 +27,11 @@ pub fn log_path_display() -> String {
         .unwrap_or_else(|| "(unavailable)".to_string())
 }
 
-fn timestamp() -> String {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => format!("unix={}", d.as_secs()),
-        Err(_) => "unix=?".to_string(),
-    }
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -40,7 +42,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn append(section: &str, body: &str) {
+fn append(entry: serde_json::Value) {
     let Some(path) = path() else {
         return;
     };
@@ -54,35 +56,91 @@ fn append(section: &str, body: &str) {
         .map(|m| m.len() > MAX_BYTES)
         .unwrap_or(false)
     {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "===== {} {} =====", timestamp(), section);
-        let _ = writeln!(f, "{body}\n");
+        let _ = writeln!(f, "{entry}");
     }
 }
 
-/// Log an outgoing request (model + the latest turn, which is the freshest context).
-pub fn request(req: &ChatRequest) {
-    let last = req
-        .turns
-        .last()
-        .map(|t| format!("[{}] {}", t.role, t.content))
-        .unwrap_or_default();
-    append(
-        &format!("REQUEST model={} turns={}", req.model, req.turns.len()),
-        &truncate(&last, 4000),
-    );
+/// The provider's host (never the full URL, which some setups put a key into).
+fn host(base_url: &str) -> String {
+    let s = base_url.trim();
+    let s = s.split_once("://").map(|(_, r)| r).unwrap_or(s);
+    s.split(['/', '?']).next().unwrap_or("").to_string()
 }
 
-/// Log the reply text or the error.
-pub fn reply(req: &ChatRequest, result: &Result<String, String>) {
-    match result {
-        Ok(text) => append(&format!("REPLY model={}", req.model), &truncate(text, 8000)),
-        Err(e) => append(&format!("ERROR model={}", req.model), e),
+/// How one request ended, for the log.
+pub struct Outcome<'a> {
+    pub result: &'a Result<String, String>,
+    pub elapsed_ms: u128,
+    /// HTTP status of a failed request, if it got that far.
+    pub status: Option<u16>,
+    /// Raw provider error body (trimmed), when there was one.
+    pub provider_body: Option<&'a str>,
+    pub truncated: bool,
+    pub usage: Option<&'a serde_json::Value>,
+}
+
+/// Log a finished request: one line with the metadata, plus the latest turn and the reply when
+/// prompt logging is on.
+pub fn finished(req: &ChatRequest, out: &Outcome) {
+    let chars_sent: usize = req.turns.iter().map(|t| t.content.len()).sum();
+    let mut entry = serde_json::json!({
+        "ts": unix_now(),
+        "model": req.model,
+        "host": host(&req.base_url),
+        "turns": req.turns.len(),
+        "chars_sent": chars_sent,
+        "elapsed_ms": out.elapsed_ms as u64,
+        "ok": out.result.is_ok(),
+    });
+    let obj = entry.as_object_mut().expect("object");
+    if let Some(s) = out.status {
+        obj.insert("status".into(), s.into());
+    }
+    if out.truncated {
+        obj.insert("truncated".into(), true.into());
+    }
+    if let Some(u) = out.usage {
+        obj.insert("usage".into(), u.clone());
+    }
+    match out.result {
+        Ok(text) => {
+            obj.insert("reply_chars".into(), text.len().into());
+        }
+        Err(e) => {
+            obj.insert("error".into(), e.clone().into());
+            if let Some(b) = out.provider_body.filter(|b| !b.trim().is_empty()) {
+                obj.insert("provider_body".into(), truncate(b.trim(), 2000).into());
+            }
+        }
+    }
+    if req.log_text {
+        if let Some(last) = req.turns.last() {
+            obj.insert(
+                "prompt".into(),
+                serde_json::json!({ "role": last.role, "content": truncate(&last.content, 6000) }),
+            );
+        }
+        if let Ok(text) = out.result {
+            obj.insert("reply".into(), truncate(text, 12000).into());
+        }
+    }
+    append(entry);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_never_includes_path_or_query() {
+        assert_eq!(host("https://api.groq.com/openai/v1"), "api.groq.com");
+        assert_eq!(host("http://localhost:11434/v1?key=x"), "localhost:11434");
     }
 }

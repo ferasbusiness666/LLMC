@@ -9,8 +9,10 @@ pub mod apply;
 pub mod parse;
 pub mod prompt;
 
-pub use apply::{apply_ops, ApplyReport};
+pub use apply::{
+    apply_ops, apply_ops_with, block_display_name, user_allows_removal, ApplyOptions, ApplyReport,
+};
 pub use parse::{
     live_split, parse_reply, AddKind, LiveView, ParsedReply, PortSel, RawOp, TestStep,
 };
-pub use prompt::{agent_observation, circuit_context, system_prompt};
+pub use prompt::{agent_observation, circuit_context, system_prompt, Observation};

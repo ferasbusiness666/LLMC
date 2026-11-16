@@ -135,8 +135,12 @@ pub struct Provider {
     /// Held in memory while running; a working key is persisted to the OS keyring (see keystore).
     pub api_key: String,
     pub enabled: bool,
-    /// Models fetched from the provider by "Test connection" / startup reconnect.
+    /// Chat-capable models fetched from the provider by "Test connection" / startup reconnect.
     pub models: Vec<String>,
+    /// How many of the provider's models were hidden because they can't chat.
+    pub hidden_models: usize,
+    /// How long the last successful connection test took.
+    pub latency_ms: Option<u128>,
     pub status: ConnStatus,
 }
 
@@ -149,6 +153,8 @@ impl Provider {
             api_key: String::new(),
             enabled: false,
             models: Vec::new(),
+            hidden_models: 0,
+            latency_ms: None,
             status: ConnStatus::Idle,
         }
     }
@@ -173,7 +179,16 @@ pub struct AiSettings {
     dirty: bool,
     /// The model picked last (preselected in new tabs and after a restart).
     pub preferred: Option<SavedModel>,
+    /// Models to switch to, in order, when the current one is rate-limited.
+    pub fallbacks: Vec<SavedModel>,
+    /// Rate-limited models and when they may be tried again: (provider id, model, until).
+    cooldowns: Vec<(String, String, Instant)>,
+    /// Include prompt/reply text in the local request log.
+    pub log_prompts: bool,
 }
+
+/// How long a rate-limited model is skipped by the fallback chain.
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(90);
 
 impl Default for AiSettings {
     fn default() -> Self {
@@ -197,6 +212,9 @@ impl Default for AiSettings {
             rx,
             dirty: false,
             preferred: None,
+            fallbacks: Vec::new(),
+            cooldowns: Vec::new(),
+            log_prompts: true,
         }
     }
 }
@@ -230,11 +248,17 @@ impl AiSettings {
     pub fn poll(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                AiEvent::Models { provider, result } => {
+                AiEvent::Models {
+                    provider,
+                    result,
+                    elapsed_ms,
+                } => {
                     if let Some(p) = self.providers.get_mut(provider) {
                         match result {
-                            Ok(models) => {
-                                p.models = models;
+                            Ok(list) => {
+                                p.models = list.chat;
+                                p.hidden_models = list.hidden;
+                                p.latency_ms = Some(elapsed_ms);
                                 p.status = ConnStatus::Connected;
                                 // A working key is worth remembering.
                                 if !p.api_key.trim().is_empty() {
@@ -337,6 +361,68 @@ impl AiSettings {
         }
     }
 
+    /// Time left before a rate-limited model may be used again by the fallback chain.
+    pub fn cooldown_left(&self, provider: usize, model: &str) -> Option<Duration> {
+        let id = self.providers.get(provider)?.kind.id();
+        let now = Instant::now();
+        self.cooldowns
+            .iter()
+            .find(|(p, m, until)| p == id && m == model && *until > now)
+            .map(|(_, _, until)| *until - now)
+    }
+
+    fn mark_rate_limited(&mut self, provider: usize, model: &str) {
+        let Some(id) = self
+            .providers
+            .get(provider)
+            .map(|p| p.kind.id().to_string())
+        else {
+            return;
+        };
+        let now = Instant::now();
+        self.cooldowns
+            .retain(|(p, m, until)| *until > now && !(*p == id && m == model));
+        self.cooldowns
+            .push((id, model.to_string(), now + RATE_LIMIT_COOLDOWN));
+    }
+
+    /// Resolve a saved (provider id, model) to a live, pickable model.
+    fn resolve(&self, saved: &SavedModel) -> Option<ModelRef> {
+        let (i, p) = self
+            .providers
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.kind.id() == saved.provider)?;
+        (p.is_live() && p.models.contains(&saved.model)).then(|| ModelRef {
+            provider: i,
+            model: saved.model.clone(),
+        })
+    }
+
+    /// The next model in the fallback chain after `current` that is connected and not cooling
+    /// down (entries after the current one first, then from the top).
+    fn next_fallback(&self, current: &ModelRef) -> Option<ModelRef> {
+        let cur_id = self.providers.get(current.provider)?.kind.id();
+        let start = self
+            .fallbacks
+            .iter()
+            .position(|f| f.provider == cur_id && f.model == current.model)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let n = self.fallbacks.len();
+        (0..n)
+            .map(|k| &self.fallbacks[(start + k) % n.max(1)])
+            .filter_map(|f| self.resolve(f))
+            .find(|r| {
+                !(r.provider == current.provider && r.model == current.model)
+                    && self.cooldown_left(r.provider, &r.model).is_none()
+            })
+    }
+
+    fn model_label(&self, r: &ModelRef) -> String {
+        r.model.clone()
+    }
+
     /// Take (and clear) the "config changed, please persist" flag.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
@@ -366,6 +452,15 @@ pub struct ChatMessage {
     /// A status line for the user only (e.g. "Stopped") — rendered as a quiet centered note and
     /// never sent to the model.
     pub notice: bool,
+    /// For an auto-check: the one-line result and the facts behind it, shown to the user instead
+    /// of the full text sent to the model (which includes instructions to it).
+    pub summary: Option<String>,
+    pub details: Option<String>,
+    /// The connection dropped before this reply finished (offer "Continue").
+    pub truncated: bool,
+    /// When a failure happened, and which consecutive attempt it was.
+    pub when: Option<Instant>,
+    pub attempt: u32,
 }
 
 impl ChatMessage {
@@ -378,6 +473,11 @@ impl ChatMessage {
             activity: Vec::new(),
             auto: false,
             notice: false,
+            summary: None,
+            details: None,
+            truncated: false,
+            when: None,
+            attempt: 0,
         }
     }
 
@@ -395,6 +495,8 @@ impl ChatMessage {
     fn failure(text: String) -> Self {
         Self {
             error: true,
+            when: Some(Instant::now()),
+            attempt: 1,
             ..Self::base(Role::Assistant, text)
         }
     }
@@ -464,6 +566,17 @@ pub struct AiSession {
     /// as a live bubble until the terminal reply lands and replaces them with a parsed message.
     stream_reason: String,
     stream_content: String,
+    /// When the in-flight request and the current run started (for the elapsed-time display).
+    request_started: Option<Instant>,
+    run_started: Option<Instant>,
+    /// Times this run asked the model to actually send the commands it described.
+    nudges: u32,
+    /// Commands in the latest reply that couldn't be read (fed back to the model).
+    pending_problems: Vec<String>,
+    /// The latest failure was a rate limit on the selected model (try the fallback chain).
+    rate_limited: bool,
+    /// Consecutive failed attempts at the current step (shown on the error card).
+    failures: u32,
 }
 
 /// How many of the most recent conversation turns are sent verbatim each step. Older assistant
@@ -504,6 +617,12 @@ impl Default for AiSession {
             model_filter: String::new(),
             stream_reason: String::new(),
             stream_content: String::new(),
+            request_started: None,
+            run_started: None,
+            nudges: 0,
+            pending_problems: Vec::new(),
+            rate_limited: false,
+            failures: 0,
         }
     }
 }
@@ -536,20 +655,27 @@ impl AiSession {
                     token,
                     result,
                     retryable,
+                    rate_limited,
+                    truncated,
                 } => {
                     if self.pending != Some(token) {
                         continue; // stale reply (stopped, cleared, or superseded) — drop it.
                     }
                     self.pending = None;
+                    self.request_started = None;
                     self.stream_reason.clear();
                     self.stream_content.clear();
                     got = true;
+                    self.rate_limited = result.is_err() && rate_limited;
                     match result {
                         Ok(raw) => {
                             self.retries = 0;
+                            self.failures = 0;
                             let parsed = ai_edit::parse_reply(&raw);
-                            self.messages
-                                .push(ChatMessage::reply(parsed.text, parsed.thinking));
+                            let mut msg = ChatMessage::reply(parsed.text, parsed.thinking);
+                            msg.truncated = truncated;
+                            self.messages.push(msg);
+                            self.pending_problems = parsed.problems;
                             if !parsed.ops.is_empty() {
                                 self.pending_ops = Some(parsed.ops);
                             }
@@ -567,17 +693,124 @@ impl AiSession {
                             self.retry_reason = e;
                         }
                         Err(e) if retryable && self.retries >= MAX_CONSECUTIVE_RETRIES => {
-                            self.messages.push(ChatMessage::failure(format!(
+                            self.failures += 1;
+                            let mut m = ChatMessage::failure(format!(
                                 "{e} \u{2014} still failing after {MAX_CONSECUTIVE_RETRIES} \
                                  automatic retries. Press Retry to resume, or switch model."
-                            )));
+                            ));
+                            m.attempt = self.failures;
+                            self.messages.push(m);
                         }
-                        Err(e) => self.messages.push(ChatMessage::failure(e)),
+                        Err(e) => {
+                            self.failures += 1;
+                            let mut m = ChatMessage::failure(e);
+                            m.attempt = self.failures;
+                            self.messages.push(m);
+                        }
                     }
                 }
             }
         }
         got
+    }
+
+    /// Commands from the last reply that couldn't be read (reported as skipped).
+    pub fn take_problems(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_problems)
+    }
+
+    /// The latest message the user typed (the request the assistant is working on).
+    pub fn last_user_text(&self) -> &str {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && !m.auto)
+            .map(|m| m.text.as_str())
+            .unwrap_or("")
+    }
+
+    /// After a rate limit on the selected model: put it on cooldown and switch to the next model
+    /// in the fallback chain, retrying right away. Returns false when no fallback is available
+    /// (the run then waits out its normal backoff).
+    pub fn try_fallback(&mut self, settings: &mut AiSettings) -> bool {
+        if !std::mem::take(&mut self.rate_limited) || self.retry_at.is_none() {
+            return false;
+        }
+        let Some(cur) = self.selected.clone() else {
+            return false;
+        };
+        settings.mark_rate_limited(cur.provider, &cur.model);
+        let Some(next) = settings.next_fallback(&cur) else {
+            return false;
+        };
+        self.messages.push(ChatMessage::notice(format!(
+            "{} is rate-limited \u{2014} switched to {} (fallback models are set in AI providers).",
+            settings.model_label(&cur),
+            settings.model_label(&next)
+        )));
+        self.selected = Some(next);
+        self.retries = 0;
+        self.retry_at = Some(Instant::now());
+        true
+    }
+
+    /// The model replied without any commands. If it described changes (or sent commands that
+    /// couldn't be read), ask it once or twice to actually send them — a model saying "I'll add
+    /// a latch" and changing nothing must not end the run silently. Otherwise the run is done.
+    pub fn handle_reply_without_edits(&mut self, settings: &AiSettings, system_prompt: String) {
+        let problems = self.take_problems();
+        let promised = self.messages.last().is_some_and(|m| {
+            m.role == Role::Assistant && !m.error && !m.notice && promises_edit(&m.text)
+        });
+        if problems.is_empty() && !promised {
+            self.end_agent();
+            return;
+        }
+        if self.agent_enabled && !self.agent_stop && self.nudges < 2 {
+            self.nudges += 1;
+            let (text, summary) = if problems.is_empty() {
+                (
+                    "Your reply described changes to the circuit but contained no json command \
+                     block, so NOTHING changed on the canvas. If you meant to change the circuit, \
+                     send the commands now (one ```json block at the end). If no change is \
+                     needed, say so in one sentence without commands."
+                        .to_string(),
+                    "No changes were made \u{2014} asked the assistant to send its commands",
+                )
+            } else {
+                (
+                    format!(
+                        "Your commands were NOT applied:\n- {}\nNothing changed. Resend the \
+                         corrected commands as strict JSON in one ```json block.",
+                        problems.join("\n- ")
+                    ),
+                    "Its commands couldn't be read \u{2014} asked it to resend them",
+                )
+            };
+            let mut m = ChatMessage::auto(text);
+            m.summary = Some(summary.to_string());
+            m.details = (!problems.is_empty()).then(|| problems.join("\n"));
+            self.messages.push(m);
+            self.agent_steps += 1;
+            self.dispatch(settings, system_prompt);
+        } else {
+            let mut note = "No changes were made to the circuit.".to_string();
+            if !problems.is_empty() {
+                note.push_str(&format!(" Unreadable commands: {}", problems.join("; ")));
+            }
+            self.messages.push(ChatMessage::notice(note));
+            self.end_agent();
+        }
+    }
+
+    /// Elapsed time of the in-flight request and of the whole run.
+    pub fn elapsed(&self) -> (Option<Duration>, Option<Duration>) {
+        (
+            self.request_started.map(|t| t.elapsed()),
+            self.run_started
+                .filter(|_| self.agent_running)
+                .map(|t| t.elapsed()),
+        )
     }
 
     /// Take the edit ops parsed from the last reply (if any) so the app can apply them.
@@ -616,7 +849,9 @@ impl AiSession {
         self.cancel.store(true, Ordering::Relaxed);
         self.pending = None;
         self.pending_ops = None;
+        self.pending_problems.clear();
         self.retry_at = None;
+        self.request_started = None;
         self.stream_reason.clear();
         self.stream_content.clear();
         self.agent_stop = true;
@@ -641,10 +876,13 @@ impl AiSession {
         &mut self,
         settings: &AiSettings,
         system_prompt: String,
-        feedback: String,
+        feedback: ai_edit::Observation,
     ) {
         self.agent_steps += 1;
-        self.messages.push(ChatMessage::auto(feedback));
+        let mut m = ChatMessage::auto(feedback.text);
+        m.summary = Some(feedback.summary);
+        m.details = Some(feedback.details);
+        self.messages.push(m);
         self.dispatch(settings, system_prompt);
     }
 
@@ -722,6 +960,8 @@ impl AiSession {
                 let mut m = ChatMessage::base(role, r.text.clone());
                 m.thinking = r.thinking.clone();
                 m.activity = r.activity.clone();
+                m.summary = r.summary.clone();
+                m.details = r.details.clone();
                 match r.kind.as_str() {
                     "auto" => m.auto = true,
                     "error" => m.error = true,
@@ -755,6 +995,8 @@ impl AiSession {
                     "message"
                 }
                 .to_string(),
+                summary: m.summary.clone(),
+                details: m.details.clone(),
             })
             .collect()
     }
@@ -796,6 +1038,8 @@ impl AiSession {
         self.agent_stop = false;
         self.retries = 0;
         self.retry_at = None;
+        self.nudges = 0;
+        self.run_started = Some(Instant::now());
     }
 
     /// Build the request from the current turns + `system_prompt` and fire it off-thread.
@@ -832,6 +1076,7 @@ impl AiSession {
         let token = self.next_token;
         self.next_token += 1;
         self.pending = Some(token);
+        self.request_started = Some(Instant::now());
         self.stream_reason.clear();
         self.stream_content.clear();
         // A fresh cancel flag per request, so Stop aborts exactly the one in flight.
@@ -843,9 +1088,36 @@ impl AiSession {
             model: sel.model.clone(),
             turns,
             cancel,
+            log_text: settings.log_prompts,
         };
         ai_net::spawn_chat(self.chat_tx.clone(), token, req);
     }
+}
+
+/// Does a reply announce edits ("I'll add…", "Let me wire…")? Used to catch a model that
+/// describes changes but forgets to send the commands.
+fn promises_edit(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const VERBS: [&str; 12] = [
+        "add", "build", "create", "place", "wire", "connect", "fix", "change", "update", "remove",
+        "replace", "rewire",
+    ];
+    const LEADS: [&str; 9] = [
+        "i'll ",
+        "i will ",
+        "let me ",
+        "i'm going to ",
+        "i am going to ",
+        "now i'll ",
+        "let's ",
+        "i'll now ",
+        "next, i'll ",
+    ];
+    LEADS
+        .iter()
+        .any(|lead| VERBS.iter().any(|v| t.contains(&format!("{lead}{v}"))))
+        || t.contains("here's the plan")
+        || t.contains("here is the plan")
 }
 
 /// The conversation turns to send, trimmed so an arbitrarily long run never outgrows the model's
@@ -894,6 +1166,30 @@ pub struct PanelResponse {
     pub retry: bool,
     /// Open the provider settings.
     pub open_settings: bool,
+    /// The user pressed Continue on a reply cut off by a dropped connection.
+    pub continue_reply: bool,
+}
+
+/// "12s", "3m 05s".
+fn fmt_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}m {:02}s", s / 60, s % 60)
+    }
+}
+
+/// "just now", "2 min ago", "1 h ago".
+fn fmt_ago(t: Instant) -> String {
+    let s = t.elapsed().as_secs();
+    if s < 30 {
+        "just now".to_string()
+    } else if s < 3600 {
+        format!("{} min ago", (s / 60).max(1))
+    } else {
+        format!("{} h ago", s / 3600)
+    }
 }
 
 /// Starter prompts shown on an empty conversation.
@@ -917,15 +1213,23 @@ pub fn panel(
     ui.horizontal(|ui| {
         let running = session.is_running() || session.is_pending();
         let (color, label) = if session.retry_scheduled() {
-            (t.warning, "Waiting to retry")
+            (t.warning, "Waiting to retry".to_string())
         } else if running {
-            (t.accent, "Working")
+            match session.elapsed() {
+                (_, Some(run)) => (t.accent, format!("Working \u{b7} {}", fmt_elapsed(run))),
+                (Some(req), None) => (t.accent, format!("Working \u{b7} {}", fmt_elapsed(req))),
+                _ => (t.accent, "Working".to_string()),
+            }
         } else if settings.any_live() {
-            (t.success, "Ready")
+            (t.success, "Ready".to_string())
         } else {
-            (t.text_faint, "Not connected")
+            (t.text_faint, "Not connected".to_string())
         };
-        design::pill(ui, t, color, label);
+        design::pill(ui, t, color, &label);
+        if running {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(500));
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if design::icon_button(ui, t, icons::SETTINGS_3, "Providers & API keys", false)
                 .clicked()
@@ -964,7 +1268,9 @@ pub fn panel(
                 response.send = true;
             }
         } else {
-            response.retry |= conversation(ui, t, session);
+            let (retry, cont) = conversation(ui, t, session);
+            response.retry |= retry;
+            response.continue_reply |= cont;
         }
     });
     ui.add_space(6.0);
@@ -1051,43 +1357,98 @@ fn icon_tile(ui: &mut egui::Ui, t: &Theme, glyph: &str, size: f32) {
     design::paint_icon(ui, rect, glyph, size * 0.48, t.accent);
 }
 
-/// The scrolling message list (plus a live/status row while a reply is in flight). Returns true
-/// if a "Retry" was clicked.
-fn conversation(ui: &mut egui::Ui, t: &Theme, session: &AiSession) -> bool {
+/// The scrolling message list (plus a live/status row while a reply is in flight). Returns
+/// whether "Retry" and "Continue" were clicked. When the user has scrolled up and something new
+/// arrives, a "New messages" pill offers a jump back down.
+fn conversation(ui: &mut egui::Ui, t: &Theme, session: &AiSession) -> (bool, bool) {
     let row_width = ui.available_width().max(160.0);
     let mut retry = false;
-    egui::ScrollArea::vertical()
+    let mut cont = false;
+    let jump_id = ui.id().with("chat-jump");
+    let seen_id = ui.id().with("chat-seen");
+    let jump = ui
+        .ctx()
+        .data_mut(|d| d.remove_temp::<bool>(jump_id).unwrap_or(false));
+    // A cheap "how much content is there" signature: messages plus live stream length.
+    let progress = session.messages.len() * 100_000
+        + session.stream_content.len()
+        + session.stream_reason.len();
+    let mut area = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .show(ui, |ui| {
-            ui.set_width(row_width - 6.0);
-            ui.add_space(2.0);
-            for (i, msg) in session.messages.iter().enumerate() {
-                if msg.auto {
-                    auto_note(ui, t, msg, i);
-                } else if msg.notice {
-                    notice(ui, t, &msg.text);
-                } else if msg.role == Role::User {
-                    user_bubble(ui, t, &msg.text, row_width);
-                } else {
-                    retry |= assistant_message(ui, t, msg, i);
-                }
-                ui.add_space(10.0);
+        .stick_to_bottom(true);
+    if jump {
+        area = area.vertical_scroll_offset(f32::MAX);
+    }
+    let out = area.show(ui, |ui| {
+        ui.set_width(row_width - 6.0);
+        ui.add_space(2.0);
+        for (i, msg) in session.messages.iter().enumerate() {
+            if msg.auto {
+                auto_note(ui, t, msg, i);
+            } else if msg.notice {
+                notice(ui, t, &msg.text);
+            } else if msg.role == Role::User {
+                user_bubble(ui, t, &msg.text, row_width);
+            } else {
+                let (r, c) = assistant_message(ui, t, msg, i);
+                retry |= r;
+                cont |= c && i + 1 == session.messages.len() && !session.is_pending();
             }
-            if let Some(status) = session.retry_status().filter(|_| !session.is_pending()) {
-                status_row(ui, t, icons::TIMER, &status);
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(250));
-            } else if session.is_pending() {
-                if session.stream_reason.is_empty() && session.stream_content.is_empty() {
-                    thinking(ui, t, session);
-                } else {
-                    stream_message(ui, t, &session.stream_reason, &session.stream_content);
-                }
+            ui.add_space(10.0);
+        }
+        if let Some(status) = session.retry_status().filter(|_| !session.is_pending()) {
+            status_row(ui, t, icons::TIMER, &status);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        } else if session.is_pending() {
+            if session.stream_reason.is_empty() && session.stream_content.is_empty() {
+                thinking(ui, t, session);
+            } else {
+                stream_message(
+                    ui,
+                    t,
+                    session,
+                    &session.stream_reason,
+                    &session.stream_content,
+                );
             }
-            ui.add_space(4.0);
-        });
-    retry
+        }
+        ui.add_space(4.0);
+    });
+    let max_offset = (out.content_size.y - out.inner_rect.height()).max(0.0);
+    let at_bottom = out.state.offset.y >= max_offset - 24.0;
+    let seen = ui.ctx().data_mut(|d| *d.get_temp_mut_or(seen_id, progress));
+    if at_bottom || jump {
+        ui.ctx().data_mut(|d| d.insert_temp(seen_id, progress));
+    } else if progress != seen {
+        // New content below the fold: offer to jump down.
+        let pill = egui::Rect::from_center_size(
+            Pos2::new(out.inner_rect.center().x, out.inner_rect.bottom() - 22.0),
+            egui::vec2(132.0, 28.0),
+        );
+        let resp = ui.interact(pill, ui.id().with("chat-jump-pill"), Sense::click());
+        let p = ui.painter();
+        p.rect_filled(
+            pill.translate(egui::vec2(0.0, 2.0)),
+            CornerRadius::same(14),
+            Color32::from_black_alpha(40),
+        );
+        design::vertical_gradient(p, pill, CornerRadius::same(14), t.accent, t.accent_strong);
+        p.text(
+            pill.center(),
+            Align2::CENTER_CENTER,
+            format!("{}  New messages", icons::ARROW_DOWN_S),
+            design::medium(12.0),
+            Color32::WHITE,
+        );
+        if resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            ui.ctx().data_mut(|d| d.insert_temp(jump_id, true));
+        }
+    }
+    (retry, cont)
 }
 
 fn avatar_row(ui: &mut egui::Ui, t: &Theme, live: bool) {
@@ -1148,8 +1509,10 @@ fn user_bubble(ui: &mut egui::Ui, t: &Theme, text: &str, row_width: f32) {
 }
 
 /// An assistant reply: avatar, optional reasoning, answer, applied-edits card, retry on error.
-fn assistant_message(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize) -> bool {
+/// Returns whether "Retry" / "Continue" were clicked.
+fn assistant_message(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize) -> (bool, bool) {
     let mut retry = false;
+    let mut cont = false;
     if msg.error {
         Frame::NONE
             .fill(t.danger_soft)
@@ -1169,11 +1532,26 @@ fn assistant_message(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize
                             .font(design::semibold(12.5))
                             .color(t.text),
                     );
+                    // When, and which attempt — so a repeated failure doesn't look identical.
+                    let mut meta = Vec::new();
+                    if msg.attempt > 1 {
+                        meta.push(format!("attempt {}", msg.attempt));
+                    }
+                    if let Some(w) = msg.when {
+                        meta.push(fmt_ago(w));
+                    }
+                    if !meta.is_empty() {
+                        ui.label(
+                            RichText::new(meta.join(" \u{b7} "))
+                                .font(design::regular(11.5))
+                                .color(t.text_faint),
+                        );
+                    }
                 });
                 ui.label(
                     RichText::new(&msg.text)
                         .font(design::regular(12.5))
-                        .color(t.text_muted),
+                        .color(t.text),
                 );
                 ui.add_space(4.0);
                 if design::button_ex(
@@ -1183,14 +1561,14 @@ fn assistant_message(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize
                     Some(icons::REFRESH),
                     "Retry",
                     true,
-                    26.0,
+                    28.0,
                 )
                 .clicked()
                 {
                     retry = true;
                 }
             });
-        return retry;
+        return (retry, false);
     }
     avatar_row(ui, t, false);
     ui.indent(("ai-msg", idx), |ui| {
@@ -1215,8 +1593,35 @@ fn assistant_message(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize
             markdown(ui, t, &msg.text);
         }
         activity_view(ui, t, &msg.activity, idx);
+        if msg.truncated {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{}  The connection dropped before this reply finished.",
+                        icons::ERROR_WARNING
+                    ))
+                    .font(design::regular(12.0))
+                    .color(t.warning),
+                );
+                if design::button_ex(
+                    ui,
+                    t,
+                    Kind::Secondary,
+                    Some(icons::PLAY_FILL),
+                    "Continue",
+                    true,
+                    26.0,
+                )
+                .on_hover_text("Ask the assistant to pick up where it stopped")
+                .clicked()
+                {
+                    cont = true;
+                }
+            });
+        }
     });
-    retry
+    (retry, cont)
 }
 
 /// Render the small subset of Markdown models actually use: headings, bullet/numbered lists,
@@ -1224,9 +1629,29 @@ fn assistant_message(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize
 fn markdown(ui: &mut egui::Ui, t: &Theme, text: &str) {
     let mut in_code = false;
     let mut code = String::new();
+    let mut table: Vec<Vec<String>> = Vec::new();
     ui.spacing_mut().item_spacing.y = 4.0;
     for line in text.lines() {
         let trimmed = line.trim_start();
+        // Pipe tables: collect rows, render when the table ends.
+        if !in_code && trimmed.starts_with('|') {
+            let cells: Vec<String> = trimmed
+                .trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim().to_string())
+                .collect();
+            let separator = cells
+                .iter()
+                .all(|c| !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')));
+            if !separator {
+                table.push(cells);
+            }
+            continue;
+        }
+        if !table.is_empty() {
+            md_table(ui, t, &std::mem::take(&mut table));
+        }
         if trimmed.starts_with("```") {
             if in_code {
                 code_block(ui, t, code.trim_end());
@@ -1282,9 +1707,44 @@ fn markdown(ui: &mut egui::Ui, t: &Theme, text: &str) {
             }
         }
     }
+    if !table.is_empty() {
+        md_table(ui, t, &table);
+    }
     if in_code && !code.is_empty() {
         code_block(ui, t, code.trim_end());
     }
+}
+
+/// A Markdown pipe table: bold header row, zebra rows, in a bordered card that scrolls
+/// sideways when wide.
+fn md_table(ui: &mut egui::Ui, t: &Theme, rows: &[Vec<String>]) {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return;
+    }
+    Frame::NONE
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(design::radius::MD))
+        .inner_margin(Margin::symmetric(8, 6))
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt(ui.next_auto_id())
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    egui::Grid::new(ui.next_auto_id())
+                        .striped(true)
+                        .spacing(egui::vec2(14.0, 5.0))
+                        .show(ui, |ui| {
+                            for (r, row) in rows.iter().enumerate() {
+                                for c in 0..cols {
+                                    let cell = row.get(c).map(String::as_str).unwrap_or("");
+                                    ui.add(egui::Label::new(inline_job(t, cell, 12.5, r == 0)));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
 }
 
 fn code_block(ui: &mut egui::Ui, t: &Theme, code: &str) {
@@ -1374,8 +1834,19 @@ impl NoneOrElse for Option<usize> {
 }
 
 /// A live assistant message rendered from the streaming buffers.
-fn stream_message(ui: &mut egui::Ui, t: &Theme, reason_field: &str, content_field: &str) {
+fn stream_message(
+    ui: &mut egui::Ui,
+    t: &Theme,
+    session: &AiSession,
+    reason_field: &str,
+    content_field: &str,
+) {
     let live = ai_edit::live_split(reason_field, content_field);
+    let elapsed = session
+        .elapsed()
+        .0
+        .map(|d| format!(" {}", fmt_elapsed(d)))
+        .unwrap_or_default();
     avatar_row(ui, t, true);
     ui.indent("ai-live", |ui| {
         if let Some(r) = &live.reasoning {
@@ -1391,7 +1862,7 @@ fn stream_message(ui: &mut egui::Ui, t: &Theme, reason_field: &str, content_fiel
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(
-                        RichText::new(format!("{}  Thinking\u{2026}", icons::BRAIN))
+                        RichText::new(format!("{}  Thinking\u{2026}{elapsed}", icons::BRAIN))
                             .font(design::medium(11.5))
                             .color(t.text_faint),
                     );
@@ -1436,16 +1907,43 @@ fn stream_message(ui: &mut egui::Ui, t: &Theme, reason_field: &str, content_fiel
         .request_repaint_after(std::time::Duration::from_millis(60));
 }
 
-/// A compact, foldable "auto-check" row for an agent feedback turn.
+/// A compact, foldable "auto-check" row for an agent feedback turn: its one-line result, and
+/// the facts behind it when expanded (never the instructions sent to the model).
 fn auto_note(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize) {
+    let title = msg
+        .summary
+        .clone()
+        .unwrap_or_else(|| "Checked the circuit".to_string());
+    let warn = title.contains("skipped")
+        || title.contains("unwired")
+        || title.contains("oscillates")
+        || title.starts_with("No changes")
+        || title.contains("couldn't")
+        || title
+            .split("test checks ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|f| f.split_once('/'))
+            .is_some_and(|(a, b)| a != b);
+    let details = msg.details.as_deref().unwrap_or(&msg.text);
     egui::CollapsingHeader::new(
-        RichText::new(format!("{}  Checked the circuit", icons::TEST_TUBE))
-            .font(design::medium(12.0))
-            .color(t.text_faint),
+        RichText::new(format!(
+            "{}  {title}",
+            if warn {
+                icons::ERROR_WARNING
+            } else {
+                icons::TEST_TUBE
+            }
+        ))
+        .font(design::medium(12.0))
+        .color(if warn { t.warning } else { t.text_faint }),
     )
     .id_salt(("ai-autocheck", idx))
     .default_open(false)
     .show(ui, |ui| {
+        if details.trim().is_empty() {
+            return;
+        }
         Frame::NONE
             .fill(t.surface)
             .corner_radius(CornerRadius::same(design::radius::MD))
@@ -1453,7 +1951,7 @@ fn auto_note(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize) {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new(&msg.text)
+                    RichText::new(details)
                         .font(design::mono(11.0))
                         .color(t.text_muted),
                 );
@@ -1461,16 +1959,24 @@ fn auto_note(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize) {
     });
 }
 
-/// "Thinking…" / "Working — step N…" while awaiting the first token.
+/// "Thinking… 12s" / "Step 3 — reading the auto-check… 8s · 1m 20s total" while awaiting the
+/// first token.
 fn thinking(ui: &mut egui::Ui, t: &Theme, session: &AiSession) {
     avatar_row(ui, t, true);
+    let (req, run) = session.elapsed();
+    let secs = req
+        .map(|d| format!(" {}", fmt_elapsed(d)))
+        .unwrap_or_default();
     let label = if session.is_running() && session.agent_step() > 0 {
+        let total = run
+            .map(|d| format!(" \u{b7} {} total", fmt_elapsed(d)))
+            .unwrap_or_default();
         format!(
-            "Step {} \u{2014} reading the auto-check\u{2026}",
+            "Step {} \u{2014} reading the auto-check\u{2026}{secs}{total}",
             session.agent_step() + 1
         )
     } else {
-        "Thinking\u{2026}".to_string()
+        format!("Thinking\u{2026}{secs}")
     };
     ui.indent("ai-thinking", |ui| {
         ui.label(
@@ -1515,11 +2021,12 @@ fn activity_view(ui: &mut egui::Ui, t: &Theme, activity: &[String], idx: usize) 
         return;
     }
     ui.add_space(4.0);
+    let read_only = |a: &str| a.starts_with("Ran a ") || a.starts_with("Pointed at");
     let applied = activity
         .iter()
-        .filter(|a| !a.starts_with("Skipped"))
+        .filter(|a| !a.starts_with("Skipped") && !read_only(a))
         .count();
-    let skipped = activity.len() - applied;
+    let skipped = activity.iter().filter(|a| a.starts_with("Skipped")).count();
     Frame::NONE
         .fill(t.surface)
         .stroke(Stroke::new(1.0, t.border))
@@ -1527,11 +2034,15 @@ fn activity_view(ui: &mut egui::Ui, t: &Theme, activity: &[String], idx: usize) 
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let mut title = format!(
-                "{}  Applied {applied} change{}",
-                icons::CHECKBOX_CIRCLE_FILL,
-                if applied == 1 { "" } else { "s" }
-            );
+            let mut title = if applied == 0 {
+                format!("{}  No changes", icons::CHECKBOX_CIRCLE_FILL)
+            } else {
+                format!(
+                    "{}  Applied {applied} change{}",
+                    icons::CHECKBOX_CIRCLE_FILL,
+                    if applied == 1 { "" } else { "s" }
+                )
+            };
             if skipped > 0 {
                 title.push_str(&format!(" \u{b7} {skipped} skipped"));
             }
@@ -1553,11 +2064,13 @@ fn activity_view(ui: &mut egui::Ui, t: &Theme, activity: &[String], idx: usize) 
                     );
                 }
             });
-            ui.label(
-                RichText::new("Ctrl+Z undoes this whole step")
-                    .font(design::regular(11.0))
-                    .color(t.text_faint),
-            );
+            if applied > 0 {
+                ui.label(
+                    RichText::new("Ctrl+Z undoes this whole step")
+                        .font(design::regular(11.0))
+                        .color(t.text_faint),
+                );
+            }
         });
 }
 
@@ -1679,7 +2192,7 @@ fn send_button(ui: &mut egui::Ui, t: &Theme, glyph: &str, enabled: bool) -> egui
 
 /// A compact "Agent" toggle: when on, the assistant iterates (build → self-check → fix).
 fn agent_toggle(ui: &mut egui::Ui, t: &Theme, on: &mut bool) {
-    let text = format!("{}  Agent", icons::ROBOT_2);
+    let text = format!("{}  Auto-check", icons::ROBOT_2);
     let font = design::medium(12.0);
     let galley = ui
         .painter()
@@ -1713,8 +2226,10 @@ fn agent_toggle(ui: &mut egui::Ui, t: &Theme, on: &mut bool) {
     );
     if resp
         .on_hover_text(
-            "Agent mode: the assistant builds, auto-checks the circuit's real behavior, and fixes \
-             it until it matches your request \u{2014} for as long as it needs. Press Stop any time.",
+            "On: after every change the assistant tests the real circuit and keeps fixing it until \
+             it matches your request \u{2014} for as long as it needs (Stop ends it any time).\n\
+             Off: one reply per message. It can still edit the circuit, but doesn't check or \
+             iterate on its own.",
         )
         .clicked()
     {
@@ -1783,6 +2298,9 @@ fn model_switcher(
         t.text_faint,
     );
     let button = button.on_hover_text(label);
+    if button.clicked() {
+        session.model_filter.clear();
+    }
 
     egui::Popup::menu(&button)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -1829,7 +2347,11 @@ fn model_switcher(
                             .selected
                             .as_ref()
                             .is_some_and(|s| s.provider == *pi && s.model == *model);
-                        if design::menu_item_ex(ui, t, "", model, "", true, is_sel) {
+                        let limited = settings
+                            .cooldown_left(*pi, model)
+                            .map(|d| format!("limited \u{b7} {}s", d.as_secs() + 1))
+                            .unwrap_or_default();
+                        if design::menu_item_ex(ui, t, "", model, &limited, true, is_sel) {
                             picked = Some((*pi, model.to_string()));
                         }
                     }
@@ -1879,6 +2401,21 @@ pub fn settings_dialog(ctx: &egui::Context, t: &Theme, settings: &mut AiSettings
                         ui.add_space(8.0);
                     }
                 });
+            ui.add_space(4.0);
+            fallback_section(ui, t, settings);
+            ui.add_space(8.0);
+            let mut log = settings.log_prompts;
+            if design::toggle_row(
+                ui,
+                t,
+                "Log prompts and replies",
+                "Keeps request text in the local request log for debugging (timing and errors \
+                 are always logged; keys never are).",
+                &mut log,
+            ) {
+                settings.log_prompts = log;
+                changed = true;
+            }
             if let Some(i) = test_request {
                 settings.start_test(i);
             }
@@ -1912,6 +2449,138 @@ pub fn settings_dialog(ctx: &egui::Context, t: &Theme, settings: &mut AiSettings
         *open = false;
         settings.dirty = true;
     }
+}
+
+/// The ordered list of models to fall back to when one is rate-limited.
+fn fallback_section(ui: &mut egui::Ui, t: &Theme, settings: &mut AiSettings) {
+    design::section_label(ui, t, "Fallback models");
+    design::hint(
+        ui,
+        t,
+        "When a model hits a rate limit, the assistant switches to the next one here and \
+         keeps going.",
+    );
+    ui.add_space(4.0);
+    let mut remove: Option<usize> = None;
+    let mut up: Option<usize> = None;
+    for (i, f) in settings.fallbacks.iter().enumerate() {
+        let live = settings.resolve(f).is_some();
+        let provider = settings
+            .providers
+            .iter()
+            .find(|p| p.kind.id() == f.provider)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| f.provider.clone());
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{}.", i + 1))
+                    .font(design::medium(12.0))
+                    .color(t.text_faint),
+            );
+            ui.label(
+                RichText::new(&f.model)
+                    .font(design::medium(12.5))
+                    .color(if live { t.text } else { t.text_faint }),
+            );
+            ui.label(
+                RichText::new(if live {
+                    provider
+                } else {
+                    format!("{provider} \u{b7} not connected")
+                })
+                .font(design::regular(11.5))
+                .color(t.text_faint),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if design::icon_button(ui, t, icons::CLOSE, "Remove", false).clicked() {
+                    remove = Some(i);
+                }
+                if i > 0 && design::icon_button(ui, t, icons::ARROW_UP, "Move up", false).clicked()
+                {
+                    up = Some(i);
+                }
+            });
+        });
+    }
+    if let Some(i) = remove {
+        settings.fallbacks.remove(i);
+        settings.dirty = true;
+    }
+    if let Some(i) = up {
+        settings.fallbacks.swap(i, i - 1);
+        settings.dirty = true;
+    }
+    let candidates: Vec<(usize, String)> = settings
+        .live_models()
+        .into_iter()
+        .filter(|(pi, m)| {
+            let id = settings.providers[*pi].kind.id();
+            !settings
+                .fallbacks
+                .iter()
+                .any(|f| f.provider == id && f.model == *m)
+        })
+        .map(|(pi, m)| (pi, m.to_string()))
+        .collect();
+    if candidates.is_empty() {
+        if settings.fallbacks.is_empty() {
+            design::hint(ui, t, "Connect a provider to choose fallback models.");
+        }
+        return;
+    }
+    let resp = design::button_ex(
+        ui,
+        t,
+        Kind::Secondary,
+        Some(icons::ADD),
+        "Add a fallback model",
+        true,
+        28.0,
+    );
+    let filter_id = ui.id().with("fallback-filter");
+    if resp.clicked() {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(filter_id, String::new()));
+    }
+    egui::Popup::menu(&resp)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_width(300.0);
+            let mut filter: String = ui
+                .ctx()
+                .data_mut(|d| d.get_temp(filter_id).unwrap_or_default());
+            if candidates.len() > 8 {
+                design::text_field(
+                    ui,
+                    t,
+                    &mut filter,
+                    "Filter models\u{2026}",
+                    Some(icons::SEARCH),
+                );
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(filter_id, filter.clone()));
+            }
+            let f = filter.trim().to_lowercase();
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for (pi, m) in &candidates {
+                        if !f.is_empty() && !m.to_lowercase().contains(&f) {
+                            continue;
+                        }
+                        let hint = settings.providers[*pi].name.clone();
+                        if design::menu_item_ex(ui, t, "", m, &hint, true, false) {
+                            let id = settings.providers[*pi].kind.id().to_string();
+                            settings.fallbacks.push(SavedModel {
+                                provider: id,
+                                model: m.clone(),
+                            });
+                            settings.dirty = true;
+                            egui::Popup::close_all(ui.ctx());
+                        }
+                    }
+                });
+        });
 }
 
 #[derive(Default)]
@@ -2078,17 +2747,41 @@ fn provider_card(ui: &mut egui::Ui, t: &Theme, p: &mut Provider) -> CardAction {
                     });
                 }
             });
+            if p.base_url.to_lowercase().contains("logfare") {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{}  Logfare stores all API traffic for research \u{2014} don't send \
+                         anything private through it.",
+                        icons::ERROR_WARNING
+                    ))
+                    .font(design::regular(11.5))
+                    .color(t.warning),
+                );
+            }
             match &p.status {
                 ConnStatus::Connected => {
                     ui.add_space(6.0);
+                    let mut text = format!(
+                        "{}  Connected{} \u{b7} {} chat model{}",
+                        icons::CHECKBOX_CIRCLE_FILL,
+                        p.latency_ms
+                            .map(|ms| format!(" in {ms} ms"))
+                            .unwrap_or_default(),
+                        p.models.len(),
+                        if p.models.len() == 1 { "" } else { "s" }
+                    );
+                    if p.hidden_models > 0 {
+                        text.push_str(&format!(
+                            " ({} image/audio/video model{} hidden)",
+                            p.hidden_models,
+                            if p.hidden_models == 1 { "" } else { "s" }
+                        ));
+                    }
                     ui.label(
-                        RichText::new(format!(
-                            "{}  {} models available",
-                            icons::CHECKBOX_CIRCLE_FILL,
-                            p.models.len()
-                        ))
-                        .font(design::regular(12.0))
-                        .color(t.success),
+                        RichText::new(text)
+                            .font(design::regular(12.0))
+                            .color(t.success),
                     );
                 }
                 ConnStatus::Failed(msg) => {
@@ -2114,6 +2807,8 @@ mod tests {
             token,
             result,
             retryable,
+            rate_limited: false,
+            truncated: false,
         }
     }
 

@@ -189,6 +189,12 @@ impl ChipLibrary {
         self.chips.insert(def.id, def);
     }
 
+    /// Re-sync the id counter with the stored chips (see [`Circuit`]'s counterpart).
+    pub(crate) fn fix_counter(&mut self) {
+        let max = self.chips.keys().map(|id| id.0 + 1).max().unwrap_or(0);
+        self.next_id = self.next_id.max(max);
+    }
+
     pub fn get(&self, id: ChipId) -> Option<&ChipDef> {
         self.chips.get(&id)
     }

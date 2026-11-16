@@ -50,6 +50,11 @@ pub struct ChatRecord {
     /// "message", "auto" (agent auto-check), "error", or "notice".
     #[serde(default)]
     pub kind: String,
+    /// For an auto-check: the one-line result shown to the user, and the facts behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

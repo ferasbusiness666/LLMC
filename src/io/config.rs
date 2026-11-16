@@ -62,6 +62,28 @@ pub struct AppConfig {
     /// Keep each project's assistant conversation inside its `.llmc` file.
     #[serde(default = "default_true")]
     pub save_chat: bool,
+    /// Models the assistant switches to, in order, when the current one is rate-limited.
+    #[serde(default)]
+    pub fallback_models: Vec<SavedModel>,
+    /// Write prompt and reply text to the local AI request log (metadata is always logged).
+    #[serde(default = "default_true")]
+    pub log_prompts: bool,
+    #[serde(default)]
+    pub window: Option<WindowState>,
+    /// Project files that were open when the app last closed (reopened on launch).
+    #[serde(default)]
+    pub open_tabs: Vec<PathBuf>,
+}
+
+/// The main window's last size and position (logical points), restored on the next launch.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 /// Persisted, non-secret configuration for one AI provider.
@@ -93,6 +115,10 @@ impl Default for AppConfig {
             show_minimap: true,
             show_palette: true,
             save_chat: true,
+            fallback_models: Vec::new(),
+            log_prompts: true,
+            window: None,
+            open_tabs: Vec::new(),
         }
     }
 }
@@ -102,8 +128,13 @@ const MAX_RECENT: usize = 10;
 
 impl AppConfig {
     fn path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("dev", "llmc", "LLMC")
-            .map(|dirs| dirs.config_dir().join("config.json"))
+        Self::dir().map(|d| d.join("config.json"))
+    }
+
+    /// The app's config directory (also holds the single-instance lock, crash log and
+    /// autosaves).
+    pub fn dir() -> Option<PathBuf> {
+        directories::ProjectDirs::from("dev", "llmc", "LLMC").map(|d| d.config_dir().to_path_buf())
     }
 
     /// Load config, falling back to defaults on any error (missing file, bad JSON).

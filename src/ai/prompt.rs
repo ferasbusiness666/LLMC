@@ -18,7 +18,7 @@ const MAX_WIRES_LISTED: usize = 600;
 /// The system prompt: the engineer's playbook (plan → build small verified chips bottom-up →
 /// compose → test), the JSON command protocol, and the current project as context so edits are
 /// grounded in what's on the canvas.
-pub fn system_prompt(m: &CircuitManager) -> String {
+pub fn system_prompt(m: &CircuitManager, selected: &[BlockId]) -> String {
     format!(
         "You are the built-in AI of LLMC, a digital-logic builder and simulator. You design, \
          build, edit, and TEST circuits directly on the user's canvas via JSON commands.\n\
@@ -63,7 +63,17 @@ pub fn system_prompt(m: &CircuitManager) -> String {
          {{\"set\":{{\"WE\":0}},\"pulse\":[\"CLK\"]}},{{\"ticks\":4}},{{\"wait\":0.5}}]}}\n\
          \x20 \"set\" levels persist across steps; \"pulse\" drives a switch/button high then low \
          (one clock edge pair); \"ticks\" advances N transitions of the fastest clock block; \
-         \"wait\" lets seconds of clock time pass. Every LED is reported after each step.\n\
+         \"wait\" lets seconds of clock time pass. Every LED is reported after each step. Add \
+         \"expect\":{{\"Q\":1}} to a step to CHECK LED levels \u{2014} failures are reported.\n\
+         - {{\"op\":\"disconnect\",\"from\":\"u1\",\"to\":\"u2\"}} removes the wire(s) between two \
+         blocks (add \"from_port\"/\"to_port\" to remove just one) \u{2014} rewire without \
+         deleting blocks.\n\
+         - {{\"op\":\"delete_chip\",\"name\":\"Old\"}} deletes a chip definition and its copies.\n\
+         - Read-only (no edit, results come back in the auto-check): \
+         {{\"op\":\"inspect\",\"targets\":[\"A\",\"u2\"]}} (pin values and drivers), \
+         {{\"op\":\"trace\",\"target\":\"CARRY\"}} (the chain of values feeding a block), \
+         {{\"op\":\"highlight\",\"targets\":[\"u1\",\"u2\"],\"note\":\"\u{2026}\"}} (point at \
+         blocks on the user's canvas while explaining).\n\
          \n\
          HANDLES: \"from\"/\"to\"/\"target\" accept the \"ref\" you gave a new block, a numeric \
          id from the context below, or a block's label.\n\
@@ -95,13 +105,68 @@ pub fn system_prompt(m: &CircuitManager) -> String {
          one column per stage (x = 0, 8, 16, \u{2026}), ~4 rows between blocks in a column. \
          Position is cosmetic \u{2014} correctness comes from wires.\n\
          \n\
+         RULES:\n\
+         1. KEEP THE USER'S WORK. Build new parts beside the existing circuit (see FREE SPACE). \
+         Never remove, rewire or rebuild blocks the user placed unless they asked you to change \
+         them; if something must go, ASK first (reply without a json block).\n\
+         2. If the request is ambiguous, ask one short question instead of guessing.\n\
+         3. When you say you will change the circuit, DO IT in the same reply: end with the json \
+         block. Never describe changes you don't send.\n\
+         4. In prose, refer to blocks by their labels (A, SUM, CLK), never by #id. Label every \
+         switch, button, clock and LED you add.\n\
+         5. \"this\"/\"these\"/\"the selected\u{2026}\" means the SELECTED blocks listed below.\n\
+         \n\
          FINISHING: when the auto-check shows the circuit does what the user asked, reply with \
          a short summary and NO json block \u{2014} that ends the run. Include a json block ONLY \
          to change or test the circuit; for plain questions, just answer.\n\
          \n\
-         CURRENT STATE:\n{}",
-        circuit_context(m)
+         CURRENT STATE:\n{}{}{}",
+        circuit_context(m),
+        free_space(m),
+        selection_context(m, selected)
     )
+}
+
+/// Where new parts can go without landing on the user's blocks.
+fn free_space(m: &CircuitManager) -> String {
+    let mut max = (i32::MIN, i32::MIN);
+    let mut min_y = i32::MAX;
+    for b in m.circuit.iter_blocks() {
+        let size = b.footprint(&m.chips);
+        max.0 = max.0.max(b.pos.x + size.x.ceil() as i32);
+        max.1 = max.1.max(b.pos.y + size.y.ceil() as i32);
+        min_y = min_y.min(b.pos.y);
+    }
+    if max.0 == i32::MIN {
+        return String::new();
+    }
+    format!(
+        "\nFREE SPACE: the existing blocks end at x={} and y={}. Put new parts at x \u{2265} {} \
+         (starting at y={min_y}), or at y \u{2265} {}.",
+        max.0,
+        max.1,
+        max.0 + 6,
+        max.1 + 4
+    )
+}
+
+/// The user's current selection, so "fix this" has a referent.
+fn selection_context(m: &CircuitManager, selected: &[BlockId]) -> String {
+    let names: Vec<String> = selected
+        .iter()
+        .filter(|id| m.circuit.block(**id).is_some())
+        .take(40)
+        .map(|id| format!("#{id} {}", super::apply::block_display_name(m, *id)))
+        .collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nSELECTED by the user ({}): {}",
+            selected.len(),
+            names.join(", ")
+        )
+    }
 }
 
 fn kind_name(m: &CircuitManager, b: &Block) -> String {
@@ -276,11 +341,97 @@ fn unwired_inputs(m: &CircuitManager) -> Vec<String> {
     out
 }
 
+/// The automatic post-edit "auto-check": the full text handed back to the model, plus a short
+/// user-facing version for the chat (the model's instructions never leak into the UI).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Observation {
+    /// Sent to the model as the next user turn.
+    pub text: String,
+    /// One line for the user, e.g. "16/16 input cases checked · 1 unwired input".
+    pub summary: String,
+    /// The facts (truth table, timeline, test results) without instructions to the model, shown
+    /// when the user expands the note.
+    pub details: String,
+}
+
+/// Rows of a clock timeline in the auto-check.
+const TIMELINE_EDGES: usize = 8;
+
+/// Does the circuit contain feedback (a loop at the top level, or a stateful chip)? Its outputs
+/// then depend on history, so a truth table can't judge it.
+pub fn has_feedback(m: &CircuitManager) -> bool {
+    fn cyclic(c: &crate::model::Circuit) -> bool {
+        let mut adj: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+        for w in c.iter_connections() {
+            adj.entry(w.from.block).or_default().push(w.to.block);
+        }
+        // Iterative three-color DFS.
+        let mut state: BTreeMap<BlockId, u8> = BTreeMap::new(); // 1 = on stack, 2 = done
+        for &start in adj.keys() {
+            if state.contains_key(&start) {
+                continue;
+            }
+            let mut stack: Vec<(BlockId, usize)> = vec![(start, 0)];
+            state.insert(start, 1);
+            while let Some((node, i)) = stack.pop() {
+                let next = adj.get(&node).and_then(|v| v.get(i)).copied();
+                match next {
+                    Some(n) => {
+                        stack.push((node, i + 1));
+                        match state.get(&n) {
+                            Some(1) => return true,
+                            Some(_) => {}
+                            None => {
+                                state.insert(n, 1);
+                                stack.push((n, 0));
+                            }
+                        }
+                    }
+                    None => {
+                        state.insert(node, 2);
+                    }
+                }
+            }
+        }
+        false
+    }
+    let mut stateful_chips = HashSet::new();
+    for d in m.chips.iter() {
+        if cyclic(&d.circuit) {
+            stateful_chips.insert(d.id);
+        }
+    }
+    // A chip that contains a stateful chip is stateful too.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for d in m.chips.iter() {
+            if !stateful_chips.contains(&d.id)
+                && d.direct_children()
+                    .iter()
+                    .any(|c| stateful_chips.contains(c))
+            {
+                stateful_chips.insert(d.id);
+                changed = true;
+            }
+        }
+    }
+    cyclic(&m.circuit)
+        || m.circuit
+            .iter_blocks()
+            .any(|b| matches!(b.ty, BlockType::Chip(c) if stateful_chips.contains(&c)))
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 /// The automatic post-edit "auto-check" handed back to the agent: skipped-command errors,
-/// chip-verification and test results, unwired inputs, and the circuit's real behavior (a truth
-/// table when small enough, else a settled snapshot). This is what lets the assistant verify
-/// and fix its own work without the user prodding it.
-pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> String {
+/// chip-verification and test results, unwired inputs, and the circuit's real behavior — a
+/// truth table for combinational logic, a clock timeline for clocked logic, a settled snapshot
+/// when there are too many inputs. This is what lets the assistant verify and fix its own work
+/// without the user prodding it.
+pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> Observation {
     let c = &m.circuit;
     let inputs: Vec<&Block> = c
         .iter_blocks()
@@ -288,17 +439,43 @@ pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> String {
         .collect();
     let outputs: Vec<&Block> = c.iter_blocks().filter(|b| b.ty == BlockType::Led).collect();
     let has_clock = c.iter_blocks().any(|b| b.ty == BlockType::Clock);
+    let feedback = has_feedback(m);
 
-    let mut out = String::from("Auto-check after your edits.\n");
+    let mut facts = String::new();
+    let mut summary: Vec<String> = Vec::new();
 
     if !report.errors.is_empty() {
-        out.push_str("SKIPPED COMMANDS (these did NOT happen \u{2014} fix and resend them):\n");
+        facts.push_str("SKIPPED COMMANDS (these did NOT happen \u{2014} fix and resend them):\n");
         for e in &report.errors {
-            let _ = writeln!(out, "  - {e}");
+            let _ = writeln!(facts, "  - {e}");
         }
+        summary.push(format!(
+            "{} skipped",
+            plural(report.errors.len(), "command", "commands")
+        ));
     }
     for obs in &report.observations {
-        let _ = writeln!(out, "{obs}");
+        let _ = writeln!(facts, "{obs}");
+    }
+    let chips_checked = report
+        .observations
+        .iter()
+        .filter(|o| o.starts_with("Defined chip"))
+        .count();
+    if chips_checked > 0 {
+        summary.push(format!(
+            "{} verified",
+            plural(chips_checked, "chip", "chips")
+        ));
+    }
+    if report.checks_passed + report.checks_failed > 0 {
+        summary.push(format!(
+            "test checks {}/{} passed",
+            report.checks_passed,
+            report.checks_passed + report.checks_failed
+        ));
+    } else if report.tests_run > 0 {
+        summary.push(plural(report.tests_run, "test run", "test runs"));
     }
 
     let name = |b: &Block| match &b.label {
@@ -310,7 +487,7 @@ pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> String {
     let unwired = unwired_inputs(m);
     if !unwired.is_empty() {
         let _ = writeln!(
-            out,
+            facts,
             "UNWIRED INPUTS ({}): {}{}",
             unwired.len(),
             unwired
@@ -321,22 +498,85 @@ pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> String {
                 .join(", "),
             if unwired.len() > 12 { ", \u{2026}" } else { "" }
         );
+        summary.push(plural(unwired.len(), "unwired input", "unwired inputs"));
     }
 
     // A fresh sim so the user's live switch settings aren't disturbed.
     let mut sim = Simulation::build(&m.circuit, &m.chips);
     if sim.has_recursive_chips() {
-        out.push_str("WARNING: a chip contains itself; those instances are inert.\n");
+        facts.push_str("WARNING: a chip contains itself; those instances are inert.\n");
     }
 
-    if inputs.is_empty() || outputs.is_empty() {
+    let mut unstable = false;
+    if outputs.is_empty() {
         let _ = writeln!(
-            out,
-            "Circuit has {} switch/button input(s) and {} LED output(s); add at least one of each \
-             to make behavior observable.",
-            inputs.len(),
-            outputs.len()
+            facts,
+            "The circuit has no LED outputs, so its behavior can't be observed \u{2014} add LEDs \
+             for the results."
         );
+    } else if has_clock {
+        // Clocked logic: a truth table at time 0 says nothing. Run the clocks instead and show
+        // how the LEDs evolve, with the inputs at their current levels.
+        sim.step(0.0);
+        let leds: Vec<String> = outputs.iter().map(|b| name(b)).collect();
+        let ins: Vec<String> = inputs
+            .iter()
+            .map(|b| format!("{}={}", name(b), sim.switch_value(b.id) as u8))
+            .collect();
+        let _ = writeln!(
+            facts,
+            "Clock timeline (inputs held: {}) \u{2014} LEDs [{}] after each clock edge:",
+            if ins.is_empty() {
+                "none".to_string()
+            } else {
+                ins.join(" ")
+            },
+            leds.join(", ")
+        );
+        let read = |sim: &Simulation| -> String {
+            outputs
+                .iter()
+                .map(|b| {
+                    if sim.led_value(b.id).unwrap_or(false) {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let _ = writeln!(facts, "  t=0.000s | {}", read(&sim));
+        let mut edges = 0;
+        for _ in 0..TIMELINE_EDGES {
+            let Some(dt) = sim.time_to_next_edge() else {
+                break;
+            };
+            sim.step(dt + 1e-9);
+            edges += 1;
+            unstable |= sim.is_unstable();
+            let _ = writeln!(facts, "  t={:.3}s | {}", sim.time(), read(&sim));
+        }
+        facts.push_str(
+            "(Sequential logic: verify specific sequences with \"test\" \u{2014} set inputs, \
+             pulse or tick the clock, and give \"expect\" levels.)\n",
+        );
+        summary.push(format!(
+            "ran the clock for {}",
+            plural(edges, "edge", "edges")
+        ));
+    } else if inputs.is_empty() {
+        sim.step(0.0);
+        let reads: Vec<String> = outputs
+            .iter()
+            .map(|b| format!("{}={}", name(b), sim.led_value(b.id).unwrap_or(false) as u8))
+            .collect();
+        let _ = writeln!(
+            facts,
+            "No switch/button inputs; settled LEDs: {}",
+            reads.join(" ")
+        );
+        summary.push("read the LEDs".to_string());
     } else if inputs.len() > 6 {
         // Too many combinations for a full table — give a settled snapshot instead and point at
         // the `test` op for targeted verification.
@@ -350,19 +590,25 @@ pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> String {
             .map(|b| format!("{}={}", name(b), sim.led_value(b.id).unwrap_or(false) as u8))
             .collect();
         let _ = writeln!(
-            out,
+            facts,
             "{} inputs \u{2014} too many for a full truth table. Settled snapshot: inputs {}; \
-             LEDs {}. Use {{\"op\":\"test\",\"steps\":[\u{2026}]}} to verify specific sequences.",
+             LEDs {}. Use {{\"op\":\"test\",\"steps\":[\u{2026}]}} with \"expect\" to verify \
+             specific cases.",
             inputs.len(),
             states.join(" "),
             reads.join(" ")
         );
+        summary.push(format!("snapshot of {} inputs", inputs.len()));
     } else {
-        if has_clock {
-            out.push_str("(Circuit has a clock; table is a settled snapshot at time 0.)\n");
+        if feedback {
+            facts.push_str(
+                "(The circuit has FEEDBACK (latch/memory): rows below were applied in this order \
+                 and each depends on the previous state. Verify behavior with \"test\" steps and \
+                 \"expect\" instead of trusting this table.)\n",
+            );
         }
         let _ = writeln!(
-            out,
+            facts,
             "Truth table \u{2014} inputs [{}] \u{2192} outputs [{}]:",
             inputs
                 .iter()
@@ -378,7 +624,6 @@ pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> String {
                 .join(", "),
         );
         let n = inputs.len();
-        let mut unstable = false;
         for combo in 0..(1u32 << n) {
             for (i, b) in inputs.iter().enumerate() {
                 sim.set_switch(b.id, (combo >> (n - 1 - i)) & 1 == 1);
@@ -404,20 +649,41 @@ pub fn agent_observation(m: &CircuitManager, report: &ApplyReport) -> String {
                     }
                 })
                 .collect();
-            let _ = writeln!(out, "  {} | {}", ins.join(" "), outs.join(" "));
+            let _ = writeln!(facts, "  {} | {}", ins.join(" "), outs.join(" "));
         }
-        if unstable {
-            out.push_str(
-                "WARNING: the circuit OSCILLATES (never settles) for some inputs \u{2014} check \
-                 for unintended feedback loops.\n",
-            );
-        }
+        summary.push(format!(
+            "{} input cases checked{}",
+            1u32 << n,
+            if feedback { " (stateful)" } else { "" }
+        ));
     }
-    out.push_str(
-        "If this matches the request, reply with a brief summary and NO commands. Otherwise fix \
-         it with more commands.",
+    if unstable {
+        facts.push_str(
+            "WARNING: the circuit OSCILLATES (never settles) \u{2014} check for unintended \
+             feedback loops (an odd number of inverters in a loop).\n",
+        );
+        summary.push("oscillates!".to_string());
+    }
+
+    let details = facts.trim_end().to_string();
+    let text = format!(
+        "Auto-check after your edits.\n{facts}If this matches the request, reply with a brief \
+         summary and NO commands. Otherwise fix it with more commands."
     );
-    out
+    let summary = if summary.is_empty() {
+        "Checked the circuit".to_string()
+    } else {
+        let mut s = summary.join(" \u{b7} ");
+        if let Some(first) = s.get(..1) {
+            s = format!("{}{}", first.to_uppercase(), &s[1..]);
+        }
+        s
+    };
+    Observation {
+        text,
+        summary,
+        details,
+    }
 }
 
 #[cfg(test)]
@@ -442,7 +708,7 @@ mod tests {
             )
             .ops,
         );
-        let obs = agent_observation(&m, &r);
+        let obs = agent_observation(&m, &r).text;
         assert!(obs.contains("SKIPPED COMMANDS"), "{obs}");
         assert!(obs.contains("UNWIRED INPUTS (1)"), "{obs}");
         assert!(obs.contains("Truth table"), "{obs}");
@@ -471,7 +737,7 @@ mod tests {
 
     #[test]
     fn system_prompt_mentions_every_command() {
-        let p = system_prompt(&CircuitManager::new());
+        let p = system_prompt(&CircuitManager::new(), &[]);
         for op in [
             "\"add\"",
             "\"connect\"",
@@ -481,8 +747,76 @@ mod tests {
             "\"test\"",
             "pulse",
             "ticks",
+            "\"disconnect\"",
+            "\"inspect\"",
+            "\"trace\"",
+            "\"highlight\"",
+            "\"delete_chip\"",
+            "expect",
         ] {
             assert!(p.contains(op), "missing {op}");
         }
+    }
+
+    #[test]
+    fn clocked_circuits_get_a_timeline_not_a_truth_table() {
+        let mut m = CircuitManager::new();
+        let r = apply_ops(
+            &mut m,
+            parse_reply(
+                r#"{"commands":[
+                {"op":"add","ref":"c","kind":"clock","label":"CLK","hz":2,"x":0,"y":0},
+                {"op":"add","ref":"l","kind":"led","label":"Q","x":6,"y":0},
+                {"op":"connect","from":"c","to":"l"}]}"#,
+            )
+            .ops,
+        );
+        let o = agent_observation(&m, &r);
+        assert!(o.text.contains("Clock timeline"), "{}", o.text);
+        assert!(!o.text.contains("add at least one"), "{}", o.text);
+        assert!(o.details.contains("t=0.250s | 1"), "{}", o.details);
+        assert!(
+            o.summary.starts_with("Ran the clock for 8 edges"),
+            "{}",
+            o.summary
+        );
+        assert!(
+            !o.details.contains("If this matches"),
+            "instructions stay out of the UI"
+        );
+    }
+
+    #[test]
+    fn feedback_is_detected_and_flagged() {
+        let mut m = CircuitManager::new();
+        let r = apply_ops(
+            &mut m,
+            parse_reply(
+                r#"{"commands":[
+                {"op":"add","ref":"s","kind":"switch","label":"S","x":0,"y":0},
+                {"op":"add","ref":"r","kind":"switch","label":"R","x":0,"y":4},
+                {"op":"add","ref":"n1","kind":"nor","x":6,"y":0},
+                {"op":"add","ref":"n2","kind":"nor","x":6,"y":4},
+                {"op":"add","ref":"q","kind":"led","label":"Q","x":12,"y":0},
+                {"op":"connect","from":"r","to":"n1"},{"op":"connect","from":"n2","to":"n1"},
+                {"op":"connect","from":"s","to":"n2"},{"op":"connect","from":"n1","to":"n2"},
+                {"op":"connect","from":"n1","to":"q"}]}"#,
+            )
+            .ops,
+        );
+        assert!(has_feedback(&m));
+        let o = agent_observation(&m, &r);
+        assert!(o.text.contains("FEEDBACK"), "{}", o.text);
+        assert!(o.summary.contains("(stateful)"), "{}", o.summary);
+    }
+
+    #[test]
+    fn prompt_lists_selection_and_free_space() {
+        let mut m = CircuitManager::new();
+        let id = m.add_block(BlockType::Not, Pos::new(2, 3));
+        let p = system_prompt(&m, &[id]);
+        assert!(p.contains("SELECTED by the user (1): #0 NOT"), "{p}");
+        assert!(p.contains("FREE SPACE"), "{p}");
+        assert!(p.contains("KEEP THE USER'S WORK"));
     }
 }

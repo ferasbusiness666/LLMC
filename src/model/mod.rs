@@ -6,6 +6,7 @@ pub mod circuit;
 pub mod connection;
 pub mod geometry;
 pub mod ids;
+pub mod repair;
 
 pub use block::{Block, BlockType, PortLayout, MAX_GATE_INPUTS};
 pub use chip::{ChipDef, ChipLibrary, PinMap};
@@ -13,3 +14,4 @@ pub use circuit::Circuit;
 pub use connection::{Connection, Port, PortKind};
 pub use geometry::{Orientation, Pos, Rotation, Vec2f};
 pub use ids::{BlockId, ChipId, ConnId};
+pub use repair::repair_project;
