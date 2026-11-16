@@ -1890,14 +1890,17 @@ pub fn settings_dialog(ctx: &egui::Context, t: &Theme, settings: &mut AiSettings
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
+                let full = super::ai_log::log_path_display();
+                let short = std::path::Path::new(&full)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| full.clone());
                 ui.label(
-                    RichText::new(format!(
-                        "Request log: {}",
-                        super::ai_log::log_path_display()
-                    ))
-                    .font(design::regular(11.0))
-                    .color(t.text_faint),
-                );
+                    RichText::new(format!("{}  Request log: {short}", icons::FILE))
+                        .font(design::regular(11.5))
+                        .color(t.text_faint),
+                )
+                .on_hover_text(full);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if design::button(ui, t, Kind::Primary, None, "Done").clicked() {
                         ui.close();
