@@ -185,6 +185,8 @@ pub struct Document {
     /// Blocks the assistant created in this tab (it may freely change those; the user's own
     /// blocks are protected unless the request asks for changes).
     pub ai_blocks: HashSet<BlockId>,
+    /// The "simulation is paused" hint was shown (once per tab).
+    paused_hint: bool,
 }
 
 /// A temporary highlight drawn around some blocks.
@@ -209,7 +211,7 @@ impl Document {
             manager,
             sim,
             sim_rev: rev,
-            running: false,
+            running: true,
             speed: 1.0,
             camera,
             tool: Tool::Select,
@@ -236,11 +238,13 @@ impl Document {
             paste_count: 0,
             glow: None,
             ai_blocks: HashSet::new(),
+            paused_hint: false,
         };
-        // The loaded/empty content is the "saved" baseline. A document opens paused — and paused
-        // means frozen, so nothing is evaluated until Run or Step.
+        // The loaded/empty content is the "saved" baseline. A document opens RUNNING, so a
+        // flipped switch lights its LEDs right away (Pause freezes everything).
         doc.saved_fingerprint = doc.content_fingerprint();
         doc.fingerprint_rev = doc.manager.revision();
+        doc.sim.step(0.0);
         doc
     }
 
@@ -249,6 +253,25 @@ impl Document {
     }
 
     pub fn from_project(project: Project, path: PathBuf) -> Self {
+        let title = title_from_path(&path);
+        Self::from_project_at(project, Some(path), title)
+    }
+
+    /// A project recovered from an autosave after a crash: it opens with unsaved changes (it's
+    /// newer than whatever is on disk).
+    pub fn recovered(project: Project, original: Option<PathBuf>, title: String) -> Self {
+        let mut doc = Self::from_project_at(project, original, title);
+        doc.mark_modified();
+        doc
+    }
+
+    /// Treat the content as differing from the file on disk.
+    pub fn mark_modified(&mut self) {
+        self.saved_fingerprint = self.content_fingerprint().wrapping_add(1);
+        self.fingerprint_rev = u64::MAX;
+    }
+
+    fn from_project_at(project: Project, path: Option<PathBuf>, title: String) -> Self {
         let (mut circuit, mut chips) = (project.circuit, project.chips);
         // Make a damaged or hand-edited file consistent before anything touches it.
         let repairs = llmc::model::repair_project(&mut circuit, &mut chips);
@@ -257,8 +280,7 @@ impl Document {
             pan: Vec2::new(project.camera.pan_x, project.camera.pan_y),
             zoom: project.camera.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
         };
-        let title = title_from_path(&path);
-        let mut doc = Self::new(manager, Some(path), title, camera);
+        let mut doc = Self::new(manager, path, title, camera);
         doc.ai.restore(&project.chat);
         if !repairs.is_empty() {
             doc.notify(
@@ -269,8 +291,7 @@ impl Document {
                 ),
             );
             // The repaired content differs from the file on disk.
-            doc.saved_fingerprint = doc.saved_fingerprint.wrapping_add(1);
-            doc.fingerprint_rev = u64::MAX;
+            doc.mark_modified();
         }
         if project.camera.zoom <= 0.0 || !project.camera.pan_x.is_finite() {
             doc.frame_request = Some(FrameRequest::All);
@@ -433,6 +454,13 @@ impl Document {
         self.sim.set_switch(id, level);
         if self.running {
             self.sim.step(0.0);
+        } else if !self.paused_hint {
+            // Otherwise a flipped switch with dark LEDs looks broken.
+            self.paused_hint = true;
+            self.notify(
+                NoticeKind::Info,
+                "The simulation is paused \u{2014} press Run (F5) to see the circuit react.",
+            );
         }
     }
 
@@ -699,15 +727,26 @@ impl Document {
         if !has_out {
             return Err("A chip needs at least one LED (it becomes an output pin).".into());
         }
+        let has_in = circuit.iter_blocks().any(|b| b.ty == BlockType::Switch);
         let id = self.manager.chips.allocate_id();
         let def = ChipDef::from_circuit(id, name, circuit);
         self.manager.put_chip(def);
-        self.notify(
-            NoticeKind::Success,
-            format!(
-                "Created chip \u{201c}{name}\u{201d} \u{2014} find it under Chips in the sidebar"
-            ),
-        );
+        if has_in {
+            self.notify(
+                NoticeKind::Success,
+                format!(
+                    "Created chip \u{201c}{name}\u{201d} \u{2014} find it under Chips in the sidebar"
+                ),
+            );
+        } else {
+            self.notify(
+                NoticeKind::Warning,
+                format!(
+                    "Created chip \u{201c}{name}\u{201d}, but it has no input pins (add switches \
+                     to make inputs), so its outputs never change."
+                ),
+            );
+        }
         Ok(id)
     }
 
@@ -949,12 +988,18 @@ mod tests {
     #[test]
     fn paused_sim_is_frozen_until_run_and_keeps_state_across_edits() {
         let mut d = doc();
+        assert!(d.running, "documents open running");
+        d.toggle_running();
         let s = d.manager.add_block(BlockType::Switch, Pos::new(0, 0));
         let l = d.manager.add_block(BlockType::Led, Pos::new(4, 0));
         d.connect(Port::output(s, 0), Port::input(l, 0));
         d.set_input(s, true, true);
         d.tick(0.016);
         assert_eq!(d.sim.led_value(l), Some(false), "paused: nothing evaluated");
+        assert!(
+            matches!(d.notices.last().map(|n| &n.kind), Some(NoticeKind::Info)),
+            "flipping an input while paused explains why nothing reacts"
+        );
         d.toggle_running();
         d.tick(0.016);
         assert_eq!(d.sim.led_value(l), Some(true));
@@ -981,7 +1026,7 @@ mod tests {
         src.connect(Port::output(s, 0), Port::input(inst, 0));
         src.connect(Port::output(inst, 0), Port::input(led, 0));
         src.set_input(s, true, true);
-        src.toggle_running();
+        src.tick(0.0);
         assert_eq!(src.sim.led_value(led), Some(true));
 
         // Edit: insert a NOT between the pin markers, then apply back.

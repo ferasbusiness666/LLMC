@@ -32,7 +32,11 @@ whole CPUs.
   changes.
 - **Projects** — tabs, recent files, drag-and-drop `.llmc` files onto the window, crash-safe
   saving, unsaved-changes prompts, and the assistant conversation saved with the project
-  (optional).
+  (optional). Damaged files are repaired on open (and you're told what was fixed).
+- **Safety nets** — unsaved work is autosaved every 30 s and offered back after a crash or
+  power loss; a crash writes `crash.log`; one LLMC runs at a time (opening a file while it's
+  running adds a tab); the window, its size and your open projects come back on the next
+  launch.
 - **Light & dark themes** — one design system (Inter, JetBrains Mono, Remix icons) across the
   whole app.
 
@@ -42,13 +46,27 @@ Open it with **Assistant** (`Ctrl+L`) and connect a provider under *File → AI 
 OpenRouter, Google AI Studio, Cerebras, Mistral, Ollama Cloud, opencode Zen — or **Custom**, any
 OpenAI-compatible endpoint, including keyless local servers (Ollama, LM Studio, llama.cpp).
 Keys are stored in the OS keychain (Windows Credential Manager) and never leave your machine.
+Only models that can chat are offered (image, video, audio and embedding models are hidden),
+and the model you used last is remembered.
 
-In **Agent** mode the assistant works like an engineer: it plans, defines small chips that are
-truth-table-verified the moment they're created, composes them, then reads an automatic
+With **Auto-check** on, the assistant works like an engineer: it plans, defines small chips that
+are truth-table-verified the moment they're created, composes them, then reads an automatic
 *auto-check* of the real circuit after every step and keeps fixing until it matches your
-request — for as long as it needs. Sequential designs are verified with scripted tests that
-set inputs, pulse clocks, and let time pass. Everything it does is one undo step per reply, and
-**Stop** halts it instantly.
+request — for as long as it needs. Combinational logic gets a truth table; clocked logic gets a
+clock timeline; scripted tests set inputs, pulse clocks, let time pass and check expected LED
+levels. Everything it does is one undo step per reply, and **Stop** halts it instantly.
+
+Guard rails: it never deletes blocks *you* placed unless you asked for a change; what it builds
+glows briefly instead of being selected; a reply that describes changes without sending them is
+caught; commands it got wrong are reported back to it, not dropped. Its commands: `add`,
+`connect`, `disconnect`, `set`, `remove`, `move`, `label`, `defchip`, `delete_chip`, `test`,
+plus read-only `inspect`, `trace` and `highlight` (point at blocks while explaining).
+
+Reliability: no time limit on a reply (only a 5-minute silence counts as a dead connection);
+rate limits and dropped connections are retried with backoff, and a rate-limited model hands
+over to the next one in your **fallback models** list; a reply cut off mid-stream keeps what
+arrived and offers **Continue**. A local request log (`ai.log`, JSON lines with timing, status
+and token usage) helps debugging; prompt text in it can be switched off.
 
 ## Building & running
 

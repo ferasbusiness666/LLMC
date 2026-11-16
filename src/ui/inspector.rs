@@ -700,10 +700,13 @@ fn multi(ui: &mut Ui, doc: &mut Document, t: &Theme, actions: &mut Vec<Inspector
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             let title = match (nb, nw) {
-                (0, 1) => "1 wire".to_string(),
-                (0, w) => format!("{w} wires"),
-                (b, 0) => format!("{b} blocks"),
-                (b, w) => format!("{b} blocks, {w} wires"),
+                (0, w) => design::plural(w, "wire", "wires"),
+                (b, 0) => design::plural(b, "block", "blocks"),
+                (b, w) => format!(
+                    "{}, {}",
+                    design::plural(b, "block", "blocks"),
+                    design::plural(w, "wire", "wires")
+                ),
             };
             ui.label(
                 RichText::new(title)

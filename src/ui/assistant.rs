@@ -1316,7 +1316,7 @@ fn welcome(ui: &mut egui::Ui, t: &Theme) -> Option<&'static str> {
             ui.label(RichText::new("What should we build?").font(design::semibold(16.0)).color(t.text));
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Describe a circuit. In Agent mode the assistant builds it, checks the real truth table, and fixes it until it works.")
+                RichText::new("Describe a circuit. With Auto-check on, the assistant builds it, tests how it really behaves, and fixes it until it works.")
                     .font(design::regular(12.5))
                     .color(t.text_muted),
             );
@@ -2409,8 +2409,7 @@ pub fn settings_dialog(ctx: &egui::Context, t: &Theme, settings: &mut AiSettings
                 ui,
                 t,
                 "Log prompts and replies",
-                "Keeps request text in the local request log for debugging (timing and errors \
-                 are always logged; keys never are).",
+                "Keep request text in ai.log for debugging (keys are never logged).",
                 &mut log,
             ) {
                 settings.log_prompts = log;

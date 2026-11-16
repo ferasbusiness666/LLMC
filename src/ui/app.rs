@@ -13,7 +13,7 @@ use eframe::egui::{
 };
 
 use llmc::backend::{CircuitManager, GroupTransform};
-use llmc::io::{AppConfig, GateStyle, Project, WireStyle};
+use llmc::io::{AppConfig, GateStyle, Project, WindowState, WireStyle};
 use llmc::model::{BlockType, ChipId};
 
 use super::assistant::{self, AiSettings};
@@ -26,6 +26,7 @@ use super::document::{
 use super::icons;
 use super::inspector::{self, InspectorAction};
 use super::palette::{self, PaletteAction};
+use super::session::{self, Autosave, Instance, Recovered};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightTab {
@@ -59,6 +60,8 @@ enum Dialog {
     Close(CloseKind),
     Shortcuts,
     About,
+    /// Unsaved work left behind by a crash, offered for recovery at launch.
+    Recover(Vec<Recovered>),
 }
 
 struct Toast {
@@ -68,6 +71,17 @@ struct Toast {
 }
 
 const TOAST_SECS: f64 = 3.6;
+
+impl Toast {
+    /// Problems stay up long enough to read; long messages get extra time.
+    fn life(&self) -> f64 {
+        let base = match self.kind {
+            NoticeKind::Warning | NoticeKind::Error => 8.0,
+            _ => TOAST_SECS,
+        };
+        base + (self.text.chars().count().saturating_sub(80) as f64) * 0.03
+    }
+}
 
 pub struct LlmcApp {
     docs: Vec<Document>,
@@ -87,16 +101,46 @@ pub struct LlmcApp {
     palette_search: String,
     overlays: Overlays,
     window_title: String,
+    /// Single-instance lock + inbox (other launches hand their files to this window).
+    instance: Option<Instance>,
+    autosave: Autosave,
+    /// Manager revision last autosaved, per document id.
+    autosaved: std::collections::HashMap<u64, u64>,
+    /// Last known window geometry (saved on exit).
+    window_state: Option<WindowState>,
+    /// The window has been checked against the monitor size once.
+    monitor_checked: bool,
+    /// The theme last sent to the native title bar.
+    title_theme: Option<bool>,
+    /// The tab the strip last scrolled into view (by document id).
+    tab_in_view: Option<u64>,
 }
 
 impl LlmcApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         config: AppConfig,
-        initial: Option<PathBuf>,
+        initial: Vec<PathBuf>,
+        instance: Option<Instance>,
     ) -> Self {
         design::install_fonts(&cc.egui_ctx);
         design::apply_style(&cc.egui_ctx, config.dark_mode);
+        let (autosave, recovered) = Autosave::start();
+        let crashed = session::take_crash_marker();
+        if let Some(inbox) = instance.as_ref().map(Instance::inbox_dir) {
+            // Wake the (otherwise idle) UI when another launch hands us files.
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let waiting = std::fs::read_dir(&inbox)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false);
+                if waiting {
+                    ctx.request_repaint();
+                }
+            });
+        }
+        let window_state = config.window;
         let mut app = Self {
             docs: Vec::new(),
             active: 0,
@@ -115,13 +159,40 @@ impl LlmcApp {
             palette_search: String::new(),
             overlays: Overlays::default(),
             window_title: String::new(),
+            instance,
+            autosave,
+            autosaved: std::collections::HashMap::new(),
+            window_state,
+            monitor_checked: false,
+            title_theme: None,
+            tab_in_view: None,
         };
         if app.docs.is_empty() {
             let doc = app.fresh_document();
             app.push_doc(doc);
         }
-        if let Some(path) = initial {
-            app.open_path(&path);
+        // Reopen last session's projects, then whatever was passed on the command line.
+        let reopen: Vec<PathBuf> = app
+            .config
+            .open_tabs
+            .iter()
+            .filter(|p| p.exists())
+            .cloned()
+            .collect();
+        for path in reopen.iter().chain(initial.iter()) {
+            app.open_path(path);
+        }
+        if let Some(log) = crashed {
+            app.docs[app.active].notify(
+                NoticeKind::Warning,
+                format!(
+                    "LLMC closed unexpectedly last time. Details were saved to {}.",
+                    log.display()
+                ),
+            );
+        }
+        if !recovered.is_empty() {
+            app.dialog = Some(Dialog::Recover(recovered));
         }
         let saved = app.config.ai_providers.clone();
         app.ai.apply_config(&saved);
@@ -289,10 +360,16 @@ impl LlmcApp {
     }
 
     fn write_doc(&mut self, i: usize, path: &Path) -> bool {
+        // The project is named after its file (not "untitled").
+        if self.docs[i].chip_edit.is_none() {
+            self.docs[i].manager.circuit.name = title_from_path(path);
+        }
         let project = self.docs[i].to_project(self.config.save_chat);
         match project.save(path) {
             Ok(()) => {
                 self.docs[i].mark_saved();
+                self.autosave.remove(self.docs[i].id);
+                self.autosaved.remove(&self.docs[i].id);
                 self.docs[i].notify(
                     NoticeKind::Success,
                     format!("Saved {}", title_from_path(path)),
@@ -313,6 +390,8 @@ impl LlmcApp {
             return;
         }
         self.docs[i].ai.request_stop();
+        self.autosave.remove(self.docs[i].id);
+        self.autosaved.remove(&self.docs[i].id);
         if self.docs.len() == 1 {
             let doc = self.fresh_document();
             self.docs.clear();
@@ -643,33 +722,36 @@ impl LlmcApp {
         }
         let recent = self.config.recent_files.clone();
         if !recent.is_empty() {
-            ui.menu_button(
-                RichText::new(format!("{}   Open recent", icons::HISTORY))
-                    .font(design::regular(13.0)),
-                |ui| {
-                    ui.set_width(280.0);
-                    for p in &recent {
-                        let name = title_from_path(p);
-                        let dir = p
-                            .parent()
-                            .map(|d| d.display().to_string())
-                            .unwrap_or_default();
-                        if design::menu_item(ui, t, icons::FILE, &name, "") {
-                            self.open_path(p);
-                        }
-                        ui.label(
-                            RichText::new(dir)
-                                .font(design::regular(10.5))
-                                .color(t.text_faint),
+            let row = design::submenu_row(ui, t, icons::HISTORY, "Open recent");
+            egui::containers::menu::SubMenu::new().show(ui, &row, |ui| {
+                ui.set_width(280.0);
+                for p in &recent {
+                    let name = title_from_path(p);
+                    let dir = p
+                        .parent()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_default();
+                    if design::menu_item(ui, t, icons::FILE, &name, "") {
+                        self.open_path(p);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add_space(26.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(dir)
+                                    .font(design::regular(10.5))
+                                    .color(t.text_faint),
+                            )
+                            .truncate(),
                         );
-                    }
-                    design::divider(ui, t);
-                    if design::menu_item(ui, t, icons::DELETE_BIN_6, "Clear recent", "") {
-                        self.config.recent_files.clear();
-                        self.config.save();
-                    }
-                },
-            );
+                    });
+                }
+                design::divider(ui, t);
+                if design::menu_item(ui, t, icons::DELETE_BIN_6, "Clear recent", "") {
+                    self.config.recent_files.clear();
+                    self.config.save();
+                }
+            });
         }
         design::divider(ui, t);
         let chip = self.docs[self.active].chip_edit.is_some();
@@ -1181,8 +1263,15 @@ impl LlmcApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
+                            let active_id = self.docs[self.active].id;
                             for (i, doc) in self.docs.iter().enumerate() {
-                                match tab(ui, &t, doc, i == self.active) {
+                                let (event, rect) = tab(ui, &t, doc, i == self.active);
+                                // A newly active tab (new, opened, Ctrl+Tab) scrolls into view.
+                                if i == self.active && self.tab_in_view != Some(active_id) {
+                                    ui.scroll_to_rect(rect, None);
+                                    self.tab_in_view = Some(active_id);
+                                }
+                                match event {
                                     TabEvent::Select => select = Some(i),
                                     TabEvent::Close => close = Some(i),
                                     TabEvent::CloseOthers => close_others = Some(i),
@@ -1287,10 +1376,10 @@ impl LlmcApp {
                         let c = &doc.manager.circuit;
                         ui.label(
                             RichText::new(format!(
-                                "{} blocks \u{b7} {} wires \u{b7} {} chips",
-                                c.blocks.len(),
-                                c.connections.len(),
-                                doc.manager.chips.len()
+                                "{} \u{b7} {} \u{b7} {}",
+                                design::plural(c.blocks.len(), "block", "blocks"),
+                                design::plural(c.connections.len(), "wire", "wires"),
+                                design::plural(doc.manager.chips.len(), "chip", "chips")
                             ))
                             .font(design::regular(12.0))
                             .color(t.text_muted),
@@ -1462,6 +1551,37 @@ impl LlmcApp {
                     }
                     ui.add_space(6.0);
                     design::hint(ui, &t, "Switches become input pins and LEDs become output pins, ordered top to bottom.");
+                    // What the chip will look like, before it's made.
+                    let (ins, outs) = {
+                        let d = &self.docs[self.active];
+                        let c = &d.manager.circuit;
+                        let count = |ty: BlockType| {
+                            c.iter_blocks()
+                                .filter(|b| b.ty == ty)
+                                .filter(|b| !(from_selection && has_sel) || d.selection.contains(&b.id))
+                                .count()
+                        };
+                        (count(BlockType::Switch), count(BlockType::Led))
+                    };
+                    ui.add_space(6.0);
+                    let warn = ins == 0 || outs == 0;
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  {} \u{b7} {}{}",
+                            if warn { icons::ERROR_WARNING } else { icons::CHECKBOX_CIRCLE_FILL },
+                            design::plural(ins, "input pin", "input pins"),
+                            design::plural(outs, "output pin", "output pins"),
+                            if outs == 0 {
+                                " \u{2014} add at least one LED"
+                            } else if ins == 0 {
+                                " \u{2014} with no inputs its outputs never change"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .font(design::medium(12.0))
+                        .color(if warn { t.warning } else { t.success }),
+                    );
                     if let Some(e) = &error {
                         error_line(ui, e);
                     }
@@ -1714,6 +1834,127 @@ impl LlmcApp {
                     keep = Some(Dialog::About);
                 }
             }
+            Dialog::Recover(items) => {
+                #[derive(PartialEq)]
+                enum Choice {
+                    Recover,
+                    Discard,
+                }
+                let mut choice = None;
+                let r = modal("recover").show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    design::dialog_header(
+                        ui,
+                        &t,
+                        icons::HISTORY,
+                        t.warning,
+                        "Recover unsaved work?",
+                        "LLMC didn't close normally last time. These projects had unsaved changes.",
+                    );
+                    ui.add_space(12.0);
+                    for item in &items {
+                        design::card(&t)
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(icons::FILE)
+                                            .font(design::icon_font(15.0))
+                                            .color(t.text_muted),
+                                    );
+                                    ui.label(
+                                        RichText::new(&item.title)
+                                            .font(design::medium(13.0))
+                                            .color(t.text),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            RichText::new(format!("autosaved {}", item.age()))
+                                                .font(design::regular(11.5))
+                                                .color(t.text_faint),
+                                        );
+                                    });
+                                });
+                                let place = item
+                                    .original
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "Never saved".to_string());
+                                ui.label(
+                                    RichText::new(place)
+                                        .font(design::regular(11.5))
+                                        .color(t.text_faint),
+                                );
+                            });
+                        ui.add_space(6.0);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if design::button(ui, &t, Kind::Ghost, None, "Discard")
+                            .on_hover_text("Delete these autosaves")
+                            .clicked()
+                        {
+                            choice = Some(Choice::Discard);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if design::button(
+                                ui,
+                                &t,
+                                Kind::Primary,
+                                Some(icons::HISTORY),
+                                "Recover",
+                            )
+                            .clicked()
+                            {
+                                choice = Some(Choice::Recover);
+                            }
+                        });
+                    });
+                });
+                match choice {
+                    Some(Choice::Recover) => {
+                        for item in &items {
+                            let Some(project) = item.load() else {
+                                continue;
+                            };
+                            let doc = Document::recovered(
+                                project,
+                                item.original.clone(),
+                                item.title.clone(),
+                            );
+                            // A tab already showing the on-disk version gives way to the newer
+                            // recovered one.
+                            let same = item.original.as_ref().and_then(|o| {
+                                self.docs.iter().position(|d| d.path.as_ref() == Some(o))
+                            });
+                            match same {
+                                Some(i) => {
+                                    let id = self.docs[i].id;
+                                    self.docs[i] = doc;
+                                    self.docs[i].id = id;
+                                    self.active = i;
+                                }
+                                None => self.active = self.push_doc(doc),
+                            }
+                        }
+                        Autosave::discard(&items);
+                        let n = items.len();
+                        self.docs[self.active].notify(
+                            NoticeKind::Success,
+                            format!(
+                                "Recovered {} \u{2014} save to keep {}",
+                                design::plural(n, "project", "projects"),
+                                if n == 1 { "it" } else { "them" }
+                            ),
+                        );
+                    }
+                    Some(Choice::Discard) => Autosave::discard(&items),
+                    // Closed with Esc: decide next launch.
+                    None if r.should_close() => {}
+                    None => keep = Some(Dialog::Recover(items)),
+                }
+            }
         }
         if self.dialog.is_none() {
             self.dialog = keep;
@@ -1868,7 +2109,7 @@ impl LlmcApp {
 
     fn draw_toasts(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        self.toasts.retain(|t| now - t.born < TOAST_SECS);
+        self.toasts.retain(|t| now - t.born < t.life());
         if self.toasts.is_empty() {
             return;
         }
@@ -1881,7 +2122,7 @@ impl LlmcApp {
                 for toast in &self.toasts {
                     let age = (now - toast.born) as f32;
                     let alpha =
-                        (age / 0.15).min(1.0) * ((TOAST_SECS as f32 - age) / 0.4).clamp(0.0, 1.0);
+                        (age / 0.15).min(1.0) * ((toast.life() as f32 - age) / 0.4).clamp(0.0, 1.0);
                     let (glyph, color) = match toast.kind {
                         NoticeKind::Info => (icons::INFORMATION, t.accent),
                         NoticeKind::Success => (icons::CHECKBOX_CIRCLE_FILL, t.success),
@@ -2039,7 +2280,7 @@ enum TabEvent {
 }
 
 /// One document tab: icon, title, and a close button (a dot when unsaved, like most editors).
-fn tab(ui: &mut Ui, t: &Theme, doc: &Document, active: bool) -> TabEvent {
+fn tab(ui: &mut Ui, t: &Theme, doc: &Document, active: bool) -> (TabEvent, Rect) {
     let font = design::medium(12.5);
     let title = super::glyphs::ellipsize(ui.painter(), &doc.title, &font, 180.0);
     let galley = ui
@@ -2151,7 +2392,7 @@ fn tab(ui: &mut Ui, t: &Theme, doc: &Document, active: bool) -> TabEvent {
             ev = TabEvent::CloseOthers;
         }
     });
-    ev
+    (ev, rect)
 }
 
 fn shortcut_group(ui: &mut Ui, t: &Theme, title: &str, rows: &[(&str, &str)]) {
@@ -2208,9 +2449,112 @@ fn status_hint(doc: &Document) -> String {
     }
 }
 
+impl LlmcApp {
+    /// Per-frame housekeeping for the process-level safety nets: files handed over by another
+    /// launch, autosave, window geometry, and the native title bar's theme.
+    fn housekeeping(&mut self, ctx: &egui::Context) {
+        if let Some(paths) = self.instance.as_mut().and_then(Instance::poll) {
+            for p in &paths {
+                self.open_path(p);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+
+        if self.autosave.due() {
+            for d in &self.docs {
+                // Chip-editor tabs belong to their project; only whole projects are autosaved.
+                if d.chip_edit.is_some() {
+                    continue;
+                }
+                if d.is_dirty() {
+                    let rev = d.manager.revision();
+                    if self.autosaved.get(&d.id) != Some(&rev) {
+                        let project = d.to_project(true);
+                        self.autosave
+                            .write(d.id, &project, &d.title, d.path.as_deref());
+                        self.autosaved.insert(d.id, rev);
+                    }
+                } else if self.autosaved.remove(&d.id).is_some() {
+                    self.autosave.remove(d.id);
+                }
+            }
+        }
+        // Autosave needs a frame now and then even when nothing moves.
+        ctx.request_repaint_after(session::AUTOSAVE_EVERY);
+
+        let (outer, inner, maximized, monitor) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.outer_rect, v.inner_rect, v.maximized, v.monitor_size)
+        });
+        if maximized == Some(true) {
+            if let Some(w) = &mut self.window_state {
+                w.maximized = true;
+            } else {
+                self.window_state = Some(WindowState {
+                    x: 40.0,
+                    y: 40.0,
+                    width: 1440.0,
+                    height: 900.0,
+                    maximized: true,
+                });
+            }
+        } else if let (Some(o), Some(i)) = (outer, inner) {
+            self.window_state = Some(WindowState {
+                x: o.min.x,
+                y: o.min.y,
+                width: i.width(),
+                height: i.height(),
+                maximized: false,
+            });
+        }
+        // A window restored from a bigger screen must not hang off this one.
+        if !self.monitor_checked {
+            if let (Some(m), Some(i)) = (monitor, inner) {
+                self.monitor_checked = true;
+                if maximized != Some(true) && (i.width() > m.x + 1.0 || i.height() > m.y - 40.0) {
+                    let size = egui::vec2(
+                        (m.x * 0.92).max(960.0).min(m.x),
+                        (m.y * 0.88).max(600.0).min(m.y),
+                    );
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(
+                        ((m.x - size.x) / 2.0).max(0.0),
+                        ((m.y - size.y) / 2.0).max(0.0),
+                    )));
+                }
+            }
+        }
+
+        if self.title_theme != Some(self.dark) {
+            self.title_theme = Some(self.dark);
+            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(if self.dark {
+                egui::SystemTheme::Dark
+            } else {
+                egui::SystemTheme::Light
+            }));
+        }
+    }
+}
+
 impl eframe::App for LlmcApp {
+    /// A clean exit: remember the window and open projects, and drop the autosaves (there is
+    /// nothing to recover — unsaved work was either saved or knowingly discarded).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.config.window = self.window_state;
+        self.config.open_tabs = self
+            .docs
+            .iter()
+            .filter(|d| d.chip_edit.is_none())
+            .filter_map(|d| d.path.clone())
+            .collect();
+        self.config.save();
+        self.autosave.clear_session();
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.housekeeping(&ctx);
         self.ai.poll();
         if self.ai.any_testing() {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));

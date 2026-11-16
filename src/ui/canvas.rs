@@ -1768,7 +1768,8 @@ impl Document {
                     BlockType::Chip(_) => "Double-click to edit the chip",
                     _ => "Double-click for properties",
                 };
-                format!("{name}{ty}\n{}\n{hint}", b.ty.description())
+                // The id is how the assistant's auto-check refers to unnamed blocks.
+                format!("{name}{ty}  #{}\n{}\n{hint}", b.id, b.ty.description())
             })
         } else {
             None

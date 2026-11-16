@@ -1057,6 +1057,41 @@ pub fn menu_item_ex(
     clicked
 }
 
+/// A menu row that opens a submenu (same layout as [`menu_item_ex`], with a chevron). Pass the
+/// response to `egui::containers::menu::SubMenu::show`.
+pub fn submenu_row(ui: &mut Ui, t: &Theme, glyph: &str, label: &str) -> egui::Response {
+    let width = ui.max_rect().width().max(200.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 28.0), Sense::click());
+    let open = egui::containers::menu::SubMenu::id_from_widget_id(resp.id);
+    let active = resp.hovered() || egui::Popup::is_id_open(ui.ctx(), open);
+    let p = ui.painter();
+    if active {
+        p.rect_filled(rect, CornerRadius::same(radius::SM), t.surface_hover);
+    }
+    p.text(
+        Pos2::new(rect.left() + 16.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        glyph,
+        icon_font(15.0),
+        if active { t.text } else { t.text_muted },
+    );
+    p.text(
+        Pos2::new(rect.left() + 32.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        regular(13.0),
+        t.text,
+    );
+    p.text(
+        Pos2::new(rect.right() - 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        icons::ARROW_RIGHT_S,
+        icon_font(14.0),
+        t.text_faint,
+    );
+    resp
+}
+
 /// A thin horizontal divider inside menus/panels.
 pub fn divider(ui: &mut Ui, t: &Theme) {
     let w = ui.available_width();
@@ -1129,4 +1164,9 @@ pub fn logo(ui: &mut Ui, t: &Theme, size: f32) -> Response {
         Stroke::new((size * 0.085).max(1.5), Color32::WHITE),
     ));
     resp
+}
+
+/// "1 block", "3 blocks".
+pub fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
