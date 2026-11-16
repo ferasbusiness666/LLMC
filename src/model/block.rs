@@ -60,6 +60,48 @@ impl BlockType {
         }
     }
 
+    /// The human-facing name (palette, inspector, AI context).
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            BlockType::And => "AND",
+            BlockType::Or => "OR",
+            BlockType::Not => "NOT",
+            BlockType::Nand => "NAND",
+            BlockType::Nor => "NOR",
+            BlockType::Xor => "XOR",
+            BlockType::Xnor => "XNOR",
+            BlockType::Buffer => "Buffer",
+            BlockType::Switch => "Switch",
+            BlockType::Button => "Button",
+            BlockType::Led => "LED",
+            BlockType::ConstantHigh => "Constant 1",
+            BlockType::ConstantLow => "Constant 0",
+            BlockType::Clock => "Clock",
+            BlockType::Chip(_) => "Chip",
+        }
+    }
+
+    /// One-line explanation for tooltips.
+    pub fn description(&self) -> &'static str {
+        match self {
+            BlockType::And => "Output is 1 only when every input is 1.",
+            BlockType::Or => "Output is 1 when any input is 1.",
+            BlockType::Not => "Inverter: output is the opposite of the input.",
+            BlockType::Nand => "NOT-AND: output is 0 only when every input is 1.",
+            BlockType::Nor => "NOT-OR: output is 1 only when every input is 0.",
+            BlockType::Xor => "Exclusive OR: output is 1 when an odd number of inputs are 1.",
+            BlockType::Xnor => "Equivalence: output is 1 when an even number of inputs are 1.",
+            BlockType::Buffer => "Passes its input through unchanged.",
+            BlockType::Switch => "Click to toggle between 0 and 1. Becomes an input pin in a chip.",
+            BlockType::Button => "Momentary input: 1 only while held down.",
+            BlockType::Led => "Lights up when its input is 1. Becomes an output pin in a chip.",
+            BlockType::ConstantHigh => "Always outputs 1.",
+            BlockType::ConstantLow => "Always outputs 0.",
+            BlockType::Clock => "Toggles between 0 and 1 at a set frequency while running.",
+            BlockType::Chip(_) => "An instance of a reusable chip.",
+        }
+    }
+
     /// True for the primitive logic gates (not I/O or chips).
     pub fn is_gate(&self) -> bool {
         matches!(

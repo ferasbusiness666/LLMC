@@ -5,7 +5,7 @@ pub mod commands;
 pub mod simulator;
 pub mod undo;
 
-pub use circuit_manager::CircuitManager;
+pub use circuit_manager::{CircuitManager, GroupTransform, RedefineReport, Txn};
 pub use commands::{apply_batch, EditCommand};
-pub use simulator::Simulation;
+pub use simulator::{clock_half_period, Simulation};
 pub use undo::UndoSystem;

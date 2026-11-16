@@ -35,9 +35,10 @@ jobs:
           path: target/release/llmc.exe
           if-no-files-found: error
 
-  # Fast headless verification of the pure-logic engine (no GUI system deps needed).
-  linux-logic:
-    name: Linux logic tests
+  # Headless verification on Linux: the pure-logic library (simulator, undo, chips, AI command
+  # handling) plus the GUI crate's own tests (document model, canvas geometry, glyphs).
+  linux-tests:
+    name: Linux tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,3 +46,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test library + simulation
         run: cargo test --lib --test simulation
+      - name: Test GUI crate
+        run: cargo test --bin llmc

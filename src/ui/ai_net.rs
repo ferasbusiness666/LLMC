@@ -148,9 +148,6 @@ fn stream_chat(
     if base.is_empty() {
         return Err(ChatFailure::fatal("No base URL for the selected provider."));
     }
-    if req.api_key.trim().is_empty() {
-        return Err(ChatFailure::fatal("No API key for the selected provider."));
-    }
     let messages: Vec<serde_json::Value> = req
         .turns
         .iter()
@@ -165,9 +162,7 @@ fn stream_chat(
         "temperature": 0.2,
     });
     let url = format!("{base}/chat/completions");
-    let resp = chat_agent()
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", req.api_key.trim()))
+    let resp = with_auth(chat_agent().post(&url), &req.api_key)
         .set("Accept", "text/event-stream")
         .send_json(body)
         .map_err(describe_chat_error)?;
@@ -335,13 +330,8 @@ pub fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String
     if base.is_empty() {
         return Err("Set a base URL first.".to_string());
     }
-    if api_key.trim().is_empty() {
-        return Err("Paste an API key first.".to_string());
-    }
     let url = format!("{base}/models");
-    let resp = agent()
-        .get(&url)
-        .set("Authorization", &format!("Bearer {}", api_key.trim()))
+    let resp = with_auth(agent().get(&url), api_key)
         .call()
         .map_err(describe_error)?;
     let value: serde_json::Value = resp
@@ -352,6 +342,17 @@ pub fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String
         Err("Connected, but the provider returned no models.".to_string())
     } else {
         Ok(models)
+    }
+}
+
+/// Attach `Authorization: Bearer <key>` — unless there is no key, so keyless local servers
+/// (Ollama, LM Studio, llama.cpp) work through the Custom provider.
+fn with_auth(req: ureq::Request, api_key: &str) -> ureq::Request {
+    let key = api_key.trim();
+    if key.is_empty() {
+        req
+    } else {
+        req.set("Authorization", &format!("Bearer {key}"))
     }
 }
 

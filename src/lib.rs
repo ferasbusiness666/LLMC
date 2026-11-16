@@ -5,6 +5,7 @@
 //! which holds a [`backend::CircuitManager`] over the [`model`], and drives a
 //! [`backend::Simulation`]. Every mutation flows through [`backend::EditCommand`].
 
+pub mod ai;
 pub mod backend;
 pub mod icon;
 pub mod io;

@@ -37,6 +37,21 @@ impl Default for CameraState {
     }
 }
 
+/// One saved assistant chat message (so a project reopens with its conversation).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChatRecord {
+    /// "user" or "assistant".
+    pub role: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity: Vec<String>,
+    /// "message", "auto" (agent auto-check), "error", or "notice".
+    #[serde(default)]
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default = "default_schema_version")]
@@ -46,6 +61,9 @@ pub struct Project {
     pub chips: ChipLibrary,
     #[serde(default)]
     pub camera: CameraState,
+    /// The project's assistant conversation (optional; see the "save chat" setting).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat: Vec<ChatRecord>,
 }
 
 impl Project {
@@ -55,6 +73,7 @@ impl Project {
             circuit,
             chips,
             camera,
+            chat: Vec::new(),
         }
     }
 
@@ -76,8 +95,9 @@ impl Project {
         serde_json::from_value(value).map_err(ProjectError::Json)
     }
 
+    /// Save crash-safely (temp file + rename), so a failed save never corrupts the project.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ProjectError> {
-        std::fs::write(path, self.to_json()?).map_err(ProjectError::Io)
+        super::fs::write_atomic(path.as_ref(), self.to_json()?.as_bytes()).map_err(ProjectError::Io)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProjectError> {

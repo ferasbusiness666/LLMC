@@ -11,7 +11,7 @@ use super::block::Block;
 use super::connection::{Connection, Port};
 use super::ids::{BlockId, ConnId};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Circuit {
     pub name: String,
     pub blocks: BTreeMap<BlockId, Block>,

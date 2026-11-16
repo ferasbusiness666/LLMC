@@ -3,12 +3,11 @@
 //! Providers answer in free text, so this module does the tolerant parsing: it pulls any
 //! `<think>` reasoning out for separate display, and extracts a `{"commands":[…]}` block (in a
 //! ```json fence or raw) into a list of loosely-typed [`RawOp`]s. Applying those ops to a real
-//! circuit — allocating ids, resolving refs, validating ports — happens in the app layer, which
-//! owns the circuit; keeping the parsing here (egui-free) lets it be unit-tested.
+//! circuit — allocating ids, resolving refs, validating ports — happens in [`super::apply`].
 
 use std::ops::Range;
 
-use llmc::model::BlockType;
+use crate::model::BlockType;
 
 /// What an `add` op places: a primitive block, or an instance of a library chip (by name).
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +36,10 @@ pub enum RawOp {
         inputs: Option<u16>,
         label: Option<String>,
         state: bool,
+        /// Clock frequency in Hz (clocks only).
+        hz: Option<f32>,
+        /// Custom body color.
+        color: Option<[u8; 3]>,
     },
     Connect {
         from: String,
@@ -65,11 +68,36 @@ pub enum RawOp {
         outputs: Vec<String>,
         ops: Vec<RawOp>,
     },
-    /// A scripted test: each step sets switches/buttons (by handle) and then reads every LED.
-    /// This is how sequential circuits (latches, registers, memory) get verified.
-    Test {
-        steps: Vec<Vec<(String, bool)>>,
+    /// Change properties of an existing block: input count, clock frequency, color, a switch's
+    /// default level, or its label. Unset fields are left alone.
+    Set {
+        target: String,
+        inputs: Option<u16>,
+        hz: Option<f32>,
+        /// `Some(None)` clears a custom color.
+        color: Option<Option<[u8; 3]>>,
+        state: Option<bool>,
+        label: Option<String>,
     },
+    /// A scripted test: each step sets switches/buttons (by handle), optionally pulses some
+    /// (high then low) and/or lets time pass, then reads every LED. This is how sequential
+    /// circuits (latches, registers, memory, clocked CPUs) get verified.
+    Test {
+        steps: Vec<TestStep>,
+    },
+}
+
+/// One step of a scripted test.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TestStep {
+    /// Switch/button levels to set (they persist into later steps).
+    pub set: Vec<(String, bool)>,
+    /// Inputs to pulse: set high, settle, set low, settle (a manual clock edge).
+    pub pulse: Vec<String>,
+    /// Seconds of simulated time to let pass (clocks tick).
+    pub wait: Option<f64>,
+    /// Number of clock edges (transitions of the fastest clock) to advance.
+    pub ticks: Option<u32>,
 }
 
 /// A parsed assistant reply: the reasoning (if any), the prose to show, and edit ops.
@@ -509,13 +537,38 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
                     .get("inputs")
                     .or_else(|| v.get("num_inputs"))
                     .and_then(|n| n.as_u64())
-                    .map(|n| n as u16),
+                    .map(|n| n.min(u16::MAX as u64) as u16),
                 label: v.get("label").and_then(|l| l.as_str()).map(str::to_string),
                 state: v
                     .get("state")
                     .or_else(|| v.get("value"))
-                    .and_then(|s| s.as_bool())
+                    .and_then(as_bool)
                     .unwrap_or(false),
+                hz: hz_of(v),
+                color: v.get("color").and_then(as_color),
+            })
+        }
+        "set" | "setprops" | "props" | "properties" | "configure" | "update" | "modify" => {
+            Some(RawOp::Set {
+                target: target_handle(v)?,
+                inputs: v
+                    .get("inputs")
+                    .or_else(|| v.get("num_inputs"))
+                    .and_then(|n| n.as_u64())
+                    .map(|n| n.min(u16::MAX as u64) as u16),
+                hz: hz_of(v),
+                color: v.get("color").map(|c| {
+                    if c.is_null()
+                        || c.as_str()
+                            .is_some_and(|s| s.trim().is_empty() || s.trim() == "none")
+                    {
+                        None
+                    } else {
+                        as_color(c)
+                    }
+                }),
+                state: v.get("state").or_else(|| v.get("value")).and_then(as_bool),
+                label: v.get("label").and_then(|l| l.as_str()).map(str::to_string),
             })
         }
         "connect" | "wire" | "addconnection" | "link" | "join" => {
@@ -611,19 +664,53 @@ fn parse_op(v: &serde_json::Value) -> Option<RawOp> {
             })
         }
         "test" | "simulate" | "run" | "check" | "verify" => {
-            let mut steps: Vec<Vec<(String, bool)>> = Vec::new();
+            let mut steps: Vec<TestStep> = Vec::new();
             if let Some(arr) = v.get("steps").and_then(|s| s.as_array()) {
                 for step in arr {
-                    // Either {"set": {…}} or the {…} map directly.
-                    let map = step.get("set").unwrap_or(step);
-                    steps.push(set_map(map));
+                    steps.push(test_step(step));
                 }
-            } else if let Some(map) = v.get("set") {
-                steps.push(set_map(map));
+            } else {
+                let step = test_step(v);
+                if step != TestStep::default() {
+                    steps.push(step);
+                }
             }
             (!steps.is_empty()).then_some(RawOp::Test { steps })
         }
         _ => None,
+    }
+}
+
+/// One test step: `{"set":{…},"pulse":["CLK"],"wait":0.5,"ticks":2}` — or, for backwards
+/// compatibility, a bare `{"A":1,"B":0}` map of switch levels.
+fn test_step(step: &serde_json::Value) -> TestStep {
+    const KEYS: [&str; 4] = ["set", "pulse", "wait", "ticks"];
+    let structured = step
+        .as_object()
+        .is_some_and(|o| o.keys().any(|k| KEYS.contains(&k.as_str())));
+    if !structured {
+        return TestStep {
+            set: set_map(step),
+            ..Default::default()
+        };
+    }
+    let pulse = match step.get("pulse") {
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(as_handle).collect(),
+        Some(v) => as_handle(v).into_iter().collect(),
+        None => Vec::new(),
+    };
+    TestStep {
+        set: step.get("set").map(set_map).unwrap_or_default(),
+        pulse,
+        wait: step
+            .get("wait")
+            .and_then(|w| w.as_f64())
+            .map(|w| w.clamp(0.0, 3600.0)),
+        ticks: step
+            .get("ticks")
+            .or_else(|| step.get("tick"))
+            .and_then(|t| t.as_u64())
+            .map(|t| t.min(100_000) as u32),
     }
 }
 
@@ -633,14 +720,43 @@ fn set_map(v: &serde_json::Value) -> Vec<(String, bool)> {
         return Vec::new();
     };
     obj.iter()
-        .filter_map(|(k, val)| {
-            let b = val
-                .as_bool()
-                .or_else(|| val.as_u64().map(|n| n != 0))
-                .or_else(|| val.as_str().map(|s| s.trim() == "1" || s.trim() == "true"))?;
-            Some((k.trim().to_string(), b))
-        })
+        .filter_map(|(k, val)| Some((k.trim().to_string(), as_bool(val)?)))
         .collect()
+}
+
+/// A level given as bool, 0/1, or "0"/"1"/"true"/"false".
+fn as_bool(val: &serde_json::Value) -> Option<bool> {
+    val.as_bool()
+        .or_else(|| val.as_u64().map(|n| n != 0))
+        .or_else(|| match val.as_str()?.trim() {
+            "1" | "true" | "high" | "on" => Some(true),
+            "0" | "false" | "low" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+/// A clock frequency from `hz` / `freq` / `frequency`, kept in a sane range.
+fn hz_of(v: &serde_json::Value) -> Option<f32> {
+    v.get("hz")
+        .or_else(|| v.get("freq"))
+        .or_else(|| v.get("frequency"))
+        .and_then(|h| h.as_f64())
+        .filter(|h| h.is_finite() && *h > 0.0)
+        .map(|h| h.clamp(0.01, 1000.0) as f32)
+}
+
+/// A color as `"#rrggbb"` / `"rrggbb"` or `[r, g, b]`.
+fn as_color(v: &serde_json::Value) -> Option<[u8; 3]> {
+    if let Some(a) = v.as_array() {
+        let c = |i: usize| a.get(i).and_then(|x| x.as_u64()).map(|x| x.min(255) as u8);
+        return Some([c(0)?, c(1)?, c(2)?]);
+    }
+    let s = v.as_str()?.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let p = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
+    Some([p(0)?, p(2)?, p(4)?])
 }
 
 fn target_handle(v: &serde_json::Value) -> Option<String> {
@@ -676,10 +792,17 @@ fn xy(v: &serde_json::Value) -> (i32, i32) {
     )
 }
 
+/// Coordinates are kept within ±100 000 cells: a model emitting an absurd number gets a block
+/// far away rather than one wrapped around to a random spot.
 fn as_i32(v: &serde_json::Value) -> Option<i32> {
+    const LIMIT: i64 = 100_000;
     v.as_i64()
-        .map(|n| n as i32)
-        .or_else(|| v.as_f64().map(|n| n.round() as i32))
+        .or_else(|| {
+            v.as_f64()
+                .filter(|n| n.is_finite())
+                .map(|n| n.round() as i64)
+        })
+        .map(|n| n.clamp(-LIMIT, LIMIT) as i32)
 }
 
 /// Read a port selector from the first present key: a number is an index, a numeric string is
@@ -833,9 +956,9 @@ mod tests {
         match &parsed.ops[0] {
             RawOp::Test { steps } => {
                 assert_eq!(steps.len(), 2);
-                assert!(steps[0].contains(&("EN".to_string(), true)));
-                assert!(steps[0].contains(&("D".to_string(), true)));
-                assert_eq!(steps[1], vec![("D".to_string(), false)]);
+                assert!(steps[0].set.contains(&("EN".to_string(), true)));
+                assert!(steps[0].set.contains(&("D".to_string(), true)));
+                assert_eq!(steps[1].set, vec![("D".to_string(), false)]);
             }
             _ => panic!("expected test"),
         }
@@ -946,5 +1069,69 @@ mod tests {
             RawOp::Label { text, .. } => assert_eq!(text.as_deref(), Some("see http://x/y")),
             _ => panic!("expected label"),
         }
+    }
+
+    #[test]
+    fn parses_set_op_and_add_properties() {
+        let raw = r##"{"commands":[
+            {"op":"add","ref":"c","kind":"clock","x":0,"y":0,"hz":4,"color":"#ff8800"},
+            {"op":"set","target":"c","hz":2.5,"color":null},
+            {"op":"set","target":"g1","inputs":4,"state":"1","label":"AND4"}
+        ]}"##;
+        let ops = parse_reply(raw).ops;
+        assert!(
+            matches!(&ops[0], RawOp::Add { hz: Some(h), color: Some([255, 136, 0]), .. } if *h == 4.0)
+        );
+        assert!(matches!(&ops[1], RawOp::Set { hz: Some(h), color: Some(None), .. } if *h == 2.5));
+        match &ops[2] {
+            RawOp::Set {
+                target,
+                inputs,
+                state,
+                label,
+                color,
+                ..
+            } => {
+                assert_eq!(target, "g1");
+                assert_eq!(*inputs, Some(4));
+                assert_eq!(*state, Some(true));
+                assert_eq!(label.as_deref(), Some("AND4"));
+                assert_eq!(*color, None, "absent color is left alone");
+            }
+            other => panic!("expected set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pulse_wait_and_tick_test_steps() {
+        let raw = r#"{"commands":[{"op":"test","steps":[
+            {"set":{"D":1}},
+            {"pulse":"CLK"},
+            {"set":{"EN":0},"pulse":["CLK","LOAD"],"wait":0.25},
+            {"ticks":4}
+        ]}]}"#;
+        let ops = parse_reply(raw).ops;
+        let RawOp::Test { steps } = &ops[0] else {
+            panic!("expected test");
+        };
+        assert_eq!(steps[0].set, vec![("D".to_string(), true)]);
+        assert_eq!(steps[1].pulse, vec!["CLK".to_string()]);
+        assert_eq!(steps[2].pulse.len(), 2);
+        assert_eq!(steps[2].wait, Some(0.25));
+        assert_eq!(steps[3].ticks, Some(4));
+    }
+
+    #[test]
+    fn absurd_coordinates_are_clamped_not_wrapped() {
+        let raw = r#"{"commands":[{"op":"add","kind":"and","x":99999999999,"y":-5e12}]}"#;
+        let ops = parse_reply(raw).ops;
+        assert!(matches!(
+            ops[0],
+            RawOp::Add {
+                x: 100_000,
+                y: -100_000,
+                ..
+            }
+        ));
     }
 }

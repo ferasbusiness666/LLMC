@@ -1,11 +1,36 @@
-//! Persistent application settings, stored in the OS config directory.
-//!
-//! Phase 2 will extend this with AI provider entries; API *keys* will live in the OS
-//! keyring rather than this file.
+//! Persistent application settings, stored in the OS config directory. API *keys* never live
+//! here — they're in the OS keyring (see the UI's keystore).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// How logic gates are drawn on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GateStyle {
+    /// Standard distinctive-shape symbols (AND's D, OR's shield, …).
+    #[default]
+    Shapes,
+    /// Labeled rectangles.
+    Boxes,
+}
+
+/// How wires are routed on the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WireStyle {
+    /// Smooth curves (easy to tell apart when they cross).
+    #[default]
+    Curved,
+    /// Right-angle routing, like a schematic.
+    Orthogonal,
+}
+
+/// The assistant model picked last time, so it's preselected on the next launch.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedModel {
+    pub provider: String,
+    pub model: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -13,13 +38,30 @@ pub struct AppConfig {
     pub dark_mode: bool,
     #[serde(default)]
     pub last_dir: Option<PathBuf>,
-    /// Clock half-period in seconds for simulation.
-    #[serde(default = "default_clock_period")]
-    pub clock_period: f64,
-    /// Saved AI provider setup (enabled/base-url/name). API keys are NOT stored here — they
-    /// live in the OS keyring / a separate local file (see the UI's keystore).
+    /// Most recently opened/saved projects, newest first.
+    #[serde(default)]
+    pub recent_files: Vec<PathBuf>,
+    /// Saved AI provider setup (enabled/base-url/name). API keys are NOT stored here.
     #[serde(default)]
     pub ai_providers: Vec<AiProviderConfig>,
+    #[serde(default)]
+    pub last_model: Option<SavedModel>,
+    #[serde(default)]
+    pub gate_style: GateStyle,
+    #[serde(default)]
+    pub wire_style: WireStyle,
+    /// Scroll wheel zooms (true) or pans (false; Ctrl+scroll / pinch zooms).
+    #[serde(default = "default_true")]
+    pub scroll_zooms: bool,
+    #[serde(default = "default_true")]
+    pub show_grid: bool,
+    #[serde(default = "default_true")]
+    pub show_minimap: bool,
+    #[serde(default = "default_true")]
+    pub show_palette: bool,
+    /// Keep each project's assistant conversation inside its `.llmc` file.
+    #[serde(default = "default_true")]
+    pub save_chat: bool,
 }
 
 /// Persisted, non-secret configuration for one AI provider.
@@ -36,20 +78,27 @@ fn default_true() -> bool {
     true
 }
 
-fn default_clock_period() -> f64 {
-    1.0
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             dark_mode: true,
             last_dir: None,
-            clock_period: 1.0,
+            recent_files: Vec::new(),
             ai_providers: Vec::new(),
+            last_model: None,
+            gate_style: GateStyle::default(),
+            wire_style: WireStyle::default(),
+            scroll_zooms: true,
+            show_grid: true,
+            show_minimap: true,
+            show_palette: true,
+            save_chat: true,
         }
     }
 }
+
+/// How many recent projects to remember.
+const MAX_RECENT: usize = 10;
 
 impl AppConfig {
     fn path() -> Option<PathBuf> {
@@ -65,7 +114,7 @@ impl AppConfig {
             .unwrap_or_default()
     }
 
-    /// Best-effort save; errors are ignored (settings are non-critical).
+    /// Best-effort, crash-safe save; errors are ignored (settings are non-critical).
     pub fn save(&self) {
         let Some(path) = Self::path() else {
             return;
@@ -74,7 +123,41 @@ impl AppConfig {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, text);
+            let _ = super::fs::write_atomic(&path, text.as_bytes());
         }
+    }
+
+    /// Move `path` to the front of the recent-files list.
+    pub fn push_recent(&mut self, path: &Path) {
+        self.recent_files.retain(|p| p != path);
+        self.recent_files.insert(0, path.to_path_buf());
+        self.recent_files.truncate(MAX_RECENT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_config_files_still_load() {
+        // A config written by an older build (with a field that no longer exists).
+        let old = r#"{"dark_mode":false,"last_dir":null,"clock_period":1.0,"ai_providers":[]}"#;
+        let c: AppConfig = serde_json::from_str(old).unwrap();
+        assert!(!c.dark_mode);
+        assert!(c.scroll_zooms && c.show_grid && c.save_chat);
+        assert_eq!(c.gate_style, GateStyle::Shapes);
+    }
+
+    #[test]
+    fn recent_files_are_deduplicated_newest_first() {
+        let mut c = AppConfig::default();
+        c.push_recent(Path::new("a.llmc"));
+        c.push_recent(Path::new("b.llmc"));
+        c.push_recent(Path::new("a.llmc"));
+        assert_eq!(
+            c.recent_files,
+            vec![PathBuf::from("a.llmc"), PathBuf::from("b.llmc")]
+        );
     }
 }

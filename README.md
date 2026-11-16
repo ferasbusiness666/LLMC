@@ -1,38 +1,54 @@
 # LLMC
 
-A clean, fast **digital-logic builder and simulator** for Windows (and Linux/macOS),
-written in Rust with [egui](https://github.com/emilk/egui). Place gates, wire them up
-with the mouse, and watch the logic run live. Package any circuit into a reusable chip
-and drop it back onto the canvas.
+A fast, professional **digital-logic builder and simulator** for Windows (and Linux/macOS),
+written in Rust with [egui](https://github.com/emilk/egui) — with a built-in **AI assistant**
+that designs, wires, and *tests* circuits for you.
 
-> Architecturally inspired by the
-> [Connection Machine](https://github.com/Martian-Technologies/Connection-Machine)
-> project — a layered `Environment → Backend → CircuitManager` design — but a fresh,
-> independent implementation in Rust.
+Place gates, wire them with the mouse, and watch signals flow live. Package any circuit into a
+reusable chip and build bigger things from smaller verified ones — adders, registers, RAM,
+whole CPUs.
 
 ## Features
 
-- **Interactive canvas** — infinite grid, smooth pan/zoom around the cursor, precise
-  hover/hit detection for blocks, ports, and wires.
-- **Mouse-first wiring** — drag from a port to draw a wire; it snaps to the nearest
-  valid target and shows a live preview. Outputs fan out to many inputs.
-- **Live simulation** — toggle switches and watch LEDs and wires light up in real time.
-  Combinational logic settles instantly; sequential logic (latches, registers) and
-  clocks run step-by-step.
-- **Reusable chips** — package the current circuit into a chip (switches become input
-  pins, LEDs become output pins) and instance it like any other block, with full nesting
-  (e.g. build a full adder once, drop four to make a 4-bit adder).
-- **Full editing** — select (click / shift-click / box select), move, rotate, flip,
-  duplicate, copy/paste, delete, and unlimited undo/redo.
-- **Project tabs** — open several fully independent projects at once (each with its own
-  circuit, chips, undo history, and view); copy from one tab and paste into another.
-- **Save/Load** — versioned `.llmc` JSON project files with an **unsaved-changes prompt**
-  before you close a tab or the app; persistent app settings.
+- **Canvas** — infinite dotted grid, smooth zoom around the cursor, minimap, zoom controls,
+  *Fit everything* (`Home`) and *Zoom to selection* (`Shift+2`).
+- **Real gate symbols** — standard AND/OR/XOR/NOT shapes with inversion bubbles (or labeled
+  boxes, under *View → Gates*). Live signals light wires, pins, and LEDs as they change.
+- **Wiring** — drag from a port (or click a port, then the target). Curved or right-angle wires
+  (*View → Wires*). An input fed by several wires sees their OR.
+- **Simulation** — Run/Pause (`F5`), Step to the next clock edge (`F10`), speed control,
+  reset. Event-driven and fast; fast clocks never skip an edge; oscillating circuits are
+  flagged instead of freezing the app. Registers, latches, and RAM **keep their contents
+  while you edit**.
+- **Chips** — package the canvas or a selection as a chip (switches → input pins, LEDs → output
+  pins); chips show their pin names on the canvas. Double-click a chip to edit it in its own
+  tab; *Update chip* applies the change to every placed copy, and wires follow their pins even
+  if you move or rename them. A chip can never contain itself.
+- **Properties panel** (`Ctrl+I`) — name, color, input count, clock frequency, default level,
+  position/rotation, and live input/output values for whatever is selected.
+- **Editing** — box select, move, nudge with the arrow keys, rotate/flip the selection as a
+  group, duplicate, cut/copy/paste (at the cursor, between tabs, even between two LLMC windows;
+  chips come along), and undo/redo for *everything* — including property edits and chip
+  changes.
+- **Projects** — tabs, recent files, drag-and-drop `.llmc` files onto the window, crash-safe
+  saving, unsaved-changes prompts, and the assistant conversation saved with the project
+  (optional).
+- **Light & dark themes** — one design system (Inter, JetBrains Mono, Remix icons) across the
+  whole app.
 
-### Components
+## The AI assistant
 
-Gates: `AND OR NOT NAND NOR XOR XNOR BUFFER` · I/O: `Switch Button LED Constant-1
-Constant-0 Clock` · plus your own **chips**.
+Open it with **Assistant** (`Ctrl+L`) and connect a provider under *File → AI providers*: Groq,
+OpenRouter, Google AI Studio, Cerebras, Mistral, Ollama Cloud, opencode Zen — or **Custom**, any
+OpenAI-compatible endpoint, including keyless local servers (Ollama, LM Studio, llama.cpp).
+Keys are stored in the OS keychain (Windows Credential Manager) and never leave your machine.
+
+In **Agent** mode the assistant works like an engineer: it plans, defines small chips that are
+truth-table-verified the moment they're created, composes them, then reads an automatic
+*auto-check* of the real circuit after every step and keeps fixing until it matches your
+request — for as long as it needs. Sequential designs are verified with scripted tests that
+set inputs, pulse clocks, and let time pass. Everything it does is one undo step per reply, and
+**Stop** halts it instantly.
 
 ## Building & running
 
@@ -42,66 +58,51 @@ Requires a recent stable Rust toolchain.
 cargo run --release
 ```
 
-A prebuilt Windows binary (`llmc.exe`) is produced by CI on every push — see the
-**Actions** tab → latest run → **Artifacts → llmc-windows**.
+A prebuilt Windows binary (`llmc.exe`) is produced by CI on every push — see the **Actions**
+tab → latest run → **Artifacts → llmc-windows**.
 
-## Controls
+## Keyboard shortcuts
 
-| Action | Input |
+Press **F1** in the app for the full list. Highlights:
+
+| | |
 | --- | --- |
-| New project / switch / close | tab bar: **+** to open a tab · click a tab to switch · **×** to close |
-| Save prompt | closing a tab or the app with unsaved changes asks to Save / Don't Save / Cancel |
-| Place a component | pick it in the left palette, then click the canvas |
-| Cancel the held component | right-click, or `Esc` |
-| Select | click a block/wire · Shift-click to add · drag on empty space to box-select (grabs blocks **and** wires) |
-| Move | drag a selected block (grid-snapped; one undo step) |
-| Wire | drag from a port to another port — **or** click a port, then click the target port |
-| Cancel a wire in progress | right-click, or `Esc` |
-| Context menu | right-click the canvas → properties, copy, paste-here, duplicate, delete, rotate, flip |
-| Block properties | right-click a block → **Properties…** (rename, custom color, clock frequency, and gate input-pin count) |
-| Manage a chip | right-click it in the palette → place, edit, rename, delete |
-| Toggle a switch | click it |
-| Pan | drag with middle or right mouse button, or hold `Space` and drag |
-| Zoom | scroll wheel (zooms around the cursor) |
-| Rotate / flip | `R` / `Shift+R` · `F` |
-| Delete | `Delete` / `Backspace` |
-| Undo / redo | `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`) |
-| Copy / paste / duplicate | `Ctrl+C` / `Ctrl+V` / `Ctrl+D` |
-| Select all | `Ctrl+A` |
-| Run / stop simulation | toolbar **Run** / **Stop** |
-
-**Editing a chip:** right-click a chip in the palette and choose **Edit** to open its
-internal circuit; the toolbar shows **Update chip** / **Cancel**. Updating re-derives the
-chip from its switches (inputs) and LEDs (outputs) and returns you to your circuit.
+| `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | New / open / save (in a chip tab: update the chip) |
+| `Ctrl+W`, `Ctrl+Tab` | Close tab, next tab |
+| `F5` / `F10` | Run–pause / step to the next clock edge |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+X` / `C` / `V` / `D` | Cut / copy / paste at cursor / duplicate |
+| `R`, `Shift+R`, `F` | Rotate right / left, flip (the selection as a group) |
+| Arrows (`Shift` = 5) | Nudge the selection |
+| `Home`, `Shift+2`, `Ctrl+0` | Fit everything, zoom to selection, 100% |
+| `Space` + drag, middle/right drag | Pan |
+| `Ctrl+B`, `Ctrl+I`, `Ctrl+L` | Toggle sidebar, Properties, Assistant |
+| Double-click | Properties (or edit a chip) |
+| Shift+click a switch | Select it without toggling |
 
 ## Architecture
 
-The project is split into a GUI-free **library** (unit-tested headlessly) and a thin
-**binary** that hosts the egui GUI.
+A GUI-free **library** (tested headlessly on Linux and Windows CI) and a thin **binary** that
+hosts the egui GUI.
 
 ```
 src/
-  model/      geometry, block types + port layouts, connections, circuits, chips
-  backend/    EditCommand (single mutation path) + undo/redo, CircuitManager, Simulation
-  io/         versioned .llmc project files, persistent app config
-  ui/         theme, block glyphs, and the interactive canvas (binary only)
+  model/      geometry, block types + port layouts, connections, circuits, chips (pin maps, cycle checks)
+  backend/    EditCommand (the single, undoable mutation path) + undo/redo, CircuitManager, Simulation
+  ai/         reply parsing, applying commands as one undo step, prompt/context/auto-check
+  io/         versioned .llmc project files, app config, crash-safe writes
+  ui/         design system, canvas, document, shell, inspector, palette, assistant (binary only)
 tests/
-  simulation.rs   truth tables, half/full adder, 4-bit adder from chips, mux, SR latch
+  simulation.rs   truth tables, adders built from chips, mux, SR latch
+assets/fonts/     Inter, JetBrains Mono (SIL OFL), Remix Icon subset (Apache-2.0)
 ```
 
-Every edit — from a mouse drag to (in future) an AI action — flows through a single
-`EditCommand` batch that is atomic and invertible, which is what powers undo/redo.
+Every edit — a drag, a property change, a chip redefinition, an AI build — is an `EditCommand`
+batch that is atomic and invertible, which is what makes undo/redo complete.
 
-The simulator flattens a circuit (expanding chip instances recursively via a union-find
-over nets) into primitive gates, then iterates to a fixpoint each step.
-
-## Roadmap
-
-- **AI panel** (planned): a toolbar button opens a right-side panel where an AI assistant
-  can build and *edit* circuits for you via a structured, validated command API, with a
-  diff preview before anything is applied. Multiple providers (Groq, OpenRouter, Google
-  AI Studio, Zen), model selection, and locally-stored keys.
+The simulator flattens a circuit (expanding chips via a union-find over nets) into primitive
+gates and evaluates them event-driven: only gates whose inputs changed are re-evaluated.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. Bundled fonts and icons keep their own licenses (see `assets/fonts/`).

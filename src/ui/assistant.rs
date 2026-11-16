@@ -15,14 +15,18 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke};
+use eframe::egui::{
+    self, Align, Align2, Color32, CornerRadius, Frame, Layout, Margin, Pos2, RichText, Sense,
+    Stroke, StrokeKind,
+};
 
-use llmc::io::AiProviderConfig;
+use llmc::ai::{self as ai_edit, RawOp};
+use llmc::io::{AiProviderConfig, ChatRecord, SavedModel};
 
-use super::ai_edit::{self, RawOp};
 use super::ai_net::{self, AiEvent, ChatEvent, ChatRequest, ChatTurn};
+use super::design::{self, Kind, Theme};
+use super::icons;
 use super::keystore;
-use super::theme::Theme;
 
 /// A provider the settings can offer. Most are OpenAI-compatible, so they share one client;
 /// Google AI Studio uses its own adapter (or its OpenAI-compatible endpoint).
@@ -152,6 +156,11 @@ impl Provider {
     fn is_live(&self) -> bool {
         self.enabled && self.status == ConnStatus::Connected && !self.models.is_empty()
     }
+
+    /// Local/self-hosted endpoints (Ollama, LM Studio, llama.cpp) often need no key.
+    fn key_optional(&self) -> bool {
+        self.kind == ProviderKind::Custom
+    }
 }
 
 /// Global assistant settings: the provider list plus the worker-thread channel that carries
@@ -160,8 +169,10 @@ pub struct AiSettings {
     pub providers: Vec<Provider>,
     tx: Sender<AiEvent>,
     rx: Receiver<AiEvent>,
-    /// Set when the persisted config changed (enabled/base-url/name); the app writes it out.
+    /// Set when the persisted config changed (enabled/base-url/name/model); the app writes it out.
     dirty: bool,
+    /// The model picked last (preselected in new tabs and after a restart).
+    pub preferred: Option<SavedModel>,
 }
 
 impl Default for AiSettings {
@@ -185,6 +196,7 @@ impl Default for AiSettings {
             tx,
             rx,
             dirty: false,
+            preferred: None,
         }
     }
 }
@@ -245,7 +257,7 @@ impl AiSettings {
         let Some(p) = self.providers.get_mut(i) else {
             return;
         };
-        if p.api_key.trim().is_empty() || p.base_url.trim().is_empty() {
+        if p.base_url.trim().is_empty() || (p.api_key.trim().is_empty() && !p.key_optional()) {
             p.status = ConnStatus::Failed("Enter a base URL and API key first.".to_string());
             return;
         }
@@ -272,10 +284,12 @@ impl AiSettings {
             if let Some(key) = keystore::load(id) {
                 self.providers[i].api_key = key;
             }
-            // Reconnect providers that were on and have a key.
+            // Reconnect providers that were on and have a key (or don't need one).
             let ready = {
                 let p = &self.providers[i];
-                p.enabled && !p.api_key.trim().is_empty() && !p.base_url.trim().is_empty()
+                p.enabled
+                    && (!p.api_key.trim().is_empty() || p.key_optional())
+                    && !p.base_url.trim().is_empty()
             };
             if ready {
                 self.providers[i].status = ConnStatus::Testing;
@@ -299,6 +313,28 @@ impl AiSettings {
                 enabled: p.enabled,
             })
             .collect()
+    }
+
+    /// Forget a provider's stored key (removes it from the OS keyring too) and disconnect it.
+    fn forget_key(&mut self, i: usize) {
+        if let Some(p) = self.providers.get_mut(i) {
+            keystore::delete(p.kind.id());
+            p.api_key.clear();
+            p.models.clear();
+            p.status = ConnStatus::Idle;
+            self.dirty = true;
+        }
+    }
+
+    /// Remember the picked model (persisted by the app).
+    fn set_preferred(&mut self, provider: usize, model: &str) {
+        if let Some(p) = self.providers.get(provider) {
+            self.preferred = Some(SavedModel {
+                provider: p.kind.id().to_string(),
+                model: model.to_string(),
+            });
+            self.dirty = true;
+        }
     }
 
     /// Take (and clear) the "config changed, please persist" flag.
@@ -650,17 +686,77 @@ impl AiSession {
 
     /// If nothing valid is selected, fall back to the first available model (and recover from a
     /// selection whose provider has since disconnected).
-    fn ensure_selection(&mut self, live: &[(usize, &str)]) {
+    fn ensure_selection(&mut self, live: &[(usize, &str)], settings: &AiSettings) {
         let valid = self.selected.as_ref().is_some_and(|s| {
             live.iter()
                 .any(|(pi, m)| *pi == s.provider && *m == s.model)
         });
         if !valid {
-            self.selected = live.first().map(|(pi, m)| ModelRef {
+            // Prefer the model picked last time, else the first available one.
+            let preferred = settings.preferred.as_ref().and_then(|pref| {
+                live.iter().find(|(pi, m)| {
+                    settings
+                        .providers
+                        .get(*pi)
+                        .is_some_and(|p| p.kind.id() == pref.provider)
+                        && *m == pref.model
+                })
+            });
+            self.selected = preferred.or(live.first()).map(|(pi, m)| ModelRef {
                 provider: *pi,
                 model: m.to_string(),
             });
         }
+    }
+
+    /// Restore a conversation saved in a project file.
+    pub fn restore(&mut self, records: &[ChatRecord]) {
+        self.messages = records
+            .iter()
+            .map(|r| {
+                let role = if r.role == "user" {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                let mut m = ChatMessage::base(role, r.text.clone());
+                m.thinking = r.thinking.clone();
+                m.activity = r.activity.clone();
+                match r.kind.as_str() {
+                    "auto" => m.auto = true,
+                    "error" => m.error = true,
+                    "notice" => m.notice = true,
+                    _ => {}
+                }
+                m
+            })
+            .collect();
+    }
+
+    /// The conversation as saveable records.
+    pub fn records(&self) -> Vec<ChatRecord> {
+        self.messages
+            .iter()
+            .map(|m| ChatRecord {
+                role: match m.role {
+                    Role::User => "user".to_string(),
+                    Role::Assistant => "assistant".to_string(),
+                },
+                text: m.text.clone(),
+                thinking: m.thinking.clone(),
+                activity: m.activity.clone(),
+                kind: if m.auto {
+                    "auto"
+                } else if m.error {
+                    "error"
+                } else if m.notice {
+                    "notice"
+                } else {
+                    "message"
+                }
+                .to_string(),
+            })
+            .collect()
     }
 
     /// Send the current composer input as a new user turn. `system_prompt` carries the circuit
@@ -789,481 +885,758 @@ fn history_turns(messages: &[ChatMessage]) -> (Vec<ChatTurn>, bool) {
 
 // ===================== rendering =====================
 
-/// What the panel needs the app to do after rendering. Kept tiny so the app can build the
-/// circuit context (which lives with the document) and hand it to [`AiSession::send`].
+/// What the panel needs the app to do after rendering.
 #[derive(Default)]
 pub struct PanelResponse {
     /// The user pressed Send on a ready model; dispatch a chat request.
     pub send: bool,
     /// The user pressed Retry on a failed reply; re-run the last request.
     pub retry: bool,
+    /// Open the provider settings.
+    pub open_settings: bool,
 }
 
-/// Render the assistant panel on the right. Mutates session/settings, may flip `open_settings`
-/// when the gear is pressed, and reports (via the return value) when a chat send was requested.
+/// Starter prompts shown on an empty conversation.
+const SUGGESTIONS: [(&str, &str); 4] = [
+    ("Build a 4-bit adder", "Build a 4-bit ripple-carry adder from full-adder chips, with switches for A and B and LEDs for the sum and carry. Verify it."),
+    ("D flip-flop + test", "Build an edge-triggered D flip-flop as a chip, then place one with a D switch, a CLK button and a Q LED, and test that it only changes on the clock."),
+    ("2-bit counter", "Build a 2-bit binary counter driven by a 2 Hz clock, with LEDs for each bit."),
+    ("Explain this circuit", "Explain what the circuit on the canvas does, block by block, and point out anything that looks wrong."),
+];
+
+/// Render the assistant inside the right sidebar.
 pub fn panel(
     ui: &mut egui::Ui,
-    theme: &Theme,
+    t: &Theme,
     settings: &mut AiSettings,
     session: &mut AiSession,
-    open_settings: &mut bool,
 ) -> PanelResponse {
     let mut response = PanelResponse::default();
-    egui::Panel::right("ai_panel")
-        .resizable(true)
-        .default_size(370.0)
-        .min_size(300.0)
-        .max_size(560.0)
-        .show(ui, |ui| {
-            // Header ------------------------------------------------------------
-            ui.add_space(9.0);
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                accent_dot(ui, theme, 5.0);
-                ui.add_space(4.0);
-                ui.label(RichText::new("Assistant").strong().size(15.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(10.0);
-                    if text_button(ui, theme, "Settings", "Providers & API keys") {
-                        *open_settings = true;
-                    }
-                    // Don't offer "Clear" mid-run; the next step would land in a cleared thread.
-                    if !session.messages.is_empty()
-                        && !session.is_pending()
-                        && !session.is_running()
-                        && !session.retry_scheduled()
-                        && text_button(ui, theme, "Clear", "Clear conversation")
-                    {
-                        session.messages.clear();
-                    }
-                });
-            });
-            ui.add_space(8.0);
-            ui.separator();
 
-            // Reserve room for the composer at the bottom, give the rest to the conversation.
-            let composer_h = 156.0;
-            let chat_h = (ui.available_height() - composer_h).max(120.0);
-            let width = ui.available_width();
-            ui.allocate_ui(egui::vec2(width, chat_h), |ui| {
-                if !settings.any_live() {
-                    empty_state(ui, theme, open_settings);
-                } else {
-                    response.retry |= conversation(ui, theme, session);
-                }
-            });
-
-            ui.separator();
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_space(12.0);
-                ui.vertical(|ui| {
-                    ui.set_width(width - 24.0);
-                    response.send = composer(ui, theme, settings, session);
-                });
-            });
+    // Header: agent mode + actions.
+    ui.horizontal(|ui| {
+        let running = session.is_running() || session.is_pending();
+        let (color, label) = if session.retry_scheduled() {
+            (t.warning, "Waiting to retry")
+        } else if running {
+            (t.accent, "Working")
+        } else if settings.any_live() {
+            (t.success, "Ready")
+        } else {
+            (t.text_faint, "Not connected")
+        };
+        design::pill(ui, t, color, label);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if design::icon_button(ui, t, icons::SETTINGS_3, "Providers & API keys", false)
+                .clicked()
+            {
+                response.open_settings = true;
+            }
+            let can_clear = !session.messages.is_empty() && !running && !session.retry_scheduled();
+            if design::icon_button_sized(
+                ui,
+                t,
+                icons::DELETE_BIN_6,
+                "Clear conversation",
+                false,
+                30.0,
+                can_clear,
+            )
+            .clicked()
+                && can_clear
+            {
+                session.messages.clear();
+            }
         });
+    });
+    ui.add_space(6.0);
+
+    // Reserve room for the composer at the bottom, give the rest to the conversation.
+    let composer_h = 128.0;
+    let chat_h = (ui.available_height() - composer_h).max(140.0);
+    let width = ui.available_width();
+    ui.allocate_ui(egui::vec2(width, chat_h), |ui| {
+        if !settings.any_live() {
+            disconnected_state(ui, t, &mut response);
+        } else if session.messages.is_empty() && !session.is_pending() {
+            if let Some(prompt) = welcome(ui, t) {
+                session.input = prompt.to_string();
+                response.send = true;
+            }
+        } else {
+            response.retry |= conversation(ui, t, session);
+        }
+    });
+    ui.add_space(6.0);
+    response.send |= composer(ui, t, settings, session);
     response
 }
 
-/// The calm "connect a provider" state shown before anything is connected.
-fn empty_state(ui: &mut egui::Ui, theme: &Theme, open_settings: &mut bool) {
+/// Shown before any provider is connected.
+fn disconnected_state(ui: &mut egui::Ui, t: &Theme, response: &mut PanelResponse) {
     ui.vertical_centered(|ui| {
-        ui.add_space(48.0);
-        accent_dot(ui, theme, 9.0);
+        ui.add_space(36.0);
+        icon_tile(ui, t, icons::PLUG, 44.0);
         ui.add_space(12.0);
         ui.label(
-            RichText::new("Connect a provider to begin")
-                .strong()
-                .size(15.0),
+            RichText::new("Connect a provider")
+                .font(design::semibold(16.0))
+                .color(t.text),
         );
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Add a free provider (Groq, Cerebras, Gemini, …) and the assistant can build \
-                 and edit your circuits.",
+                "Add a free provider (Groq, Cerebras, Gemini, …) or a local server, and the \
+                 assistant can build, wire, and test circuits for you.",
             )
-            .color(theme.label_dim),
+            .font(design::regular(12.5))
+            .color(t.text_muted),
         );
         ui.add_space(14.0);
-        if accent_button(ui, theme, "  Open settings  ").clicked() {
-            *open_settings = true;
+        if design::button(ui, t, Kind::Primary, Some(icons::KEY_2), "Set up providers").clicked() {
+            response.open_settings = true;
         }
     });
 }
 
-/// The scrolling message list (plus a "thinking" row while a reply is in flight). Empty until
-/// the first message so the panel stays calm. Returns true if a "Retry" was clicked.
-fn conversation(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) -> bool {
-    // The row width must be captured from the bounded scroll viewport; passing it down keeps
-    // the per-message right/left alignment from treating the width as unbounded (which would
-    // blow the panel's size up).
-    let row_width = (ui.available_width() - 24.0).max(120.0);
+/// Empty conversation: a greeting and starter prompts. Returns a picked prompt.
+fn welcome(ui: &mut egui::Ui, t: &Theme) -> Option<&'static str> {
+    let mut picked = None;
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            icon_tile(ui, t, icons::SPARKLING_2_FILL, 44.0);
+            ui.add_space(12.0);
+            ui.label(RichText::new("What should we build?").font(design::semibold(16.0)).color(t.text));
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Describe a circuit. In Agent mode the assistant builds it, checks the real truth table, and fixes it until it works.")
+                    .font(design::regular(12.5))
+                    .color(t.text_muted),
+            );
+        });
+        ui.add_space(14.0);
+        for (title, prompt) in SUGGESTIONS {
+            let w = ui.available_width();
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 34.0), Sense::click());
+            let p = ui.painter();
+            let hovered = resp.hovered();
+            p.rect_filled(rect, CornerRadius::same(design::radius::MD), if hovered { t.surface_hover } else { t.surface });
+            p.rect_stroke(rect, CornerRadius::same(design::radius::MD), Stroke::new(1.0, if hovered { t.border_strong } else { t.border }), StrokeKind::Inside);
+            p.text(Pos2::new(rect.left() + 14.0, rect.center().y), Align2::CENTER_CENTER, icons::MAGIC, design::icon_font(14.0), t.accent);
+            p.text(Pos2::new(rect.left() + 28.0, rect.center().y), Align2::LEFT_CENTER, title, design::medium(12.5), t.text);
+            p.text(Pos2::new(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, icons::ARROW_RIGHT_S, design::icon_font(14.0), t.text_faint);
+            if hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.on_hover_text(prompt).clicked() {
+                picked = Some(prompt);
+            }
+            ui.add_space(2.0);
+        }
+    });
+    picked
+}
+
+fn icon_tile(ui: &mut egui::Ui, t: &Theme, glyph: &str, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(design::radius::XL), t.accent_soft);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(design::radius::XL),
+        Stroke::new(1.0, t.accent.gamma_multiply(0.4)),
+        StrokeKind::Inside,
+    );
+    design::paint_icon(ui, rect, glyph, size * 0.48, t.accent);
+}
+
+/// The scrolling message list (plus a live/status row while a reply is in flight). Returns true
+/// if a "Retry" was clicked.
+fn conversation(ui: &mut egui::Ui, t: &Theme, session: &AiSession) -> bool {
+    let row_width = ui.available_width().max(160.0);
     let mut retry = false;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.set_width(row_width - 6.0);
+            ui.add_space(2.0);
             for (i, msg) in session.messages.iter().enumerate() {
                 if msg.auto {
-                    auto_note(ui, theme, msg, i);
+                    auto_note(ui, t, msg, i);
                 } else if msg.notice {
-                    notice(ui, theme, &msg.text);
+                    notice(ui, t, &msg.text);
+                } else if msg.role == Role::User {
+                    user_bubble(ui, t, &msg.text, row_width);
                 } else {
-                    retry |= bubble(ui, theme, msg, row_width, i);
+                    retry |= assistant_message(ui, t, msg, i);
                 }
-                ui.add_space(8.0);
+                ui.add_space(10.0);
             }
             if let Some(status) = session.retry_status().filter(|_| !session.is_pending()) {
-                // Backing off after a transient provider failure; the run resumes on its own.
-                status_row(ui, theme, &status);
+                status_row(ui, t, icons::TIMER, &status);
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(250));
             } else if session.is_pending() {
                 if session.stream_reason.is_empty() && session.stream_content.is_empty() {
-                    thinking(ui, theme, session);
+                    thinking(ui, t, session);
                 } else {
-                    stream_bubble(
-                        ui,
-                        theme,
-                        &session.stream_reason,
-                        &session.stream_content,
-                        row_width,
-                    );
+                    stream_message(ui, t, &session.stream_reason, &session.stream_content);
                 }
             }
+            ui.add_space(4.0);
         });
     retry
 }
 
-/// A live assistant bubble rendered from the partial streaming buffers — reasoning dimmed above,
-/// answer below, and a collapsible "Writing commands…" row showing the raw command JSON as it
-/// is typed — so the reply appears token by token.
-fn stream_bubble(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    reason_field: &str,
-    content_field: &str,
-    row_width: f32,
-) {
-    let live = ai_edit::live_split(reason_field, content_field);
-    ui.allocate_ui_with_layout(
-        egui::vec2(row_width, 0.0),
-        Layout::left_to_right(Align::TOP),
-        |ui| {
-            ui.add_space(12.0);
-            let max_w = (row_width * 0.82).max(140.0);
-            Frame::NONE
-                .fill(surface(theme))
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_max_width(max_w);
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            accent_dot(ui, theme, 3.0);
-                            ui.add_space(5.0);
-                            ui.label(RichText::new("Assistant").small().color(theme.label_dim));
-                        });
-                        if let Some(r) = &live.reasoning {
-                            ui.label(RichText::new(r).italics().color(theme.label_dim).size(12.5));
-                        }
-                        if !live.answer.is_empty() {
-                            ui.label(RichText::new(&live.answer).color(theme.label));
-                        }
-                        if let Some(cmds) = &live.commands {
-                            // Progress row while the model emits its JSON; expand to watch it
-                            // being typed live (a rough count of ops written so far is shown).
-                            let ops = cmds.matches("\"op\"").count();
-                            let title = if ops > 0 {
-                                format!("Writing commands\u{2026} ({ops} so far)")
-                            } else {
-                                "Writing commands\u{2026}".to_string()
-                            };
-                            egui::CollapsingHeader::new(
-                                RichText::new(title).small().italics().color(theme.accent),
-                            )
-                            .id_salt("ai-live-commands")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(cmds)
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(theme.label_dim),
-                                );
-                            });
-                        }
-                    });
+fn avatar_row(ui: &mut egui::Ui, t: &Theme, live: bool) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
+        design::vertical_gradient(
+            ui.painter(),
+            rect,
+            CornerRadius::same(6),
+            t.accent,
+            t.accent_strong,
+        );
+        design::paint_icon(ui, rect, icons::SPARKLING_2_FILL, 11.0, Color32::WHITE);
+        ui.label(
+            RichText::new("Assistant")
+                .font(design::semibold(12.5))
+                .color(t.text),
+        );
+        if live {
+            let tm = ui.input(|i| i.time) as f32;
+            let (r, _) = ui.allocate_exact_size(egui::vec2(26.0, 12.0), Sense::hover());
+            for k in 0..3 {
+                let a = ((tm * 4.0 - k as f32 * 0.7).sin() * 0.5 + 0.5).clamp(0.15, 1.0);
+                ui.painter().circle_filled(
+                    Pos2::new(r.left() + 5.0 + k as f32 * 7.0, r.center().y),
+                    2.3,
+                    t.accent.gamma_multiply(a),
+                );
+            }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(60));
+        }
+    });
+}
+
+fn user_bubble(ui: &mut egui::Ui, t: &Theme, text: &str, row_width: f32) {
+    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+        let max_w = (row_width * 0.85).max(140.0);
+        Frame::NONE
+            .fill(t.accent_soft)
+            .stroke(Stroke::new(1.0, t.accent.gamma_multiply(0.35)))
+            .corner_radius(CornerRadius {
+                nw: 12,
+                ne: 4,
+                sw: 12,
+                se: 12,
+            })
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_max_width(max_w);
+                ui.label(
+                    RichText::new(text)
+                        .font(design::regular(13.0))
+                        .color(t.text),
+                );
+            });
+    });
+}
+
+/// An assistant reply: avatar, optional reasoning, answer, applied-edits card, retry on error.
+fn assistant_message(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize) -> bool {
+    let mut retry = false;
+    if msg.error {
+        Frame::NONE
+            .fill(t.danger_soft)
+            .stroke(Stroke::new(1.0, t.danger.gamma_multiply(0.45)))
+            .corner_radius(CornerRadius::same(design::radius::LG))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(icons::ERROR_WARNING)
+                            .font(design::icon_font(15.0))
+                            .color(t.danger),
+                    );
+                    ui.label(
+                        RichText::new("Request failed")
+                            .font(design::semibold(12.5))
+                            .color(t.text),
+                    );
                 });
+                ui.label(
+                    RichText::new(&msg.text)
+                        .font(design::regular(12.5))
+                        .color(t.text_muted),
+                );
+                ui.add_space(4.0);
+                if design::button_ex(
+                    ui,
+                    t,
+                    Kind::Secondary,
+                    Some(icons::REFRESH),
+                    "Retry",
+                    true,
+                    26.0,
+                )
+                .clicked()
+                {
+                    retry = true;
+                }
+            });
+        return retry;
+    }
+    avatar_row(ui, t, false);
+    ui.indent(("ai-msg", idx), |ui| {
+        if let Some(reasoning) = &msg.thinking {
+            egui::CollapsingHeader::new(
+                RichText::new(format!("{}  Reasoning", icons::BRAIN))
+                    .font(design::medium(12.0))
+                    .color(t.text_faint),
+            )
+            .id_salt(("ai-reasoning", idx))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(reasoning)
+                        .font(design::regular(12.0))
+                        .italics()
+                        .color(t.text_faint),
+                );
+            });
+        }
+        if !msg.text.trim().is_empty() {
+            markdown(ui, t, &msg.text);
+        }
+        activity_view(ui, t, &msg.activity, idx);
+    });
+    retry
+}
+
+/// Render the small subset of Markdown models actually use: headings, bullet/numbered lists,
+/// fenced code blocks, **bold**, and `inline code`. Everything else is plain text.
+fn markdown(ui: &mut egui::Ui, t: &Theme, text: &str) {
+    let mut in_code = false;
+    let mut code = String::new();
+    ui.spacing_mut().item_spacing.y = 4.0;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_code {
+                code_block(ui, t, code.trim_end());
+                code.clear();
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            code.push_str(line);
+            code.push('\n');
+            continue;
+        }
+        if trimmed.is_empty() {
+            ui.add_space(2.0);
+            continue;
+        }
+        let (size, font_semibold, body, bullet) = if let Some(h) = trimmed.strip_prefix("### ") {
+            (13.0, true, h, None)
+        } else if let Some(h) = trimmed.strip_prefix("## ") {
+            (14.0, true, h, None)
+        } else if let Some(h) = trimmed.strip_prefix("# ") {
+            (15.0, true, h, None)
+        } else if let Some(b) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("\u{2022} "))
+        {
+            (13.0, false, b, Some("\u{2022}".to_string()))
+        } else if let Some((num, rest)) = trimmed
+            .split_once(". ")
+            .filter(|(n, _)| !n.is_empty() && n.len() <= 3 && n.chars().all(|c| c.is_ascii_digit()))
+        {
+            (13.0, false, rest, Some(format!("{num}.")))
+        } else {
+            (13.0, false, trimmed, None)
+        };
+        let job = inline_job(t, body, size, font_semibold);
+        match bullet {
+            Some(b) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(b)
+                            .font(design::medium(13.0))
+                            .color(t.text_muted),
+                    );
+                    ui.add(egui::Label::new(job).wrap());
+                });
+            }
+            None => {
+                ui.add(egui::Label::new(job).wrap());
+            }
+        }
+    }
+    if in_code && !code.is_empty() {
+        code_block(ui, t, code.trim_end());
+    }
+}
+
+fn code_block(ui: &mut egui::Ui, t: &Theme, code: &str) {
+    Frame::NONE
+        .fill(t.bg_canvas)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(design::radius::MD))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(code)
+                    .font(design::mono(11.5))
+                    .color(t.text_muted),
+            );
+        });
+}
+
+/// One line with **bold** and `code` spans.
+fn inline_job(t: &Theme, text: &str, size: f32, semibold: bool) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let base = |bold: bool| TextFormat {
+        font_id: if bold || semibold {
+            design::semibold(size)
+        } else {
+            design::regular(size)
         },
-    );
-    // Stream smoothly.
+        color: t.text,
+        ..Default::default()
+    };
+    let mut bold = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next_bold = rest.find("**");
+        let next_code = rest.find('`');
+        match (next_bold, next_code) {
+            (Some(b), c) if c.is_none_or_else(|c| c > b) => {
+                job.append(&rest[..b], 0.0, base(bold));
+                bold = !bold;
+                rest = &rest[b + 2..];
+            }
+            (_, Some(c)) => {
+                job.append(&rest[..c], 0.0, base(bold));
+                let after = &rest[c + 1..];
+                match after.find('`') {
+                    Some(end) => {
+                        job.append(
+                            &after[..end],
+                            0.0,
+                            TextFormat {
+                                font_id: design::mono(size - 1.0),
+                                color: t.accent,
+                                background: t.surface_active,
+                                ..Default::default()
+                            },
+                        );
+                        rest = &after[end + 1..];
+                    }
+                    None => {
+                        job.append(&rest[c..], 0.0, base(bold));
+                        rest = "";
+                    }
+                }
+            }
+            _ => {
+                job.append(rest, 0.0, base(bold));
+                rest = "";
+            }
+        }
+    }
+    job
+}
+
+/// `opt.is_none_or_else(f)`: true when `None`, else `f(value)` (MSRV-friendly `is_none_or`).
+trait NoneOrElse {
+    fn is_none_or_else(&self, f: impl FnOnce(usize) -> bool) -> bool;
+}
+
+impl NoneOrElse for Option<usize> {
+    fn is_none_or_else(&self, f: impl FnOnce(usize) -> bool) -> bool {
+        match self {
+            None => true,
+            Some(v) => f(*v),
+        }
+    }
+}
+
+/// A live assistant message rendered from the streaming buffers.
+fn stream_message(ui: &mut egui::Ui, t: &Theme, reason_field: &str, content_field: &str) {
+    let live = ai_edit::live_split(reason_field, content_field);
+    avatar_row(ui, t, true);
+    ui.indent("ai-live", |ui| {
+        if let Some(r) = &live.reasoning {
+            let tail: String = {
+                let chars: Vec<char> = r.chars().collect();
+                let n = chars.len();
+                chars[n.saturating_sub(600)..].iter().collect()
+            };
+            Frame::NONE
+                .fill(t.surface)
+                .corner_radius(CornerRadius::same(design::radius::MD))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new(format!("{}  Thinking\u{2026}", icons::BRAIN))
+                            .font(design::medium(11.5))
+                            .color(t.text_faint),
+                    );
+                    ui.label(
+                        RichText::new(tail)
+                            .font(design::regular(12.0))
+                            .italics()
+                            .color(t.text_faint),
+                    );
+                });
+        }
+        if !live.answer.is_empty() {
+            markdown(ui, t, &live.answer);
+        }
+        if let Some(cmds) = &live.commands {
+            let ops = cmds.matches("\"op\"").count();
+            let title = if ops > 0 {
+                format!(
+                    "{}  Writing commands\u{2026} ({ops} so far)",
+                    icons::TERMINAL_BOX
+                )
+            } else {
+                format!("{}  Writing commands\u{2026}", icons::TERMINAL_BOX)
+            };
+            egui::CollapsingHeader::new(
+                RichText::new(title)
+                    .font(design::medium(12.0))
+                    .color(t.accent),
+            )
+            .id_salt("ai-live-commands")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(cmds)
+                        .font(design::mono(11.0))
+                        .color(t.text_muted),
+                );
+            });
+        }
+    });
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(60));
 }
 
-/// A subtle, foldable "auto-check" row for an agent-loop feedback turn — visible so the run reads
-/// like a live workflow, but quiet so it never competes with the real messages.
-fn auto_note(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, idx: usize) {
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        egui::CollapsingHeader::new(
-            RichText::new("Checked the circuit")
-                .small()
-                .italics()
-                .color(theme.label_dim),
-        )
-        .id_salt(("ai-autocheck", idx))
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.label(RichText::new(&msg.text).small().color(theme.label_dim));
-        });
+/// A compact, foldable "auto-check" row for an agent feedback turn.
+fn auto_note(ui: &mut egui::Ui, t: &Theme, msg: &ChatMessage, idx: usize) {
+    egui::CollapsingHeader::new(
+        RichText::new(format!("{}  Checked the circuit", icons::TEST_TUBE))
+            .font(design::medium(12.0))
+            .color(t.text_faint),
+    )
+    .id_salt(("ai-autocheck", idx))
+    .default_open(false)
+    .show(ui, |ui| {
+        Frame::NONE
+            .fill(t.surface)
+            .corner_radius(CornerRadius::same(design::radius::MD))
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(&msg.text)
+                        .font(design::mono(11.0))
+                        .color(t.text_muted),
+                );
+            });
     });
 }
 
-/// A left-aligned status row shown while awaiting a reply: "Thinking…", or "Working — step N…"
-/// during an autonomous run.
-fn thinking(ui: &mut egui::Ui, theme: &Theme, session: &AiSession) {
+/// "Thinking…" / "Working — step N…" while awaiting the first token.
+fn thinking(ui: &mut egui::Ui, t: &Theme, session: &AiSession) {
+    avatar_row(ui, t, true);
     let label = if session.is_running() && session.agent_step() > 0 {
-        format!("Working \u{2014} step {}\u{2026}", session.agent_step())
+        format!(
+            "Step {} \u{2014} reading the auto-check\u{2026}",
+            session.agent_step() + 1
+        )
     } else {
         "Thinking\u{2026}".to_string()
     };
-    status_row(ui, theme, &label);
-    // Keep animating so the reply (and this indicator) refresh promptly.
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(120));
+    ui.indent("ai-thinking", |ui| {
+        ui.label(
+            RichText::new(label)
+                .font(design::regular(12.5))
+                .italics()
+                .color(t.text_faint),
+        );
+    });
 }
 
-/// A quiet left-aligned status line with the accent dot (thinking / retry countdown).
-fn status_row(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+fn status_row(ui: &mut egui::Ui, t: &Theme, glyph: &str, text: &str) {
     ui.horizontal_wrapped(|ui| {
-        ui.add_space(12.0);
-        accent_dot(ui, theme, 3.5);
-        ui.add_space(6.0);
-        ui.label(RichText::new(text).italics().color(theme.label_dim));
+        ui.label(
+            RichText::new(glyph)
+                .font(design::icon_font(14.0))
+                .color(t.warning),
+        );
+        ui.label(
+            RichText::new(text)
+                .font(design::regular(12.5))
+                .color(t.text_muted),
+        );
     });
 }
 
-/// A system notice (e.g. "Stopped.") — a dim, centered line rather than a bubble, so it reads as
-/// part of the timeline and not as something either side said.
-fn notice(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+/// A system notice (e.g. "Stopped.") — a quiet centered line.
+fn notice(ui: &mut egui::Ui, t: &Theme, text: &str) {
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new(text).small().italics().color(theme.label_dim));
+        ui.label(
+            RichText::new(text)
+                .font(design::regular(11.5))
+                .italics()
+                .color(t.text_faint),
+        );
     });
 }
 
-/// A single chat bubble: user right-aligned/accent, assistant left-aligned/panel, errors muted-red.
-/// Shows any `<think>` reasoning (dimmed, collapsible) above the answer and an "activity" list of
-/// applied edits below it. Returns true if the bubble's "Retry" button was clicked.
-fn bubble(ui: &mut egui::Ui, theme: &Theme, msg: &ChatMessage, row_width: f32, idx: usize) -> bool {
-    let is_user = msg.role == Role::User;
-    let mut retry = false;
-    let fill = if msg.error {
-        theme.conflict.linear_multiply(0.16)
-    } else if is_user {
-        theme.accent.linear_multiply(0.22)
-    } else {
-        surface(theme)
-    };
-    let layout = if is_user {
-        Layout::right_to_left(Align::TOP)
-    } else {
-        Layout::left_to_right(Align::TOP)
-    };
-    // Bound the row to a known width so `right_to_left` has a finite right edge.
-    ui.allocate_ui_with_layout(egui::vec2(row_width, 0.0), layout, |ui| {
-        ui.add_space(12.0);
-        let max_w = (row_width * 0.82).max(140.0);
-        Frame::NONE
-            .fill(fill)
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_max_width(max_w);
-                ui.vertical(|ui| {
-                    if msg.error {
-                        ui.label(RichText::new("Error").small().color(theme.conflict));
-                    } else if !is_user {
-                        ui.label(RichText::new("Assistant").small().color(theme.label_dim));
-                    }
-                    // Reasoning first, dimmed and foldable (default open, so it's visible but calm).
-                    if let Some(reasoning) = &msg.thinking {
-                        egui::CollapsingHeader::new(
-                            RichText::new("Reasoning").small().color(theme.label_dim),
-                        )
-                        .id_salt(("ai-reasoning", idx))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new(reasoning)
-                                    .italics()
-                                    .color(theme.label_dim)
-                                    .size(12.5),
-                            );
-                        });
-                    }
-                    if !msg.text.trim().is_empty() {
-                        ui.label(RichText::new(&msg.text).color(theme.label));
-                    }
-                    activity_view(ui, theme, &msg.activity, idx);
-                    if msg.error && text_button(ui, theme, "Retry", "Send this prompt again") {
-                        retry = true;
-                    }
-                });
-            });
-    });
-    retry
-}
-
-/// The "activity" view under an assistant reply: the concrete edits it applied to the circuit,
-/// one line each, with skipped ops shown in muted-red. Nothing is drawn when the list is empty.
-fn activity_view(ui: &mut egui::Ui, theme: &Theme, activity: &[String], idx: usize) {
+/// The edits a reply applied: a compact card, folded when long.
+fn activity_view(ui: &mut egui::Ui, t: &Theme, activity: &[String], idx: usize) {
     if activity.is_empty() {
         return;
     }
-    ui.add_space(6.0);
+    ui.add_space(4.0);
     let applied = activity
         .iter()
         .filter(|a| !a.starts_with("Skipped"))
         .count();
-    let title = RichText::new(format!(
-        "Applied {applied} change{}",
-        if applied == 1 { "" } else { "s" }
-    ))
-    .small()
-    .strong()
-    .color(theme.label_dim);
-    // Big steps (a whole ALU in one reply) fold their list away so a long run stays readable
-    // and cheap to draw; short lists are shown inline.
-    const INLINE_MAX: usize = 8;
-    if activity.len() > INLINE_MAX {
-        egui::CollapsingHeader::new(title)
-            .id_salt(("ai-activity", idx))
-            .default_open(false)
-            .show(ui, |ui| activity_lines(ui, theme, activity));
-    } else {
-        ui.label(title);
-        activity_lines(ui, theme, activity);
-    }
-    ui.add_space(2.0);
-    ui.label(
-        RichText::new("Undo (Ctrl+Z) to revert")
-            .small()
-            .color(theme.label_dim),
-    );
-}
-
-/// One muted line per applied edit; skipped ops in muted-red.
-fn activity_lines(ui: &mut egui::Ui, theme: &Theme, activity: &[String]) {
-    for line in activity {
-        let skipped = line.starts_with("Skipped");
-        let color = if skipped {
-            theme.conflict
-        } else {
-            theme.label_dim
-        };
-        ui.horizontal(|ui| {
-            ui.add_space(2.0);
-            colored_dot(
-                ui,
-                if skipped {
-                    theme.conflict
-                } else {
-                    theme.accent
-                },
-                2.5,
+    let skipped = activity.len() - applied;
+    Frame::NONE
+        .fill(t.surface)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(design::radius::MD))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut title = format!(
+                "{}  Applied {applied} change{}",
+                icons::CHECKBOX_CIRCLE_FILL,
+                if applied == 1 { "" } else { "s" }
             );
-            ui.add_space(5.0);
-            ui.label(RichText::new(line).small().color(color));
+            if skipped > 0 {
+                title.push_str(&format!(" \u{b7} {skipped} skipped"));
+            }
+            let open_default = activity.len() <= 6;
+            egui::CollapsingHeader::new(
+                RichText::new(title)
+                    .font(design::medium(12.0))
+                    .color(if skipped > 0 { t.warning } else { t.success }),
+            )
+            .id_salt(("ai-activity", idx))
+            .default_open(open_default)
+            .show(ui, |ui| {
+                for line in activity {
+                    let skipped = line.starts_with("Skipped");
+                    ui.label(
+                        RichText::new(line)
+                            .font(design::regular(11.5))
+                            .color(if skipped { t.danger } else { t.text_muted }),
+                    );
+                }
+            });
+            ui.label(
+                RichText::new("Ctrl+Z undoes this whole step")
+                    .font(design::regular(11.0))
+                    .color(t.text_faint),
+            );
         });
-    }
 }
 
-/// The bottom composer: model switcher + input + send. Returns true when the user asked to
-/// send (the app then supplies circuit context and dispatches via [`AiSession::send`]).
+/// The composer: input card, model switcher, agent toggle, send/stop.
 fn composer(
     ui: &mut egui::Ui,
-    theme: &Theme,
+    t: &Theme,
     settings: &mut AiSettings,
     session: &mut AiSession,
 ) -> bool {
     let live = settings.live_models();
     let ready = !live.is_empty();
-    session.ensure_selection(&live);
+    session.ensure_selection(&live, settings);
     let pending = session.is_pending();
     let mut send = false;
 
-    ui.add_enabled_ui(ready, |ui| {
-        // Input box in a soft rounded surface.
-        Frame::NONE
-            .fill(surface(theme))
-            .stroke(Stroke::new(1.0, theme.block_stroke))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                let hint = if !ready {
-                    "Connect a provider to start\u{2026}"
-                } else if pending {
-                    "Working\u{2026} you can type your next message meanwhile"
-                } else {
-                    "Ask the assistant to build or edit your circuit\u{2026}"
-                };
-                // Enter sends; Shift+Enter inserts a newline. The box stays editable (and keeps
-                // keyboard focus) while a reply is pending: disabling it would drop focus, and
-                // whatever you typed next would fall through to the canvas as shortcuts. Only
-                // *sending* waits until the current reply lands.
-                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-                let editor = ui.add(
-                    egui::TextEdit::multiline(&mut session.input)
-                        .frame(Frame::NONE)
-                        .desired_rows(2)
-                        .hint_text(hint)
-                        .desired_width(f32::INFINITY),
-                );
-                if enter && editor.has_focus() && !session.input.trim().is_empty() {
-                    send = true;
-                }
-            });
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            model_switcher(ui, theme, settings, session);
-            // Agent toggle: when on, the assistant iterates (build → self-check → fix) on its own.
-            ui.add_space(8.0);
-            ui.checkbox(&mut session.agent_enabled, RichText::new("Agent").small())
-                .on_hover_text(
-                    "Let the assistant work on its own: build, auto-check the circuit's \
-                     behavior, and fix it until it matches your request — for as long as it \
-                     needs. Uses several provider calls; press Stop any time.",
-                );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if session.is_running() {
-                    // Mid-run: offer Stop instead of Send.
-                    if ui
-                        .add(accent_widget(theme, "Stop"))
-                        .on_hover_text("Stop the assistant now")
-                        .clicked()
-                    {
-                        session.request_stop();
+    let id = ui.id().with("composer-input");
+    let focused = ui.ctx().memory(|m| m.has_focus(id));
+    Frame::NONE
+        .fill(t.surface)
+        .stroke(Stroke::new(
+            1.0,
+            if focused { t.accent } else { t.border_strong },
+        ))
+        .corner_radius(CornerRadius::same(design::radius::XL))
+        .inner_margin(Margin {
+            left: 12,
+            right: 8,
+            top: 8,
+            bottom: 6,
+        })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let hint = if !ready {
+                "Connect a provider to start\u{2026}"
+            } else if pending {
+                "Working\u{2026} you can type your next message"
+            } else {
+                "Describe a circuit to build or change\u{2026}"
+            };
+            // Enter sends; Shift+Enter inserts a newline. The box stays editable while a reply is
+            // pending (disabling it would drop focus and send keystrokes to the canvas).
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            let editor = ui.add_enabled(
+                ready,
+                egui::TextEdit::multiline(&mut session.input)
+                    .id(id)
+                    .frame(Frame::NONE)
+                    .desired_rows(2)
+                    .hint_text(RichText::new(hint).color(t.text_faint))
+                    .desired_width(f32::INFINITY),
+            );
+            if enter && editor.has_focus() && !session.input.trim().is_empty() {
+                send = true;
+            }
+            ui.horizontal(|ui| {
+                model_switcher(ui, t, settings, session);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if session.is_running() || pending {
+                        let r = send_button(ui, t, icons::STOP_FILL, true)
+                            .on_hover_text("Stop the assistant now");
+                        if r.clicked() {
+                            session.request_stop();
+                        }
+                    } else {
+                        let can_send = ready && !session.input.trim().is_empty();
+                        if send_button(ui, t, icons::ARROW_UP, can_send)
+                            .on_hover_text("Send (Enter)")
+                            .clicked()
+                            && can_send
+                        {
+                            send = true;
+                        }
                     }
-                } else {
-                    let can_send = ready && !pending && !session.input.trim().is_empty();
-                    let label = if pending { "Sending\u{2026}" } else { "Send" };
-                    if ui
-                        .add_enabled(can_send, accent_widget(theme, label))
-                        .clicked()
-                    {
-                        send = true;
-                    }
-                }
+                    ui.add_space(4.0);
+                    agent_toggle(ui, t, &mut session.agent_enabled);
+                });
             });
         });
-    });
-    // A stray newline from the Enter keypress is trimmed by `send`, but drop it here too so the
-    // box doesn't briefly show one.
     if send {
         while session.input.ends_with('\n') {
             session.input.pop();
@@ -1272,17 +1645,96 @@ fn composer(
     send && ready && !pending && !session.input.trim().is_empty()
 }
 
-/// The in-composer model picker. Shows the current model with its provider in a fainter,
-/// smaller style beside it, and lists every connected (provider, model) the same way.
+fn send_button(ui: &mut egui::Ui, t: &Theme, glyph: &str, enabled: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(30.0, 30.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let p = ui.painter();
+    if enabled {
+        design::vertical_gradient(p, rect, CornerRadius::same(15), t.accent, t.accent_strong);
+        if resp.hovered() {
+            p.circle_filled(rect.center(), 15.0, Color32::from_white_alpha(18));
+        }
+    } else {
+        p.circle_filled(rect.center(), 15.0, t.surface_active);
+    }
+    design::paint_icon(
+        ui,
+        rect,
+        glyph,
+        15.0,
+        if enabled {
+            Color32::WHITE
+        } else {
+            t.text_faint
+        },
+    );
+    resp
+}
+
+/// A compact "Agent" toggle: when on, the assistant iterates (build → self-check → fix).
+fn agent_toggle(ui: &mut egui::Ui, t: &Theme, on: &mut bool) {
+    let text = format!("{}  Agent", icons::ROBOT_2);
+    let font = design::medium(12.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.clone(), font.clone(), t.text);
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(galley.size().x + 18.0, 26.0), Sense::click());
+    let p = ui.painter();
+    let rad = CornerRadius::same(13);
+    if *on {
+        p.rect_filled(rect, rad, t.accent_soft);
+        p.rect_stroke(
+            rect,
+            rad,
+            Stroke::new(1.0, t.accent.gamma_multiply(0.6)),
+            StrokeKind::Inside,
+        );
+    } else {
+        p.rect_stroke(
+            rect,
+            rad,
+            Stroke::new(1.0, t.border_strong),
+            StrokeKind::Inside,
+        );
+    }
+    p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        font,
+        if *on { t.accent } else { t.text_muted },
+    );
+    if resp
+        .on_hover_text(
+            "Agent mode: the assistant builds, auto-checks the circuit's real behavior, and fixes \
+             it until it matches your request \u{2014} for as long as it needs. Press Stop any time.",
+        )
+        .clicked()
+    {
+        *on = !*on;
+    }
+}
+
+/// The in-composer model picker.
 fn model_switcher(
     ui: &mut egui::Ui,
-    theme: &Theme,
-    settings: &AiSettings,
+    t: &Theme,
+    settings: &mut AiSettings,
     session: &mut AiSession,
 ) {
-    let live = settings.live_models();
+    let live: Vec<(usize, String)> = settings
+        .live_models()
+        .into_iter()
+        .map(|(i, m)| (i, m.to_string()))
+        .collect();
     let multi_provider = {
-        // Only show provider tags when more than one provider is connected (matches the spec).
         let mut seen: Vec<usize> = Vec::new();
         for (pi, _) in &live {
             if !seen.contains(pi) {
@@ -1291,74 +1743,102 @@ fn model_switcher(
         }
         seen.len() > 1
     };
-
-    let selected_label = match &session.selected {
-        Some(sel) => model_job(
-            ui,
-            theme,
-            &sel.model,
-            settings
-                .providers
-                .get(sel.provider)
-                .map(|p| p.name.as_str()),
-            multi_provider,
-        ),
-        None => model_job(ui, theme, "Choose a model", None, false),
+    let label = match &session.selected {
+        Some(sel) => sel.model.clone(),
+        None => "Choose a model".to_string(),
     };
+    let font = design::medium(12.0);
+    let max_w = (ui.available_width() - 120.0).max(80.0);
+    let shown = super::glyphs::ellipsize(ui.painter(), &label, &font, max_w - 34.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(shown.clone(), font.clone(), t.text);
+    let (rect, button) =
+        ui.allocate_exact_size(egui::vec2(galley.size().x + 46.0, 26.0), Sense::click());
+    let p = ui.painter();
+    if button.hovered()
+        || egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&button))
+    {
+        p.rect_filled(rect, CornerRadius::same(13), t.surface_hover);
+    }
+    p.text(
+        Pos2::new(rect.left() + 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        icons::CPU,
+        design::icon_font(13.0),
+        t.text_muted,
+    );
+    p.text(
+        Pos2::new(rect.left() + 22.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        shown,
+        font,
+        t.text_muted,
+    );
+    p.text(
+        Pos2::new(rect.right() - 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        icons::ARROW_DOWN_S,
+        design::icon_font(13.0),
+        t.text_faint,
+    );
+    let button = button.on_hover_text(label);
 
-    // A real popup (not `menu_button`): menus close on *any* click by default, which was closing
-    // the panel the instant you clicked the filter box. `CloseOnClickOutside` keeps it open while
-    // you type; a model row closes it explicitly.
-    let button = ui.add(egui::Button::new(selected_label));
     egui::Popup::menu(&button)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            ui.set_min_width(260.0);
-            ui.set_max_width(360.0);
-            // A filter box once the list is long enough to be a pain to eyeball (e.g. OpenRouter).
+            ui.set_width(320.0);
             if live.len() > 8 {
-                ui.add(
-                    egui::TextEdit::singleline(&mut session.model_filter)
-                        .hint_text("Filter models\u{2026}")
-                        .desired_width(f32::INFINITY),
+                design::text_field(
+                    ui,
+                    t,
+                    &mut session.model_filter,
+                    "Filter models\u{2026}",
+                    Some(icons::SEARCH),
                 );
                 ui.add_space(4.0);
             }
             let filter = session.model_filter.trim().to_lowercase();
             let mut picked: Option<(usize, String)> = None;
-            // Scroll so hundreds of models never run off the screen.
             egui::ScrollArea::vertical()
-                .max_height(320.0)
-                .auto_shrink([false, false])
+                .max_height(340.0)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     let mut shown = 0usize;
+                    let mut last_provider = usize::MAX;
                     for (pi, model) in &live {
-                        let provider = settings.providers.get(*pi).map(|p| p.name.as_str());
-                        if !filter.is_empty() {
-                            let hay = format!("{model} {}", provider.unwrap_or("")).to_lowercase();
-                            if !hay.contains(&filter) {
-                                continue;
-                            }
+                        let provider = settings
+                            .providers
+                            .get(*pi)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("");
+                        if !filter.is_empty()
+                            && !format!("{model} {provider}")
+                                .to_lowercase()
+                                .contains(&filter)
+                        {
+                            continue;
+                        }
+                        if multi_provider && *pi != last_provider {
+                            last_provider = *pi;
+                            ui.add_space(4.0);
+                            design::menu_section(ui, t, provider);
                         }
                         shown += 1;
                         let is_sel = session
                             .selected
                             .as_ref()
                             .is_some_and(|s| s.provider == *pi && s.model == *model);
-                        let row = model_job(ui, theme, model, provider, multi_provider);
-                        if ui.selectable_label(is_sel, row).clicked() {
+                        if design::menu_item_ex(ui, t, "", model, "", true, is_sel) {
                             picked = Some((*pi, model.to_string()));
                         }
                     }
                     if shown == 0 {
-                        ui.label(
-                            RichText::new("No matching models")
-                                .small()
-                                .color(theme.label_dim),
-                        );
+                        design::hint(ui, t, "No matching models");
                     }
                 });
             if let Some((provider, model)) = picked {
+                settings.set_preferred(provider, &model);
                 session.selected = Some(ModelRef { provider, model });
                 session.model_filter.clear();
                 egui::Popup::close_all(ui.ctx());
@@ -1366,80 +1846,35 @@ fn model_switcher(
         });
 }
 
-/// Build a two-tone label: model name in normal text, provider in a smaller, dimmer style.
-fn model_job(
-    ui: &egui::Ui,
-    theme: &Theme,
-    model: &str,
-    provider: Option<&str>,
-    show_provider: bool,
-) -> egui::text::LayoutJob {
-    use egui::text::{LayoutJob, TextFormat};
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let small = egui::FontId::proportional(font.size * 0.82);
-    let mut job = LayoutJob::default();
-    job.append(
-        model,
-        0.0,
-        TextFormat {
-            font_id: font,
-            color: theme.label,
-            ..Default::default()
-        },
-    );
-    if show_provider {
-        if let Some(p) = provider {
-            job.append(
-                &format!("   {p}"),
-                0.0,
-                TextFormat {
-                    font_id: small,
-                    color: theme.label_dim,
-                    ..Default::default()
-                },
-            );
-        }
-    }
-    job
-}
+// ===================== settings dialog =====================
 
-// ===================== settings modal =====================
-
-/// Render the provider settings window. Set `open` false to close.
-pub fn settings_window(
-    ctx: &egui::Context,
-    theme: &Theme,
-    settings: &mut AiSettings,
-    open: &mut bool,
-) {
-    let mut keep_open = true;
-    egui::Window::new(RichText::new("AI providers").strong())
-        .collapsible(false)
-        .resizable(true)
-        .default_width(460.0)
-        .max_height(560.0)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut keep_open)
+/// The provider settings dialog (modal). Set `open` false to close.
+pub fn settings_dialog(ctx: &egui::Context, t: &Theme, settings: &mut AiSettings, open: &mut bool) {
+    let modal = egui::Modal::new(egui::Id::new("ai-settings"))
+        .frame(design::dialog_frame(t))
+        .backdrop_color(Color32::from_black_alpha(if t.dark { 140 } else { 70 }))
         .show(ctx, |ui| {
-            ui.label(
-                RichText::new(
-                    "Connect one or more providers. Keys are stored locally and never leave \
-                     your machine.",
-                )
-                .color(theme.label_dim),
+            ui.set_width(520.0);
+            design::dialog_header(
+                ui,
+                t,
+                icons::KEY_2,
+                t.accent,
+                "AI providers",
+                "Keys are stored in your OS keychain and never leave this machine.",
             );
-            ui.add_space(8.0);
+            ui.add_space(14.0);
             let mut test_request: Option<usize> = None;
+            let mut forget: Option<usize> = None;
             let mut changed = false;
             egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .max_height(440.0)
+                .auto_shrink([false, true])
+                .max_height(ctx.content_rect().height() * 0.62)
                 .show(ui, |ui| {
                     for i in 0..settings.providers.len() {
-                        let act = provider_card(ui, theme, &mut settings.providers[i]);
-                        if act.test {
-                            test_request = Some(i);
-                        }
+                        let act = provider_card(ui, t, &mut settings.providers[i]);
+                        test_request = test_request.or(act.test.then_some(i));
+                        forget = forget.or(act.forget.then_some(i));
                         changed |= act.changed;
                         ui.add_space(8.0);
                     }
@@ -1447,183 +1882,224 @@ pub fn settings_window(
             if let Some(i) = test_request {
                 settings.start_test(i);
             }
+            if let Some(i) = forget {
+                settings.forget_key(i);
+            }
             if changed {
                 settings.dirty = true;
             }
-
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "Request log: {}",
-                    super::ai_log::log_path_display()
-                ))
-                .small()
-                .color(theme.label_dim),
-            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Request log: {}",
+                        super::ai_log::log_path_display()
+                    ))
+                    .font(design::regular(11.0))
+                    .color(t.text_faint),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if design::button(ui, t, Kind::Primary, None, "Done").clicked() {
+                        ui.close();
+                    }
+                });
+            });
         });
-    if !keep_open {
+    if modal.should_close() {
         *open = false;
-        // Persist the provider setup when the modal closes.
         settings.dirty = true;
     }
 }
 
-/// What the user did to a provider card this frame.
 #[derive(Default)]
 struct CardAction {
     test: bool,
+    forget: bool,
     changed: bool,
 }
 
-/// One provider row in settings: name, status, key field, test button.
-fn provider_card(ui: &mut egui::Ui, theme: &Theme, p: &mut Provider) -> CardAction {
+/// One provider in settings: toggle, name, status, key field, actions.
+fn provider_card(ui: &mut egui::Ui, t: &Theme, p: &mut Provider) -> CardAction {
     let mut action = CardAction::default();
     Frame::NONE
-        .fill(surface(theme))
-        .stroke(Stroke::new(1.0, theme.block_stroke))
-        .corner_radius(CornerRadius::same(10))
+        .fill(t.surface)
+        .stroke(Stroke::new(
+            1.0,
+            if p.enabled { t.border_strong } else { t.border },
+        ))
+        .corner_radius(CornerRadius::same(design::radius::LG))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                if ui.checkbox(&mut p.enabled, "").changed() {
-                    action.changed = true;
-                }
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(&p.name).strong());
-                    ui.label(RichText::new(p.kind.blurb()).small().color(theme.label_dim));
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(
+                        RichText::new(&p.name)
+                            .font(design::semibold(13.5))
+                            .color(t.text),
+                    );
+                    ui.label(
+                        RichText::new(p.kind.blurb())
+                            .font(design::regular(11.5))
+                            .color(t.text_faint),
+                    );
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    status_chip(ui, theme, &p.status);
+                    if design::toggle(ui, t, p.enabled).clicked() {
+                        p.enabled = !p.enabled;
+                        action.changed = true;
+                    }
+                    ui.add_space(6.0);
+                    let (color, text) = match &p.status {
+                        ConnStatus::Idle => (t.text_faint, "Not connected"),
+                        ConnStatus::Testing => (t.accent, "Testing\u{2026}"),
+                        ConnStatus::Connected => (t.success, "Connected"),
+                        ConnStatus::Failed(_) => (t.danger, "Failed"),
+                    };
+                    design::pill(ui, t, color, text);
                 });
             });
 
-            if p.enabled {
-                ui.add_space(8.0);
-                if p.kind == ProviderKind::Custom {
-                    labeled(ui, theme, "Name", |ui| {
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut p.name)
-                                    .desired_width(f32::INFINITY),
-                            )
-                            .changed()
-                        {
-                            action.changed = true;
-                        }
-                    });
-                    labeled(ui, theme, "Base URL", |ui| {
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut p.base_url)
-                                    .hint_text("https://…/v1")
-                                    .desired_width(f32::INFINITY),
-                            )
-                            .changed()
-                        {
-                            action.changed = true;
-                        }
-                    });
+            if !p.enabled {
+                return;
+            }
+            ui.add_space(10.0);
+            if p.kind == ProviderKind::Custom {
+                design::field_label(ui, t, "Name");
+                if design::text_field(ui, t, &mut p.name, "My server", None).changed() {
+                    action.changed = true;
                 }
-                labeled(ui, theme, "API key", |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut p.api_key)
-                            .password(true)
-                            .hint_text("Paste your key")
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let can_test = !p.api_key.trim().is_empty()
-                        && p.status != ConnStatus::Testing
-                        && !p.base_url.trim().is_empty();
-                    if ui
-                        .add_enabled(can_test, accent_widget(theme, "Test connection"))
-                        .clicked()
-                    {
-                        action.test = true;
-                    }
-                    if let Some(url) = p.kind.key_url() {
-                        ui.hyperlink_to(RichText::new("Get a key").color(theme.accent), url);
-                    }
-                });
-
-                // Feedback line: model count when connected, or the failure reason.
-                match &p.status {
-                    ConnStatus::Connected => {
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!("{} models available", p.models.len()))
-                                .small()
-                                .color(theme.label_dim),
+                ui.add_space(4.0);
+                design::field_label(ui, t, "Base URL");
+                if design::text_field(
+                    ui,
+                    t,
+                    &mut p.base_url,
+                    "http://localhost:11434/v1",
+                    Some(icons::EXTERNAL_LINK),
+                )
+                .changed()
+                {
+                    action.changed = true;
+                }
+                ui.add_space(4.0);
+            }
+            design::field_label(
+                ui,
+                t,
+                if p.key_optional() {
+                    "API key (optional for local servers)"
+                } else {
+                    "API key"
+                },
+            );
+            let show_id = ui.id().with(("show-key", p.kind.id()));
+            let mut show = ui.ctx().data_mut(|d| *d.get_temp_mut_or(show_id, false));
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - 36.0;
+                let id = ui.id().with(("key", p.kind.id()));
+                let focused = ui.ctx().memory(|m| m.has_focus(id));
+                Frame::NONE
+                    .fill(t.bg_panel)
+                    .stroke(Stroke::new(
+                        1.0,
+                        if focused { t.accent } else { t.border_strong },
+                    ))
+                    .corner_radius(CornerRadius::same(design::radius::MD))
+                    .inner_margin(Margin::symmetric(9, 6))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut p.api_key)
+                                .id(id)
+                                .frame(Frame::NONE)
+                                .password(!show)
+                                .hint_text(RichText::new("Paste your key").color(t.text_faint))
+                                .desired_width(w - 20.0),
                         );
-                    }
-                    ConnStatus::Failed(msg) => {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(msg).small().color(theme.conflict));
-                    }
-                    _ => {}
+                    });
+                if design::icon_button(
+                    ui,
+                    t,
+                    if show { icons::EYE_OFF } else { icons::EYE },
+                    if show { "Hide key" } else { "Show key" },
+                    false,
+                )
+                .clicked()
+                {
+                    show = !show;
+                    ui.ctx().data_mut(|d| d.insert_temp(show_id, show));
                 }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let can_test = (!p.api_key.trim().is_empty() || p.key_optional())
+                    && p.status != ConnStatus::Testing
+                    && !p.base_url.trim().is_empty();
+                if design::button_ex(
+                    ui,
+                    t,
+                    Kind::Primary,
+                    Some(icons::PLUG),
+                    "Test connection",
+                    can_test,
+                    28.0,
+                )
+                .clicked()
+                {
+                    action.test = true;
+                }
+                if !p.api_key.trim().is_empty()
+                    && design::button_ex(
+                        ui,
+                        t,
+                        Kind::Ghost,
+                        Some(icons::DELETE_BIN_6),
+                        "Forget key",
+                        true,
+                        28.0,
+                    )
+                    .on_hover_text("Remove the saved key from this computer")
+                    .clicked()
+                {
+                    action.forget = true;
+                }
+                if let Some(url) = p.kind.key_url() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.hyperlink_to(
+                            RichText::new(format!("Get a key {}", icons::EXTERNAL_LINK))
+                                .font(design::medium(12.0))
+                                .color(t.accent),
+                            url,
+                        );
+                    });
+                }
+            });
+            match &p.status {
+                ConnStatus::Connected => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  {} models available",
+                            icons::CHECKBOX_CIRCLE_FILL,
+                            p.models.len()
+                        ))
+                        .font(design::regular(12.0))
+                        .color(t.success),
+                    );
+                }
+                ConnStatus::Failed(msg) => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("{}  {msg}", icons::ERROR_WARNING))
+                            .font(design::regular(12.0))
+                            .color(t.danger),
+                    );
+                }
+                _ => {}
             }
         });
     action
-}
-
-fn status_chip(ui: &mut egui::Ui, theme: &Theme, status: &ConnStatus) {
-    let (color, text) = match status {
-        ConnStatus::Idle => (theme.label_dim, "Not connected"),
-        ConnStatus::Testing => (theme.accent, "Testing\u{2026}"),
-        ConnStatus::Connected => (theme.wire_high, "Connected"),
-        ConnStatus::Failed(_) => (theme.conflict, "Failed"),
-    };
-    colored_dot(ui, color, 4.0);
-    ui.add_space(4.0);
-    ui.label(RichText::new(text).small().color(theme.label_dim));
-}
-
-// ===================== small shared widgets =====================
-
-/// Paint a small filled circle inline (used instead of a `●` glyph, which egui's default
-/// font doesn't include).
-fn colored_dot(ui: &mut egui::Ui, color: Color32, radius: f32) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(radius * 2.0, radius * 2.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), radius, color);
-}
-
-fn accent_dot(ui: &mut egui::Ui, theme: &Theme, radius: f32) {
-    colored_dot(ui, theme.accent, radius);
-}
-
-fn labeled(ui: &mut egui::Ui, theme: &Theme, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(label).small().color(theme.label_dim));
-    add(ui);
-}
-
-/// A subtle surface color that sits just above the panel background.
-fn surface(theme: &Theme) -> Color32 {
-    theme.block_fill
-}
-
-/// A borderless small text button (used for the header actions); returns true when clicked.
-fn text_button(ui: &mut egui::Ui, theme: &Theme, label: &str, tip: &str) -> bool {
-    ui.add(egui::Button::new(RichText::new(label).small().color(theme.label_dim)).frame(false))
-        .on_hover_text(tip)
-        .clicked()
-}
-
-/// An accent-filled button widget (for `add`/`add_enabled`).
-fn accent_widget(theme: &Theme, text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_string()).color(Color32::WHITE))
-        .fill(theme.accent)
-        .corner_radius(CornerRadius::same(8))
-}
-
-fn accent_button(ui: &mut egui::Ui, theme: &Theme, text: &str) -> egui::Response {
-    ui.add(accent_widget(theme, text))
 }
 
 #[cfg(test)]

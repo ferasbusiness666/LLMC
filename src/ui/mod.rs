@@ -1,14 +1,18 @@
 //! The eframe/egui GUI (binary-only). Everything here depends on egui; the pure logic
 //! lives in the `llmc` library crate.
 
-mod ai_edit;
 mod ai_log;
 mod ai_net;
 mod app;
 mod assistant;
+mod canvas;
+mod design;
+mod document;
 mod glyphs;
+mod icons;
+mod inspector;
 mod keystore;
-mod theme;
+mod palette;
 
 /// Launch the native window and run the app. An optional `.llmc` path may be passed as
 /// the first CLI argument (also enables double-click / drag-to-open on Windows).
@@ -23,10 +27,10 @@ pub fn run() -> eframe::Result<()> {
     };
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("LLMC — Logic Builder")
+            .with_title("LLMC")
             .with_icon(std::sync::Arc::new(icon))
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([860.0, 560.0]),
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([960.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
